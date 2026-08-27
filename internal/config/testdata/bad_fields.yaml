@@ -1,0 +1,20 @@
+# A grab bag of invalid optional fields on one project: out-of-range port,
+# supervisor and application port identical, unknown readiness strategy,
+# unknown shutdown signal, and a negative timeout.
+projects:
+  chaotic:
+    public_url: https://chaotic.test
+    supervisor_port: 70000
+    application_port: 17101
+    working_directory: /tmp
+    command: npm run dev
+    readiness_strategy: carrier-pigeon
+    readiness_url: http://127.0.0.1:17101/
+    shutdown_signal: SIGDANCE
+    idle_timeout_minutes: -5
+  twinned:
+    public_url: https://twinned.test
+    supervisor_port: 17102
+    application_port: 17102
+    working_directory: /tmp
+    command: npm run dev

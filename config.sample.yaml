@@ -1,0 +1,115 @@
+# herd-wake sample configuration
+#
+# Copy this file to:
+#
+#   ~/Library/Application Support/herd-wake/config.yaml
+#
+# and adjust it for your projects. herd-wake reads this user-level file only;
+# nothing is stored inside your project repositories.
+#
+# Each entry under `projects:` registers one Node.js dev server. For every
+# project you also register a Herd proxy pointing the public URL at the
+# project's supervisor port, e.g.:
+#
+#   herd proxy dashboard http://127.0.0.1:7101
+#   herd proxy vite.accounts http://127.0.0.1:7102
+#
+# Conventions used below: supervisor ports in the 71xx range, application
+# ports in the 171xx range. Any free high-numbered loopback ports work; every
+# port must be unique across the whole file.
+
+projects:
+  # ---------------------------------------------------------------------
+  # Example 1: a Node-only application (Next.js, Vite SPA, Express, ...).
+  # Visiting https://dashboard.test starts the dev server on demand.
+  # ---------------------------------------------------------------------
+  dashboard:
+    # Required. The public Herd URL that fronts this project. Herd terminates
+    # HTTPS and forwards requests to the supervisor port below.
+    public_url: https://dashboard.test
+
+    # Required. The loopback port the supervisor listens on for this project.
+    # This is the port you point `herd proxy` at.
+    supervisor_port: 7101
+
+    # Required. The loopback port the dev server itself listens on. The
+    # supervisor proxies traffic here once the server is ready.
+    application_port: 17101
+
+    # Required. The directory the command runs in. Must exist. A leading
+    # "~/" is expanded to your home directory.
+    working_directory: ~/Code/dashboard
+
+    # Required. The dev-server command. Pin it to application_port and make
+    # the port strict so a port conflict fails fast instead of drifting to
+    # another port.
+    command: npm run dev -- --port 17101 --strictPort
+
+    # Optional. How readiness is detected before queued requests are
+    # forwarded: "http" polls readiness_url, "tcp" dials application_port.
+    # Default: http.
+    readiness_strategy: http
+
+    # Optional. The URL polled when readiness_strategy is "http".
+    # Default: http://127.0.0.1:<application_port>/
+    readiness_url: http://127.0.0.1:17101/
+
+    # Optional. How long a cold start may take before it is declared failed.
+    # Default: 60.
+    startup_timeout_seconds: 60
+
+    # Optional. Stop the dev server after this many minutes without activity
+    # (requests or protected WebSocket connections). Default: 15.
+    idle_timeout_minutes: 15
+
+    # Optional. Extra environment variables for the dev server.
+    env:
+      APP_ENV: local
+
+    # Optional. Absolute path to the node executable to put first on PATH,
+    # for projects pinned to a specific Node version. Default: whatever
+    # `node` resolves to.
+    # node_path: /opt/homebrew/opt/node@22/bin/node
+
+  # ---------------------------------------------------------------------
+  # Example 2: the Vite dev server of a Laravel project.
+  #
+  # The Laravel app itself stays a normal Herd PHP site at
+  # https://accounts.test — herd-wake never touches it. Only the Vite server
+  # is registered here, behind a stable proxy URL that Laravel's Vite
+  # integration should reference instead of a direct port. The first asset
+  # or HMR request to https://vite.accounts.test starts Vite automatically.
+  # ---------------------------------------------------------------------
+  accounts-vite:
+    public_url: https://vite.accounts.test
+    supervisor_port: 7102
+    application_port: 17102
+    working_directory: ~/Code/accounts
+    command: npm run dev -- --port 17102 --strictPort
+    idle_timeout_minutes: 30
+
+    # Optional. Whether open WebSocket connections (such as Vite HMR) keep
+    # the project from being considered idle. Default: true — an open HMR
+    # socket prevents idle shutdown. Set to false to idle out on HTTP
+    # activity alone.
+    websockets_keep_alive: true
+
+    # Optional. Signal sent for graceful shutdown, and how long to wait for
+    # the process group to exit before it is force-killed. Defaults: SIGTERM
+    # and 10 seconds. Allowed signals: SIGTERM, SIGINT, SIGQUIT, SIGHUP,
+    # SIGUSR1, SIGUSR2, SIGKILL.
+    shutdown_signal: SIGTERM
+    shutdown_timeout_seconds: 10
+
+    # Optional. Keep this project running permanently instead of starting it
+    # on demand and stopping it when idle. Default: false.
+    always_on: false
+
+    # Optional. How many days of process logs to keep. Default: 7.
+    log_retention_days: 7
+
+    # Optional. The address the supervisor listener binds for this project.
+    # Default: 127.0.0.1. Non-loopback addresses are rejected unless you
+    # explicitly opt in with allow_non_loopback: true.
+    listen_host: 127.0.0.1
+    # allow_non_loopback: false

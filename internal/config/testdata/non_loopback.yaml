@@ -1,0 +1,9 @@
+# listen_host is not a loopback address and allow_non_loopback is not set.
+projects:
+  exposed:
+    public_url: https://exposed.test
+    supervisor_port: 7101
+    application_port: 17101
+    working_directory: /tmp
+    command: npm run dev
+    listen_host: 0.0.0.0

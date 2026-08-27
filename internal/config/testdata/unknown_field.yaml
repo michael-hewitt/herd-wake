@@ -1,0 +1,9 @@
+# A typoed field name; strict decoding must reject it.
+projects:
+  typo:
+    public_url: https://typo.test
+    supervisor_port: 7101
+    application_port: 17101
+    working_directory: /tmp
+    command: npm run dev
+    idle_timeout_mins: 15

@@ -9,4 +9,13 @@ See the full specification in [issue #1](https://github.com/michael-hewitt/herd-
 ```sh
 go build ./cmd/herd-wake
 ./herd-wake version
+./herd-wake projects            # list registered projects
+./herd-wake projects --config path/to/config.yaml
 ```
+
+## Configuration
+
+Projects are registered in a user-level config file at
+`~/Library/Application Support/herd-wake/config.yaml` — nothing is stored in
+your project repositories. See [config.sample.yaml](config.sample.yaml) for a
+fully documented example covering a Node-only app and a Laravel Vite server.

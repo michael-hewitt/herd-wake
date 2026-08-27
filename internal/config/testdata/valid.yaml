@@ -1,0 +1,29 @@
+# A valid config: one fully specified project and one minimal project that
+# relies on defaults. /tmp is used as the working directory because it exists
+# on every machine that runs the tests.
+projects:
+  dashboard:
+    public_url: https://dashboard.test
+    supervisor_port: 7101
+    application_port: 17101
+    working_directory: /tmp
+    command: npm run dev -- --port 17101 --strictPort
+    readiness_strategy: http
+    readiness_url: http://127.0.0.1:17101/
+    startup_timeout_seconds: 90
+    idle_timeout_minutes: 30
+    listen_host: 127.0.0.1
+    shutdown_signal: SIGINT
+    shutdown_timeout_seconds: 5
+    websockets_keep_alive: false
+    log_retention_days: 3
+    always_on: true
+    node_path: /usr/local/bin/node
+    env:
+      APP_ENV: local
+  minimal:
+    public_url: https://minimal.test
+    supervisor_port: 7102
+    application_port: 17102
+    working_directory: /tmp
+    command: pnpm dev

@@ -1,0 +1,8 @@
+# working_directory points at a path that does not exist.
+projects:
+  ghost:
+    public_url: https://ghost.test
+    supervisor_port: 7101
+    application_port: 17101
+    working_directory: /nonexistent/herd-wake/ghost
+    command: npm run dev

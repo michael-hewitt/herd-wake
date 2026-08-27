@@ -1,0 +1,17 @@
+# Test fixture for `herd-wake projects --config testdata/config.yaml`.
+# /tmp is used as the working directory because it exists on every machine
+# that runs the tests.
+projects:
+  dashboard:
+    public_url: https://dashboard.test
+    supervisor_port: 7101
+    application_port: 17101
+    working_directory: /tmp
+    command: npm run dev -- --port 17101 --strictPort
+  accounts-vite:
+    public_url: https://vite.accounts.test
+    supervisor_port: 7102
+    application_port: 17102
+    working_directory: /tmp
+    command: npm run dev -- --port 17102 --strictPort
+    always_on: true

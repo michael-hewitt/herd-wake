@@ -1,0 +1,14 @@
+# Two projects claiming the same application_port.
+projects:
+  alpha:
+    public_url: https://alpha.test
+    supervisor_port: 7101
+    application_port: 17101
+    working_directory: /tmp
+    command: npm run dev
+  beta:
+    public_url: https://beta.test
+    supervisor_port: 7102
+    application_port: 17101
+    working_directory: /tmp
+    command: npm run dev

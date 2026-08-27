@@ -1,0 +1,7 @@
+# Test fixture: fails validation (missing command, bad URL).
+projects:
+  broken:
+    public_url: "not a url"
+    supervisor_port: 7101
+    application_port: 17101
+    working_directory: /tmp

@@ -1,0 +1,11 @@
+# A non-loopback listen_host is accepted when explicitly opted in with
+# allow_non_loopback.
+projects:
+  exposed:
+    public_url: https://exposed.test
+    supervisor_port: 7101
+    application_port: 17101
+    working_directory: /tmp
+    command: npm run dev
+    listen_host: 0.0.0.0
+    allow_non_loopback: true

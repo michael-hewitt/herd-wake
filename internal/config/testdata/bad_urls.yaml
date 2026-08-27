@@ -1,0 +1,9 @@
+# Malformed public_url and readiness_url.
+projects:
+  mangled:
+    public_url: "dashboard.test"
+    supervisor_port: 7101
+    application_port: 17101
+    working_directory: /tmp
+    command: npm run dev
+    readiness_url: "ftp://127.0.0.1:17101/"
