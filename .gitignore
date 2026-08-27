@@ -23,3 +23,9 @@ vendor/
 # Build output
 dist/
 build/
+
+# Go build & test artifacts
+/herd-wake
+*.test
+*.out
+coverage.*

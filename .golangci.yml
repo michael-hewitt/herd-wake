@@ -1,0 +1,16 @@
+version: "2"
+
+linters:
+  default: standard
+  settings:
+    errcheck:
+      # Writes to stdout/stderr in a CLI have no meaningful error recovery.
+      exclude-functions:
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
