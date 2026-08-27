@@ -27,6 +27,17 @@ func DefaultPath() (string, error) {
 	return filepath.Join(base, "config.yaml"), nil
 }
 
+// SocketPath returns the default control socket path,
+// ~/Library/Application Support/herd-wake/herd-wake.sock. The daemon listens
+// on it and the CLI connects to it.
+func SocketPath() (string, error) {
+	base, err := BaseDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(base, "herd-wake.sock"), nil
+}
+
 // expandHome replaces a leading "~" or "~/" in path with the current user's
 // home directory. Any other path is returned unchanged.
 func expandHome(path string) string {

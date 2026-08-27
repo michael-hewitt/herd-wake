@@ -11,7 +11,16 @@ go build ./cmd/herd-wake
 ./herd-wake version
 ./herd-wake projects            # list registered projects
 ./herd-wake projects --config path/to/config.yaml
+./herd-wake start               # run the supervisor daemon in the foreground
+./herd-wake status              # daemon uptime and per-project state
 ```
+
+`herd-wake start` binds one loopback listener per registered project on its
+`supervisor_port` and reverse-proxies HTTP to the project's
+`application_port` (for now the dev server must be started manually — process
+management arrives in a later slice). The daemon serves a control API on a
+unix socket at `~/Library/Application Support/herd-wake/herd-wake.sock`,
+which `herd-wake status` queries. Stop the daemon with Ctrl-C.
 
 ## Configuration
 
