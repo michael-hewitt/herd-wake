@@ -27,6 +27,17 @@ func DefaultPath() (string, error) {
 	return filepath.Join(base, "config.yaml"), nil
 }
 
+// LogsDir returns the default directory for per-project process logs,
+// ~/Library/Application Support/herd-wake/logs. Each project's combined
+// stdout/stderr is appended to <name>.log inside it.
+func LogsDir() (string, error) {
+	base, err := BaseDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(base, "logs"), nil
+}
+
 // SocketPath returns the default control socket path,
 // ~/Library/Application Support/herd-wake/herd-wake.sock. The daemon listens
 // on it and the CLI connects to it.

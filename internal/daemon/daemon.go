@@ -1,7 +1,9 @@
 // Package daemon wires the herd-wake supervisor daemon together: one
-// loopback reverse-proxy listener per registered project, plus the control
-// API on a unix socket. It owns listener lifecycle — binding, serving, and
-// clean shutdown including control-socket file removal.
+// loopback reverse-proxy listener per registered project, a process
+// supervisor per project, and the control API on a unix socket. It owns
+// listener lifecycle — binding, serving, and clean shutdown including
+// control-socket file removal — and guarantees every process group it
+// started is terminated before the daemon exits.
 package daemon
 
 import (
@@ -21,15 +23,14 @@ import (
 	"github.com/michael-hewitt/herd-wake/internal/config"
 	"github.com/michael-hewitt/herd-wake/internal/control"
 	"github.com/michael-hewitt/herd-wake/internal/proxy"
-	"github.com/michael-hewitt/herd-wake/internal/version"
 )
 
 // shutdownTimeout bounds how long Run waits for in-flight requests when
 // shutting down.
 const shutdownTimeout = 5 * time.Second
 
-// Daemon is the supervisor daemon: per-project proxy listeners and the
-// control socket.
+// Daemon is the supervisor daemon: per-project proxy listeners, per-project
+// process supervisors, and the control socket.
 type Daemon struct {
 	cfg        *config.Config
 	socketPath string
@@ -39,13 +40,14 @@ type Daemon struct {
 }
 
 // New builds a daemon for the given configuration. The control API listens
-// on the unix socket at socketPath; diagnostics go to logger.
-func New(cfg *config.Config, socketPath string, logger *log.Logger) *Daemon {
+// on the unix socket at socketPath; project process output is written under
+// logDir (one <name>.log per project); diagnostics go to logger.
+func New(cfg *config.Config, socketPath, logDir string, logger *log.Logger) *Daemon {
 	return &Daemon{
 		cfg:        cfg,
 		socketPath: socketPath,
 		logger:     logger,
-		states:     newProjectStates(cfg),
+		states:     newProjectStates(cfg, logDir, logger),
 	}
 }
 
@@ -56,6 +58,10 @@ func New(cfg *config.Config, socketPath string, logger *log.Logger) *Daemon {
 // If another daemon already answers on the control socket, Run refuses to
 // start. A stale socket file (nothing accepting) is removed and replaced.
 func (d *Daemon) Run(ctx context.Context) error {
+	// Deferred (not just called on the normal path) so supervised process
+	// groups are terminated even if the daemon panics.
+	defer d.stopAllProjects()
+
 	if err := d.claimSocket(ctx); err != nil {
 		return err
 	}
@@ -139,27 +145,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.removeSocketFile()
 
 	return runErr
-}
-
-// Status implements control.StatusProvider.
-func (d *Daemon) Status() control.StatusResponse {
-	resp := control.StatusResponse{
-		Version:       version.String(),
-		PID:           os.Getpid(),
-		StartedAt:     d.startedAt,
-		UptimeSeconds: time.Since(d.startedAt).Seconds(),
-		Projects:      make([]control.ProjectStatus, 0, len(d.states)),
-	}
-	for _, st := range d.states {
-		resp.Projects = append(resp.Projects, control.ProjectStatus{
-			Name:            st.project.Name,
-			PublicURL:       st.project.PublicURL,
-			SupervisorPort:  st.project.SupervisorPort,
-			ApplicationPort: st.project.ApplicationPort,
-			State:           st.state,
-		})
-	}
-	return resp
 }
 
 // claimSocket makes sure this daemon may take over the control socket path.

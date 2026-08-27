@@ -40,9 +40,12 @@ projects:
     # "~/" is expanded to your home directory.
     working_directory: ~/Code/dashboard
 
-    # Required. The dev-server command. Pin it to application_port and make
-    # the port strict so a port conflict fails fast instead of drifting to
-    # another port.
+    # Required. The dev-server command, run via `/bin/sh -c` from
+    # working_directory (so quoting, $VARS, and && chains behave like your
+    # terminal) in its own process group. Its combined stdout/stderr is
+    # captured to ~/Library/Application Support/herd-wake/logs/<name>.log.
+    # Pin it to application_port and make the port strict so a port conflict
+    # fails fast instead of drifting to another port.
     command: npm run dev -- --port 17101 --strictPort
 
     # Optional. How readiness is detected before queued requests are

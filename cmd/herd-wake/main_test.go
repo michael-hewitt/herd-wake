@@ -268,6 +268,151 @@ func TestRunStartAndStatusEndToEnd(t *testing.T) {
 	}
 }
 
+func TestRunProjectCommandsRequireName(t *testing.T) {
+	for _, command := range []string{"project:start", "project:stop", "project:restart", "logs"} {
+		var stdout, stderr bytes.Buffer
+
+		code := run([]string{command, "--socket", testSocketPath(t)}, &stdout, &stderr)
+
+		if code != 2 {
+			t.Errorf("run(%s) without a name: exit code = %d, want 2", command, code)
+		}
+		if !strings.Contains(stderr.String(), "usage") {
+			t.Errorf("run(%s) stderr should show usage; got:\n%s", command, stderr.String())
+		}
+	}
+}
+
+func TestRunProjectCommandsDaemonNotRunning(t *testing.T) {
+	for _, command := range []string{"project:start", "project:stop", "project:restart", "logs"} {
+		var stdout, stderr bytes.Buffer
+
+		code := run([]string{command, "--socket", testSocketPath(t), "dashboard"}, &stdout, &stderr)
+
+		if code != 1 {
+			t.Errorf("run(%s) exit code = %d, want 1 when no daemon is running", command, code)
+		}
+		if !strings.Contains(stderr.String(), "daemon is not running") {
+			t.Errorf("run(%s) stderr should say the daemon is not running; got:\n%s", command, stderr.String())
+		}
+	}
+}
+
+// TestRunProjectStartFailureEndToEnd drives a real daemon through the CLI: a
+// project whose command exits nonzero fails to start, the failure names the
+// logs command, `logs` shows the process output that explains why, and
+// `status` reports the failed state with the recorded exit status.
+func TestRunProjectStartFailureEndToEnd(t *testing.T) {
+	workDir := t.TempDir()
+	supervisorPort := freePort(t)
+	applicationPort := freePort(t)
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	configYAML := fmt.Sprintf(`projects:
+  dashboard:
+    public_url: https://dashboard.test
+    supervisor_port: %d
+    application_port: %d
+    working_directory: %s
+    command: "echo boom >&2; exit 7"
+    startup_timeout_seconds: 10
+`, supervisorPort, applicationPort, workDir)
+	if err := os.WriteFile(configPath, []byte(configYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	socket := testSocketPath(t)
+	logDir := t.TempDir()
+
+	var startOut, startErr bytes.Buffer
+	var mu sync.Mutex
+	startDone := make(chan int, 1)
+	go func() {
+		mu.Lock()
+		defer mu.Unlock()
+		startDone <- run([]string{"start", "--config", configPath, "--socket", socket, "--log-dir", logDir}, &startOut, &startErr)
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var statusOut, statusErr bytes.Buffer
+		if code := run([]string{"status", "--socket", socket}, &statusOut, &statusErr); code == 0 {
+			break
+		}
+		select {
+		case code := <-startDone:
+			t.Fatalf("start exited early with code %d", code)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("daemon never answered on the control socket")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// project:start fails because the command exits before readiness.
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"project:start", "--socket", socket, "dashboard"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("project:start exit code = %d, want 1 (stderr:\n%s)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "herd-wake logs dashboard") {
+		t.Errorf("failure should point at the logs command; got:\n%s", stderr.String())
+	}
+
+	// logs explains why.
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"logs", "--socket", socket, "dashboard"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("logs exit code = %d, want 0 (stderr:\n%s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "boom") {
+		t.Errorf("logs should show the process output; got:\n%s", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), filepath.Join(logDir, "dashboard.log")) {
+		t.Errorf("logs should name the on-disk log file; got:\n%s", stderr.String())
+	}
+
+	// status shows failed with the recorded exit status.
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"status", "--socket", socket}, &stdout, &stderr); code != 0 {
+		t.Fatalf("status exit code = %d (stderr:\n%s)", code, stderr.String())
+	}
+	for _, want := range []string{"failed", "exit status 7"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("status output missing %q; got:\n%s", want, stdout.String())
+		}
+	}
+
+	// Unknown project names are rejected.
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"project:start", "--socket", socket, "bogus"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("project:start bogus exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "unknown project") {
+		t.Errorf("stderr should say the project is unknown; got:\n%s", stderr.String())
+	}
+
+	// project:stop on a failed project is a harmless no-op.
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"project:stop", "--socket", socket, "dashboard"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("project:stop exit code = %d, want 0 (stderr:\n%s)", code, stderr.String())
+	}
+
+	if err := syscall.Kill(os.Getpid(), syscall.SIGINT); err != nil {
+		t.Fatalf("send SIGINT: %v", err)
+	}
+	select {
+	case code := <-startDone:
+		if code != 0 {
+			mu.Lock()
+			defer mu.Unlock()
+			t.Fatalf("start exit code = %d after SIGINT, want 0 (stderr:\n%s)", code, startErr.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("start did not exit after SIGINT")
+	}
+}
+
 func TestRunUnknownCommand(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 

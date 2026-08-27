@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -44,6 +45,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runStart(args[1:], stdout, stderr)
 	case "status":
 		return runStatus(args[1:], stdout, stderr)
+	case "project:start", "project:stop", "project:restart":
+		return runProjectCommand(args[0], args[1:], stdout, stderr)
+	case "logs":
+		return runLogs(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "herd-wake: unknown command %q\n", args[0])
 		usage(stderr)
@@ -87,6 +92,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	flags.SetOutput(stderr)
 	configPath := flags.String("config", "", "path to the config file (default: ~/Library/Application Support/herd-wake/config.yaml)")
 	socketPath := flags.String("socket", "", "path to the control socket (default: ~/Library/Application Support/herd-wake/herd-wake.sock)")
+	logDirFlag := flags.String("log-dir", "", "directory for per-project process logs (default: ~/Library/Application Support/herd-wake/logs)")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -99,12 +105,20 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	if !ok {
 		return 1
 	}
+	logDir := *logDirFlag
+	if logDir == "" {
+		var err error
+		if logDir, err = config.LogsDir(); err != nil {
+			fmt.Fprintf(stderr, "herd-wake: %v\n", err)
+			return 1
+		}
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	logger := log.New(stderr, "", log.LstdFlags)
-	if err := daemon.New(cfg, socket, logger).Run(ctx); err != nil {
+	if err := daemon.New(cfg, socket, logDir, logger).Run(ctx); err != nil {
 		fmt.Fprintf(stderr, "herd-wake: %v\n", err)
 		return 1
 	}
@@ -130,8 +144,7 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 	defer cancel()
 	status, err := control.NewClient(socket).Status(ctx)
 	if err != nil {
-		fmt.Fprintf(stderr, "herd-wake: daemon is not running (%v)\n", err)
-		fmt.Fprintf(stderr, "Start it with: herd-wake start\n")
+		reportDaemonError(stderr, err)
 		return 1
 	}
 
@@ -144,16 +157,130 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 
 	fmt.Fprintln(stdout)
 	tw := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "PROJECT\tSTATE\tURL\tSUPERVISOR PORT\tUPSTREAM")
+	fmt.Fprintln(tw, "PROJECT\tSTATE\tPID\tUPTIME\tLAST EXIT\tURL\tSUPERVISOR PORT\tUPSTREAM")
 	for _, p := range status.Projects {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t127.0.0.1:%d\n",
-			p.Name, p.State, p.PublicURL, p.SupervisorPort, p.ApplicationPort)
+		pid, uptime, lastExit := "-", "-", "-"
+		if p.PID != 0 {
+			pid = strconv.Itoa(p.PID)
+			uptime = (time.Duration(p.UptimeSeconds * float64(time.Second))).Round(time.Second).String()
+		}
+		if p.LastExit != "" {
+			lastExit = p.LastExit
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%d\t127.0.0.1:%d\n",
+			p.Name, p.State, pid, uptime, lastExit, p.PublicURL, p.SupervisorPort, p.ApplicationPort)
 	}
 	if err := tw.Flush(); err != nil {
 		fmt.Fprintf(stderr, "herd-wake: %v\n", err)
 		return 1
 	}
+	for _, p := range status.Projects {
+		if p.LastError != "" {
+			fmt.Fprintf(stdout, "\n%s: %s\n", p.Name, p.LastError)
+		}
+	}
 	return 0
+}
+
+// runProjectCommand implements `herd-wake project:start|project:stop|
+// project:restart <name>` as control-client calls against the daemon.
+func runProjectCommand(command string, args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet(command, flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	socketPath := flags.String("socket", "", "path to the control socket (default: ~/Library/Application Support/herd-wake/herd-wake.sock)")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if flags.NArg() != 1 || flags.Arg(0) == "" {
+		fmt.Fprintf(stderr, "herd-wake: usage: herd-wake %s <name>\n", command)
+		return 2
+	}
+	name := flags.Arg(0)
+
+	socket, ok := resolveSocketPath(*socketPath, stderr)
+	if !ok {
+		return 1
+	}
+	client := control.NewClient(socket)
+
+	// Generous bound: starting waits for readiness (startup_timeout_seconds),
+	// stopping waits for the graceful shutdown timeout.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	var status *control.ProjectStatus
+	var err error
+	switch command {
+	case "project:start":
+		status, err = client.StartProject(ctx, name)
+	case "project:stop":
+		status, err = client.StopProject(ctx, name)
+	case "project:restart":
+		status, err = client.RestartProject(ctx, name)
+	}
+	if err != nil {
+		reportDaemonError(stderr, err)
+		if command != "project:stop" && !errors.Is(err, control.ErrDaemonUnreachable) {
+			fmt.Fprintf(stderr, "See recent output with: herd-wake logs %s\n", name)
+		}
+		return 1
+	}
+
+	if status.State == daemon.StateRunning {
+		fmt.Fprintf(stdout, "Project %q is running (pid %d).\n", name, status.PID)
+	} else {
+		fmt.Fprintf(stdout, "Project %q is %s.\n", name, status.State)
+	}
+	return 0
+}
+
+// runLogs implements `herd-wake logs <name>`: it prints the project's recent
+// combined stdout/stderr captured by the daemon.
+func runLogs(args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("logs", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	socketPath := flags.String("socket", "", "path to the control socket (default: ~/Library/Application Support/herd-wake/herd-wake.sock)")
+	lines := flags.Int("lines", 0, "maximum lines to print (0 = everything buffered, up to 200)")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if flags.NArg() != 1 || flags.Arg(0) == "" {
+		fmt.Fprintf(stderr, "herd-wake: usage: herd-wake logs [--lines n] <name>\n")
+		return 2
+	}
+	name := flags.Arg(0)
+
+	socket, ok := resolveSocketPath(*socketPath, stderr)
+	if !ok {
+		return 1
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	logs, err := control.NewClient(socket).Logs(ctx, name, *lines)
+	if err != nil {
+		reportDaemonError(stderr, err)
+		return 1
+	}
+
+	for _, line := range logs.Lines {
+		fmt.Fprintln(stdout, line)
+	}
+	if len(logs.Lines) == 0 {
+		fmt.Fprintf(stderr, "No recent output captured for project %q.\n", name)
+	}
+	fmt.Fprintf(stderr, "Full log: %s\n", logs.LogFile)
+	return 0
+}
+
+// reportDaemonError prints a control-client error: a friendly hint when the
+// daemon is not answering on its socket, the daemon's message otherwise.
+func reportDaemonError(stderr io.Writer, err error) {
+	if errors.Is(err, control.ErrDaemonUnreachable) {
+		fmt.Fprintf(stderr, "herd-wake: daemon is not running (%v)\n", err)
+		fmt.Fprintf(stderr, "Start it with: herd-wake start\n")
+		return
+	}
+	fmt.Fprintf(stderr, "herd-wake: %v\n", err)
 }
 
 // loadConfig resolves the config path (flag value or default location) and
@@ -243,15 +370,22 @@ func usage(w io.Writer) {
 	fmt.Fprint(w, `Usage: herd-wake <command>
 
 Commands:
-  start      Run the supervisor daemon in the foreground (Ctrl-C to stop)
-  status     Show daemon uptime and per-project state
-  projects   List registered projects from the config file
-  version    Print the herd-wake version
+  start                    Run the supervisor daemon in the foreground (Ctrl-C to stop)
+  status                   Show daemon uptime and per-project state
+  projects                 List registered projects from the config file
+  project:start <name>     Start a project's dev server and wait until it is ready
+  project:stop <name>      Gracefully stop a project's dev server
+  project:restart <name>   Stop (if needed) and start a project's dev server
+  logs <name>              Print a project's recent dev-server output
+  version                  Print the herd-wake version
 
 Options:
   --config <path>   Config file to load (start, projects)
                     (default: ~/Library/Application Support/herd-wake/config.yaml)
-  --socket <path>   Control socket to use (start, status)
+  --socket <path>   Control socket to use (start, status, project:*, logs)
                     (default: ~/Library/Application Support/herd-wake/herd-wake.sock)
+  --log-dir <path>  Directory for per-project process logs (start)
+                    (default: ~/Library/Application Support/herd-wake/logs)
+  --lines <n>       Maximum lines to print (logs; 0 = everything buffered)
 `)
 }

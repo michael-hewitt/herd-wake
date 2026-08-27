@@ -84,7 +84,7 @@ func startDaemon(t *testing.T, cfg *config.Config) (socket string, stop func(), 
 	t.Helper()
 	socket = testSocketPath(t)
 	ctx, cancel := context.WithCancel(context.Background())
-	d := New(cfg, socket, log.New(io.Discard, "", 0))
+	d := New(cfg, socket, t.TempDir(), log.New(io.Discard, "", 0))
 	runDone := make(chan error, 1)
 	go func() {
 		runDone <- d.Run(ctx)
@@ -217,7 +217,7 @@ func TestDaemonRefusesSecondInstance(t *testing.T) {
 	supervisorPort := freePort(t)
 	socket, _, _ := startDaemon(t, testConfig(supervisorPort, freePort(t)))
 
-	second := New(testConfig(freePort(t), freePort(t)), socket, log.New(io.Discard, "", 0))
+	second := New(testConfig(freePort(t), freePort(t)), socket, t.TempDir(), log.New(io.Discard, "", 0))
 	err := second.Run(context.Background())
 
 	if err == nil {
@@ -281,7 +281,7 @@ func TestDaemonRemovesStaleSocket(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	d := New(testConfig(freePort(t), freePort(t)), socket, log.New(io.Discard, "", 0))
+	d := New(testConfig(freePort(t), freePort(t)), socket, t.TempDir(), log.New(io.Discard, "", 0))
 	runDone := make(chan error, 1)
 	go func() { runDone <- d.Run(ctx) }()
 	defer func() {
@@ -298,7 +298,7 @@ func TestDaemonRefusesNonSocketFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := New(testConfig(freePort(t), freePort(t)), socket, log.New(io.Discard, "", 0)).Run(context.Background())
+	err := New(testConfig(freePort(t), freePort(t)), socket, t.TempDir(), log.New(io.Discard, "", 0)).Run(context.Background())
 
 	if err == nil {
 		t.Fatal("daemon should refuse to replace a non-socket file")
@@ -317,7 +317,7 @@ func TestDaemonReportsSupervisorPortConflict(t *testing.T) {
 	defer blocker.Close() //nolint:errcheck // test cleanup
 
 	socket := testSocketPath(t)
-	runErr := New(testConfig(supervisorPort, freePort(t)), socket, log.New(io.Discard, "", 0)).Run(context.Background())
+	runErr := New(testConfig(supervisorPort, freePort(t)), socket, t.TempDir(), log.New(io.Discard, "", 0)).Run(context.Background())
 
 	if runErr == nil {
 		t.Fatal("daemon should fail when a supervisor port is taken")
