@@ -111,7 +111,7 @@ The first request cold-starts the dev server (a second or two for Vite), then re
 **5. Register the URL with Herd** so `https://dashboard.test` reaches it:
 
 ```sh
-herd proxy dashboard http://127.0.0.1:7101
+herd proxy dashboard http://127.0.0.1:7101 --secure
 ```
 
 Now open `https://dashboard.test` in a browser. Herd terminates HTTPS and forwards to herd-wake; herd-wake wakes the project on demand. After `idle_timeout_minutes` (default 15) without traffic, the dev server is stopped again — the next visit revives it.
@@ -120,12 +120,14 @@ Now open `https://dashboard.test` in a browser. Herd terminates HTTPS and forwar
 
 herd-wake never touches Herd's configuration. You register each project's public URL once with `herd proxy`, pointing it at the project's `supervisor_port`. Only those URLs reach herd-wake; every other Herd site behaves exactly as before, whether herd-wake is running, stopped, or uninstalled.
 
+Always pass `--secure`: it makes Herd issue a trusted TLS certificate for the domain so the `https://` URL (and `wss://` HMR) actually works. Without it Herd registers the proxy HTTP-only and browsers/curl fail certificate verification on the `https://` URL.
+
 ### Node-only application
 
 One URL, one project:
 
 ```sh
-herd proxy dashboard http://127.0.0.1:7101
+herd proxy dashboard http://127.0.0.1:7101 --secure
 ```
 
 `https://dashboard.test` now fronts the supervisor port from the quickstart. To undo it, remove the proxy in Herd (`herd unproxy dashboard`, or via the Herd UI) — nothing else to clean up.
@@ -152,7 +154,7 @@ projects:
 Herd registration:
 
 ```sh
-herd proxy vite.accounts http://127.0.0.1:7102
+herd proxy vite.accounts http://127.0.0.1:7102 --secure
 ```
 
 Point Vite (and Laravel's `laravel-vite-plugin`) at the stable URL in `vite.config.js`:
@@ -294,7 +296,7 @@ WebSocket upgrades are proxied like any other traffic, including through a cold 
 
 **Stale socket / "another daemon is already running".** The daemon refuses to start while another daemon answers on the control socket (the error names its PID). A *stale* socket file — left by a crash, with nothing accepting on it — is detected and removed automatically. If the path exists but is not a socket at all, herd-wake asks you to move it out of the way rather than deleting it.
 
-**Herd URL gives 502/504 but `curl 127.0.0.1:<supervisor_port>` works.** The Herd proxy target does not match the project's `supervisor_port` — re-register with `herd proxy <name> http://127.0.0.1:<supervisor_port>`. If the direct curl fails too, the daemon is not running.
+**Herd URL gives 502/504 but `curl 127.0.0.1:<supervisor_port>` works.** The Herd proxy target does not match the project's `supervisor_port` — re-register with `herd proxy <name> http://127.0.0.1:<supervisor_port> --secure`. If the direct curl fails too, the daemon is not running.
 
 **Project stops while I'm still working.** Idle detection sees HTTP traffic and open WebSockets. Tools that make neither (editors, test watchers) can hold a project up with `herd-wake project:lease <name> --ttl 2h`, or set `always_on: true` for permanently-up projects, or raise `idle_timeout_minutes`.
 

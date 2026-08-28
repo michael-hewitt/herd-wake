@@ -11,8 +11,8 @@
 # project you also register a Herd proxy pointing the public URL at the
 # project's supervisor port, e.g.:
 #
-#   herd proxy dashboard http://127.0.0.1:7101
-#   herd proxy vite.accounts http://127.0.0.1:7102
+#   herd proxy dashboard http://127.0.0.1:7101 --secure
+#   herd proxy vite.accounts http://127.0.0.1:7102 --secure
 #
 # Conventions used below: supervisor ports in the 71xx range, application
 # ports in the 171xx range. Any free high-numbered loopback ports work; every
