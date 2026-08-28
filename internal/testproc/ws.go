@@ -124,6 +124,14 @@ type WSClient struct {
 // its Sec-WebSocket-Accept. The handshake (dial included) is bounded by
 // timeout — make it generous enough to cover a cold start.
 func DialWS(addr, host, path string, timeout time.Duration) (*WSClient, error) {
+	return DialWSProtocol(addr, host, path, "", timeout)
+}
+
+// DialWSProtocol is DialWS with a Sec-WebSocket-Protocol offer (empty means
+// none). Servers that gate upgrades on a subprotocol — Vite's HMR endpoint
+// requires "vite-hmr" — only complete the handshake when it is offered; when
+// the server answers with a subprotocol it must match the one requested.
+func DialWSProtocol(addr, host, path, subprotocol string, timeout time.Duration) (*WSClient, error) {
 	conn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", addr, err)
@@ -141,12 +149,17 @@ func DialWS(addr, host, path string, timeout time.Duration) (*WSClient, error) {
 	if path == "" {
 		path = "/"
 	}
+	protocolHeader := ""
+	if subprotocol != "" {
+		protocolHeader = "Sec-WebSocket-Protocol: " + subprotocol + "\r\n"
+	}
 	if _, err := fmt.Fprintf(conn, "GET %s HTTP/1.1\r\n"+
 		"Host: %s\r\n"+
 		"Upgrade: websocket\r\n"+
 		"Connection: Upgrade\r\n"+
 		"Sec-WebSocket-Key: %s\r\n"+
-		"Sec-WebSocket-Version: 13\r\n\r\n", path, host, key); err != nil {
+		"%s"+
+		"Sec-WebSocket-Version: 13\r\n\r\n", path, host, key, protocolHeader); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("write handshake: %w", err)
 	}
@@ -166,6 +179,10 @@ func DialWS(addr, host, path string, timeout time.Duration) (*WSClient, error) {
 	if got, want := resp.Header.Get("Sec-WebSocket-Accept"), wsAccept(key); got != want {
 		_ = conn.Close()
 		return nil, fmt.Errorf("Sec-WebSocket-Accept = %q, want %q", got, want)
+	}
+	if got := resp.Header.Get("Sec-WebSocket-Protocol"); got != "" && got != subprotocol {
+		_ = conn.Close()
+		return nil, fmt.Errorf("Sec-WebSocket-Protocol = %q, want %q", got, subprotocol)
 	}
 	if err := conn.SetDeadline(time.Time{}); err != nil {
 		_ = conn.Close()

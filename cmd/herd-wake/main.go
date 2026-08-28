@@ -444,7 +444,7 @@ Create one there to register your projects. A minimal example:
       supervisor_port: 7101
       application_port: 17101
       working_directory: /Users/you/Code/dashboard
-      command: npm run dev -- --port 17101 --strictPort
+      command: npm run dev -- --host 127.0.0.1 --port 17101 --strictPort
 
 A fully documented example ships with herd-wake as config.sample.yaml:
 https://github.com/michael-hewitt/herd-wake/blob/main/config.sample.yaml

@@ -33,3 +33,24 @@ jobs:
         uses: golangci/golangci-lint-action@v8
         with:
           version: v2.13.1
+
+  e2e:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: testdata/vite-fixture/package-lock.json
+      - name: Install Vite fixture dependencies
+        run: npm ci
+        working-directory: testdata/vite-fixture
+      - name: E2E acceptance suite
+        run: go test -race -v -count=1 ./e2e/
+        env:
+          HW_E2E: "1"

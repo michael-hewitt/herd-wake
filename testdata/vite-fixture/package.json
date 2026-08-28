@@ -1,0 +1,12 @@
+{
+  "name": "herd-wake-vite-fixture",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite"
+  },
+  "devDependencies": {
+    "vite": "8.2.2"
+  }
+}

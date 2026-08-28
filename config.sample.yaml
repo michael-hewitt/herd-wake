@@ -45,8 +45,11 @@ projects:
     # terminal) in its own process group. Its combined stdout/stderr is
     # captured to ~/Library/Application Support/herd-wake/logs/<name>.log.
     # Pin it to application_port and make the port strict so a port conflict
-    # fails fast instead of drifting to another port.
-    command: npm run dev -- --port 17101 --strictPort
+    # fails fast instead of drifting to another port. Make the server bind
+    # 127.0.0.1 explicitly: herd-wake proxies (and probes readiness) at
+    # 127.0.0.1, and some servers — Vite included — otherwise bind only
+    # ::1/localhost.
+    command: npm run dev -- --host 127.0.0.1 --port 17101 --strictPort
 
     # Optional. How readiness is detected before queued requests are
     # forwarded: "http" polls readiness_url, "tcp" dials application_port.
@@ -109,7 +112,7 @@ projects:
     supervisor_port: 7102
     application_port: 17102
     working_directory: ~/Code/accounts
-    command: npm run dev -- --port 17102 --strictPort
+    command: npm run dev -- --host 127.0.0.1 --port 17102 --strictPort
     idle_timeout_minutes: 30
 
     # Optional. Whether open WebSocket connections (such as Vite HMR) keep

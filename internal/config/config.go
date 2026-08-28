@@ -292,7 +292,7 @@ func (p *Project) validate() []error {
 	}
 
 	if strings.TrimSpace(p.Command) == "" {
-		fail("command", "required: the dev-server command, e.g. npm run dev -- --port %d --strictPort", p.ApplicationPort)
+		fail("command", "required: the dev-server command, e.g. npm run dev -- --host 127.0.0.1 --port %d --strictPort", p.ApplicationPort)
 	}
 
 	switch p.ReadinessStrategy {
