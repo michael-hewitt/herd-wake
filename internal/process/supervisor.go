@@ -50,6 +50,17 @@ const (
 	ringCapacity = 200
 	// maxLineBytes caps a single captured line; longer output is split.
 	maxLineBytes = 64 * 1024
+	// groupPollInterval is how often a stopping process group is probed for
+	// surviving members (kill(-pgid, 0)).
+	groupPollInterval = 15 * time.Millisecond
+	// killDrainTimeout bounds how long a stop waits for a SIGKILLed group to
+	// disappear before giving up (SIGKILL cannot be ignored, so this only
+	// fires for processes stuck in uninterruptible kernel sleep).
+	killDrainTimeout = 10 * time.Second
+	// forceKillNote is appended to LastExit when a stop had to SIGKILL
+	// surviving group members (e.g. an intermediate shell died on the
+	// graceful signal but a grandchild ignored it).
+	forceKillNote = "process group force-killed"
 )
 
 // signalsByName maps the config's validated shutdown_signal whitelist to
@@ -74,8 +85,9 @@ type Snapshot struct {
 	// process is currently alive.
 	StartedAt time.Time
 	// LastExit describes how the previous process ended, e.g.
-	// "exit status 1" or "signal: killed". Empty while a process is alive
-	// or before the first exit.
+	// "exit status 1" or "signal: killed". When a stop had to SIGKILL
+	// surviving group members, "process group force-killed" is appended.
+	// Empty while a process is alive or before the first exit.
 	LastExit string
 	// LastError explains the most recent failure while in StateFailed.
 	LastError string
@@ -100,9 +112,18 @@ type Supervisor struct {
 	// deliberately killing the process (readiness timeout, stop request);
 	// the exit handler reports it instead of a generic early-exit error.
 	abortErr error
-	// procDone is closed once the current process has exited and its state
-	// transition has been applied. Recreated on every spawn.
+	// procDone is closed once the current direct child has been reaped
+	// (cmd.Wait returned) and handleExit has run. Recreated on every spawn.
+	// The direct child exiting does NOT mean the project is stopped: on
+	// some platforms /bin/sh stays alive as an intermediate process, on
+	// others it execs the real command — either way grandchildren can
+	// outlive the direct child, so stops track the whole group (stopDone).
 	procDone chan struct{}
+	// stopDone is closed once a stop has fully finished: the entire process
+	// group is gone (or SIGKILLed and drained) and the state is StateStopped.
+	// Set by the Stop caller that owns the shutdown; joined by concurrent
+	// Stop callers.
+	stopDone chan struct{}
 	// waiters are pending EnsureStarted callers for the current startup.
 	waiters []chan error
 	ring    *ringBuffer
@@ -174,10 +195,13 @@ func (s *Supervisor) EnsureStarted() <-chan error {
 
 // Stop transitions a starting or running project to stopped: it sends the
 // configured graceful signal to the process group, waits up to the
-// configured shutdown timeout, and SIGKILLs the group only if it has not
-// exited by then. The escalation runs regardless of ctx; ctx only bounds how
-// long the caller waits. Stopping an already stopped or failed project is a
-// no-op.
+// configured shutdown timeout for the ENTIRE group to be gone, and SIGKILLs
+// the group only if members survive past then. The direct child exiting is
+// not enough — an intermediate shell can die on the graceful signal while a
+// grandchild ignores it — so the project only becomes StateStopped once
+// kill(-pgid, 0) reports the group empty. The escalation runs regardless of
+// ctx; ctx only bounds how long the caller waits. Stopping an already
+// stopped or failed project is a no-op.
 func (s *Supervisor) Stop(ctx context.Context) error {
 	s.mu.Lock()
 	switch s.state {
@@ -185,10 +209,10 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 		s.mu.Unlock()
 		return nil
 	case StateStopping:
-		procDone := s.procDone
+		stopDone := s.stopDone
 		s.mu.Unlock()
 		select {
-		case <-procDone:
+		case <-stopDone:
 			return nil
 		case <-ctx.Done():
 			return ctx.Err()
@@ -202,31 +226,96 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 	s.state = StateStopping
 	pgid := s.pgid
 	procDone := s.procDone
+	stopDone := make(chan struct{})
+	s.stopDone = stopDone
 	sig, sigName := s.shutdownSignal()
 	timeout := time.Duration(s.project.ShutdownTimeoutSeconds) * time.Second
 	s.mu.Unlock()
 
 	s.logger.Printf("project %q: stopping (sending %s to process group %d)", s.project.Name, sigName, pgid)
+	// The graceful window starts at this signal.
+	grace := time.NewTimer(timeout)
 	s.signalGroup(pgid, sig)
 
-	// Escalate independently of the caller's ctx so the group is never left
-	// running because a caller gave up waiting.
-	go func() {
-		select {
-		case <-procDone:
-		case <-time.After(timeout):
-			s.logger.Printf("project %q: process group %d still alive %s after %s; sending SIGKILL",
-				s.project.Name, pgid, timeout, sigName)
-			s.signalGroup(pgid, syscall.SIGKILL)
-		}
-	}()
+	// Drain and escalate independently of the caller's ctx so the group is
+	// never left running because a caller gave up waiting.
+	go s.finishStop(pgid, procDone, stopDone, grace, timeout, sigName)
 
 	select {
-	case <-procDone:
+	case <-stopDone:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// finishStop waits for the whole process group to disappear within the
+// graceful window (measured from the graceful signal), force-kills whatever
+// survives, and only then declares the project stopped by closing stopDone.
+func (s *Supervisor) finishStop(pgid int, procDone <-chan struct{}, stopDone chan<- struct{}, grace *time.Timer, timeout time.Duration, sigName string) {
+	defer grace.Stop()
+	forced := false
+	if !s.awaitGroupExit(pgid, procDone, grace.C) {
+		s.logger.Printf("project %q: process group %d still alive %s after %s; sending SIGKILL",
+			s.project.Name, pgid, timeout, sigName)
+		s.signalGroup(pgid, syscall.SIGKILL)
+		forced = true
+		kill := time.NewTimer(killDrainTimeout)
+		defer kill.Stop()
+		if !s.awaitGroupExit(pgid, procDone, kill.C) {
+			s.logger.Printf("project %q: process group %d still not gone %s after SIGKILL; declaring it stopped anyway",
+				s.project.Name, pgid, killDrainTimeout)
+		}
+	}
+
+	s.mu.Lock()
+	s.state = StateStopped
+	s.lastErr = ""
+	if forced {
+		// Make the exit summary truthful: the direct child's wait status
+		// alone (e.g. "signal: terminated" from an intermediate shell) would
+		// hide that surviving group members had to be SIGKILLed.
+		if s.lastExit == "" {
+			s.lastExit = forceKillNote
+		} else {
+			s.lastExit += "; " + forceKillNote
+		}
+	}
+	s.mu.Unlock()
+	close(stopDone)
+	s.logger.Printf("project %q: process group %d fully stopped", s.project.Name, pgid)
+}
+
+// awaitGroupExit waits until the direct child has been reaped AND the
+// process group has no members left, or deadline fires (returning false).
+// Requiring procDone first guarantees handleExit has recorded the exit
+// before the group probe can succeed.
+func (s *Supervisor) awaitGroupExit(pgid int, procDone <-chan struct{}, deadline <-chan time.Time) bool {
+	select {
+	case <-procDone:
+	case <-deadline:
+		return false
+	}
+	ticker := time.NewTicker(groupPollInterval)
+	defer ticker.Stop()
+	for {
+		if groupGone(pgid) {
+			return true
+		}
+		select {
+		case <-deadline:
+			return false
+		case <-ticker.C:
+		}
+	}
+}
+
+// groupGone reports whether the process group has no members left.
+// kill(-pgid, 0) fails with ESRCH once every member — including zombies not
+// yet reaped — is gone; EPERM can only mean the pgid was already recycled by
+// another user's process, so any error means our group is gone.
+func groupGone(pgid int) bool {
+	return syscall.Kill(-pgid, 0) != nil
 }
 
 // Restart stops the project (if needed) and starts it again, returning once
@@ -309,34 +398,46 @@ func (s *Supervisor) handleExit(cmd *exec.Cmd, waitErr error, procDone chan stru
 	exitDesc, cleanExit := describeExit(cmd.ProcessState, waitErr)
 
 	s.mu.Lock()
-	s.cmd = nil
-	s.pgid = 0
-	s.spawnedAt = time.Time{}
-	s.lastExit = exitDesc
 	prev := s.state
-	switch prev {
-	case StateStarting:
-		s.state = StateFailed
-		reason := s.abortErr
-		if reason == nil {
-			reason = fmt.Errorf("project %q: process exited during startup (%s); see `herd-wake logs %s`",
-				s.project.Name, exitDesc, s.project.Name)
-		}
-		s.abortErr = nil
-		s.lastErr = reason.Error()
-		s.notifyWaitersLocked(reason)
-	case StateStopping:
-		s.state = StateStopped
-		s.lastErr = ""
-	case StateRunning:
-		// Unexpected exit: we did not ask the process to stop.
-		if cleanExit {
-			s.state = StateStopped
-			s.lastErr = ""
-		} else {
+	if s.cmd == cmd { // guard against a respawn racing an extremely late exit
+		pgid := s.pgid
+		s.cmd = nil
+		s.pgid = 0
+		s.spawnedAt = time.Time{}
+		s.lastExit = exitDesc
+		switch prev {
+		case StateStarting:
 			s.state = StateFailed
-			s.lastErr = fmt.Sprintf("process exited unexpectedly (%s); see `herd-wake logs %s`",
-				exitDesc, s.project.Name)
+			reason := s.abortErr
+			if reason == nil {
+				reason = fmt.Errorf("project %q: process exited during startup (%s); see `herd-wake logs %s`",
+					s.project.Name, exitDesc, s.project.Name)
+			}
+			s.abortErr = nil
+			s.lastErr = reason.Error()
+			s.notifyWaitersLocked(reason)
+			// The direct child is gone but grandchildren may survive (e.g. a
+			// shell that spawned a background process and exited). Nothing
+			// asked them to stop gracefully, so reap the stragglers now —
+			// children are never orphaned.
+			s.signalGroup(pgid, syscall.SIGKILL)
+		case StateStopping:
+			// A Stop owns this shutdown: it declares StateStopped only once
+			// the entire process group is gone (finishStop), so only the
+			// direct child's exit is recorded here.
+		case StateRunning:
+			// Unexpected exit: we did not ask the process to stop.
+			if cleanExit {
+				s.state = StateStopped
+				s.lastErr = ""
+			} else {
+				s.state = StateFailed
+				s.lastErr = fmt.Sprintf("process exited unexpectedly (%s); see `herd-wake logs %s`",
+					exitDesc, s.project.Name)
+			}
+			// Same straggler cleanup as above: whatever the direct child left
+			// behind in the group must not outlive it.
+			s.signalGroup(pgid, syscall.SIGKILL)
 		}
 	}
 	next := s.state

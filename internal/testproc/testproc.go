@@ -31,6 +31,11 @@ const (
 	EnvPidfile = "HW_TESTPROC_PIDFILE"
 	// EnvChildPidfile is where mode "parent" tells its child to write its pid.
 	EnvChildPidfile = "HW_TESTPROC_CHILD_PIDFILE"
+	// EnvChildMode selects which mode "parent" spawns its child in
+	// (default ModeListen). ModeStubborn reproduces the shell-topology bug:
+	// a group-wide SIGTERM kills the parent instantly while the stubborn
+	// child survives, so only a full group drain plus SIGKILL ends the group.
+	EnvChildMode = "HW_TESTPROC_CHILD_MODE"
 	// EnvLinger is how long mode "listen-exit" stays alive (Go duration,
 	// default 300ms).
 	EnvLinger = "HW_TESTPROC_LINGER"
@@ -45,9 +50,9 @@ const (
 	// ModeStubborn binds a TCP listener and ignores SIGTERM/SIGINT; only
 	// SIGKILL ends it.
 	ModeStubborn = "stubborn"
-	// ModeParent spawns this binary again in ModeListen (child pidfile from
-	// EnvChildPidfile) and waits on it, so the process group has real
-	// children.
+	// ModeParent spawns this binary again as a child (mode from EnvChildMode,
+	// default ModeListen; child pidfile from EnvChildPidfile) and waits on
+	// it, so the process group has real children.
 	ModeParent = "parent"
 	// ModeListenExit binds a TCP listener, lingers briefly, then exits 0 on
 	// its own.
@@ -149,9 +154,13 @@ func parent() int {
 		fmt.Fprintln(os.Stderr, "testproc:", err)
 		return 1
 	}
+	childMode := os.Getenv(EnvChildMode)
+	if childMode == "" {
+		childMode = ModeListen
+	}
 	child := exec.Command(exe)
 	child.Env = append(os.Environ(),
-		EnvMode+"="+ModeListen,
+		EnvMode+"="+childMode,
 		EnvPidfile+"="+os.Getenv(EnvChildPidfile),
 	)
 	child.Stdout = os.Stdout

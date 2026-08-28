@@ -322,7 +322,9 @@ func TestGracefulStopKillsWholeProcessGroup(t *testing.T) {
 }
 
 func TestForceKillAfterShutdownTimeout(t *testing.T) {
+	pidfile := filepath.Join(t.TempDir(), "stubborn.pid")
 	p := helperProject(t, testproc.ModeStubborn) // ignores SIGTERM
+	p.Env[testproc.EnvPidfile] = pidfile
 	p.ShutdownTimeoutSeconds = 1
 	s := newTestSupervisor(t, p)
 
@@ -330,6 +332,10 @@ func TestForceKillAfterShutdownTimeout(t *testing.T) {
 		t.Fatalf("EnsureStarted: %v", err)
 	}
 	pid := s.Snapshot().PID
+	// The stubborn helper's own pid: on shells that exec the command it IS
+	// the direct child; on shells that keep an intermediate process it is a
+	// grandchild that outlives the direct child.
+	stubbornPID := readPidfile(t, pidfile)
 
 	begin := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -346,8 +352,54 @@ func TestForceKillAfterShutdownTimeout(t *testing.T) {
 		t.Errorf("state = %q, want %q", got, StateStopped)
 	}
 	waitProcessGone(t, pid)
+	waitProcessGone(t, stubbornPID) // SIGKILL escalation must reach the SIGTERM-ignoring process
+	// Direct child SIGKILLed ("signal: killed") or an intermediate shell died
+	// on SIGTERM and the surviving group was force-killed — either way the
+	// summary must record the SIGKILL escalation.
 	if exit := s.Snapshot().LastExit; !strings.Contains(exit, "killed") {
-		t.Errorf("LastExit = %q, want a SIGKILL exit", exit)
+		t.Errorf("LastExit = %q, want it to record the SIGKILL escalation", exit)
+	}
+}
+
+// TestForceKillReachesStubbornGrandchildOfExitedParent reproduces, on every
+// platform, the topology dash creates on Linux CI: the direct child dies on
+// the group's graceful signal almost immediately, while a SIGTERM-ignoring
+// grandchild survives. Stop must not declare the project stopped until the
+// whole group is gone, must hold the SIGKILL until the graceful window
+// elapses, and must then kill the stubborn grandchild.
+func TestForceKillReachesStubbornGrandchildOfExitedParent(t *testing.T) {
+	childPidfile := filepath.Join(t.TempDir(), "stubborn-child.pid")
+	p := helperProject(t, testproc.ModeParent) // dies on SIGTERM (no handler)
+	p.Env[testproc.EnvChildMode] = testproc.ModeStubborn
+	p.Env[testproc.EnvChildPidfile] = childPidfile
+	p.ShutdownTimeoutSeconds = 1
+	s := newTestSupervisor(t, p)
+
+	// Readiness comes from the stubborn grandchild's listener.
+	if err := awaitStartup(t, s.EnsureStarted()); err != nil {
+		t.Fatalf("EnsureStarted: %v", err)
+	}
+	parentPID := s.Snapshot().PID
+	childPID := readPidfile(t, childPidfile)
+
+	begin := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := s.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	elapsed := time.Since(begin)
+	if elapsed < time.Second {
+		t.Errorf("stop finished in %s; the direct child's quick death must not end the stop while the grandchild survives", elapsed)
+	}
+	if got := s.Snapshot().State; got != StateStopped {
+		t.Errorf("state = %q, want %q", got, StateStopped)
+	}
+	waitProcessGone(t, parentPID)
+	waitProcessGone(t, childPID) // the stubborn grandchild must have been SIGKILLed
+	if exit := s.Snapshot().LastExit; !strings.Contains(exit, "killed") {
+		t.Errorf("LastExit = %q, want it to record the SIGKILL escalation", exit)
 	}
 }
 
