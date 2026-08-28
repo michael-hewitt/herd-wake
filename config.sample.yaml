@@ -113,9 +113,12 @@ projects:
     idle_timeout_minutes: 30
 
     # Optional. Whether open WebSocket connections (such as Vite HMR) keep
-    # the project from being considered idle. Default: true — an open HMR
-    # socket prevents idle shutdown. Set to false to idle out on HTTP
-    # activity alone.
+    # the project from being considered idle. Default: true — the project is
+    # never idle-stopped while at least one socket is open, and the last
+    # socket closing starts a fresh idle window. Set to false to idle out on
+    # HTTP activity alone: an upgrade then counts only as momentary activity,
+    # and an idle stop closes any still-open sockets (auto-reconnecting
+    # clients like Vite HMR will cold-start the project again on demand).
     websockets_keep_alive: true
 
     # Optional. Signal sent for graceful shutdown, and how long to wait for

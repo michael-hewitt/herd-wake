@@ -35,8 +35,10 @@ type Upstream interface {
 }
 
 // Activity is the per-project activity tracking the on-demand proxy feeds:
-// every request is bracketed by RequestBegan/RequestEnded (the in-flight
-// count and last-completed timestamp drive idle shutdown), and StopGate
+// every plain request is bracketed by RequestBegan/RequestEnded (the
+// in-flight count and last-completed timestamp drive idle shutdown), every
+// protocol upgrade (WebSocket) is bracketed by PersistentOpened/
+// PersistentClosed when the project keeps WebSockets alive, and StopGate
 // keeps requests away from a process the idle monitor is stopping.
 // *idle.Tracker implements it.
 type Activity interface {
@@ -48,6 +50,13 @@ type Activity interface {
 	// RequestEnded records the request's completion and releases its
 	// in-flight slot.
 	RequestEnded()
+	// PersistentOpened marks one persistent connection (an upgraded
+	// request's tunnel) open. Like RequestBegan it is called before the
+	// gate/state checks, so it takes part in the same stop handshake.
+	PersistentOpened()
+	// PersistentClosed records the connection's close time and releases its
+	// slot.
+	PersistentClosed()
 	// StopGate returns a channel closed when the in-progress idle stop has
 	// finished, or nil when no idle stop is in progress.
 	StopGate() <-chan struct{}
@@ -65,6 +74,12 @@ type onDemand struct {
 	activity Activity
 	forward  http.Handler
 	logger   *log.Logger
+
+	// wsKeepAlive is the project's websockets_keep_alive setting: true means
+	// an open upgraded connection (WebSocket) parks the idle countdown for
+	// its whole lifetime; false means the upgrade only counts as momentary
+	// activity and the tunnel never blocks an idle stop.
+	wsKeepAlive bool
 
 	// maxWait bounds how long one request may be held while the project
 	// starts.
@@ -94,24 +109,75 @@ func NewOnDemand(p *config.Project, upstream Upstream, activity Activity, logger
 		maxHeld = config.DefaultHoldMaxRequests
 	}
 	return &onDemand{
-		project:  p,
-		upstream: upstream,
-		activity: activity,
-		forward:  New(p, logger),
-		logger:   logger,
-		maxWait:  maxWait,
-		maxHeld:  maxHeld,
+		project:     p,
+		upstream:    upstream,
+		activity:    activity,
+		forward:     New(p, logger),
+		logger:      logger,
+		wsKeepAlive: p.WebSocketsKeepAlive == nil || *p.WebSocketsKeepAlive,
+		maxWait:     maxWait,
+		maxHeld:     maxHeld,
 	}
 }
 
 func (h *onDemand) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Upgrade requests (WebSockets, e.g. Vite HMR) get their own activity
+	// accounting: ReverseProxy.ServeHTTP hijacks the connection on a 101
+	// and returns only when the tunnel closes, so the bracket below spans
+	// the connection's whole lifetime, not just the handshake.
+	if isUpgrade(r) {
+		h.serveUpgrade(w, r)
+		return
+	}
+
 	// Every request counts as activity — even one that ends up denied — and
 	// stays in flight for the whole handler, so a long-running request or
 	// response stream parks the idle countdown indefinitely. RequestBegan
 	// runs before the gate/state checks below (see Activity).
 	h.activity.RequestBegan()
 	defer h.activity.RequestEnded()
+	h.dispatch(w, r, nil)
+}
 
+// serveUpgrade handles a protocol-upgrade request (Connection: Upgrade).
+// With websockets_keep_alive true (the default) the open tunnel counts as a
+// persistent connection: the idle countdown is parked until the tunnel
+// closes, and closing it stamps last-activity so a fresh idle window starts.
+// With websockets_keep_alive false the upgrade is only momentary activity:
+// the handshake is protected like any request (so a cold start still works
+// and the stop-gate handshake still holds), but the in-flight slot is
+// released the moment the request is handed to the forwarding proxy — an
+// open tunnel then never blocks an idle stop, and the stop severs it (the
+// process dying closes the upstream side and ReverseProxy tears the tunnel
+// down).
+func (h *onDemand) serveUpgrade(w http.ResponseWriter, r *http.Request) {
+	if h.wsKeepAlive {
+		// Like RequestBegan, PersistentOpened runs before the gate/state
+		// checks in dispatch, so BeginStop's re-check sees this connection
+		// and an idle stop can never race the upgrade into a dying process.
+		h.activity.PersistentOpened()
+		defer h.activity.PersistentClosed()
+		h.dispatch(w, r, nil)
+		return
+	}
+
+	h.activity.RequestBegan()
+	ended := false
+	endRequest := func() {
+		if !ended {
+			ended = true
+			h.activity.RequestEnded()
+		}
+	}
+	defer endRequest() // covers the deny/cancel paths, where no forward happens
+	h.dispatch(w, r, endRequest)
+}
+
+// dispatch routes one request past the stop gate and the lock-free state
+// check, forwarding on the hot path or holding through a cold start. If
+// beforeForward is non-nil it runs immediately before the forwarding proxy
+// takes over (used to end a non-keep-alive upgrade's momentary activity).
+func (h *onDemand) dispatch(w http.ResponseWriter, r *http.Request, beforeForward func()) {
 	// An idle stop in progress: the process is being torn down, so this
 	// request must not reach it. Wait for the stop to finish — it is
 	// bounded by the project's shutdown timeout plus the force-kill drain —
@@ -127,10 +193,13 @@ func (h *onDemand) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Hot path: a running project forwards immediately. Atomic loads only —
 	// no lifecycle lock — so concurrent requests never serialize here.
 	if h.upstream.State() == process.StateRunning {
+		if beforeForward != nil {
+			beforeForward()
+		}
 		h.forward.ServeHTTP(w, r)
 		return
 	}
-	h.holdAndForward(w, r)
+	h.holdAndForward(w, r, beforeForward)
 }
 
 // holdAndForward is the cold path: trigger (or join) the project's startup
@@ -138,7 +207,7 @@ func (h *onDemand) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // The request body is never read while holding — it streams to the upstream
 // only once the project is ready — so no body buffering (or body-size limit)
 // is needed.
-func (h *onDemand) holdAndForward(w http.ResponseWriter, r *http.Request) {
+func (h *onDemand) holdAndForward(w http.ResponseWriter, r *http.Request, beforeForward func()) {
 	if held := h.held.Add(1); held > h.maxHeld {
 		h.held.Add(-1)
 		h.deny(w, r, fmt.Sprintf(
@@ -157,6 +226,9 @@ func (h *onDemand) holdAndForward(w http.ResponseWriter, r *http.Request) {
 			h.deny(w, r, err.Error())
 			return
 		}
+		if beforeForward != nil {
+			beforeForward()
+		}
 		h.forward.ServeHTTP(w, r)
 	case <-wait.C:
 		h.deny(w, r, fmt.Sprintf(
@@ -165,6 +237,24 @@ func (h *onDemand) holdAndForward(w http.ResponseWriter, r *http.Request) {
 		// The client went away; there is nobody to answer. The startup (if
 		// one is in flight) continues for other waiters.
 	}
+}
+
+// isUpgrade reports whether r asks to switch protocols: an Upgrade header
+// plus a Connection header carrying the "upgrade" token (RFC 9110 §7.8).
+// WebSocket handshakes are the practical case; any upgrade is treated the
+// same, since every upgraded connection becomes a hijacked tunnel.
+func isUpgrade(r *http.Request) bool {
+	if r.Header.Get("Upgrade") == "" {
+		return false
+	}
+	for _, v := range r.Header.Values("Connection") {
+		for token := range strings.SplitSeq(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), "upgrade") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // deny answers 503 with a diagnostic: the reason, the project's lifecycle

@@ -4,10 +4,12 @@
 // configured idle timeout.
 //
 // Activity is: in-flight HTTP requests, the most recent completed request,
-// persistent connections (WebSockets — wired up in a later slice), and the
-// manual activity lease. The idle countdown runs only while none of those is
-// active; an in-flight request or an unexpired lease parks it entirely, and
-// every completed request restarts the full timeout window.
+// persistent connections (open WebSocket tunnels, fed by the proxy for
+// projects with websockets_keep_alive enabled), and the manual activity
+// lease. The idle countdown runs only while none of those is active; an
+// in-flight request, an open persistent connection, or an unexpired lease
+// parks it entirely, and every completed request (or closed connection)
+// restarts the full timeout window.
 package idle
 
 import (
@@ -22,10 +24,9 @@ import (
 type Tracker struct {
 	// inflight is the number of requests currently inside the proxy handler.
 	inflight atomic.Int64
-	// persistent counts open persistent connections (e.g. WebSockets). The
-	// proxy does not feed it yet — it exists so WebSocket awareness (next
-	// slice) needs no Tracker rework — but the idle decision already
-	// honors it.
+	// persistent counts open persistent connections (upgraded WebSocket
+	// tunnels). The proxy feeds it for projects with websockets_keep_alive
+	// enabled; while it is non-zero the idle countdown is parked.
 	persistent atomic.Int64
 	// lastActivity is the unix-nano time of the most recent completed
 	// request or closed persistent connection (0 = none yet). It is written
@@ -63,7 +64,7 @@ func (t *Tracker) RequestEnded() {
 }
 
 // PersistentOpened marks one persistent connection (e.g. a WebSocket) open.
-// Reserved for the WebSocket slice; pair with PersistentClosed.
+// Pair with exactly one PersistentClosed.
 func (t *Tracker) PersistentOpened() { t.persistent.Add(1) }
 
 // PersistentClosed records the connection's close time and releases its slot.
@@ -86,6 +87,9 @@ func (t *Tracker) StopGate() <-chan struct{} {
 
 // Inflight returns the number of requests currently in flight.
 func (t *Tracker) Inflight() int64 { return t.inflight.Load() }
+
+// Persistent returns the number of open persistent connections (WebSockets).
+func (t *Tracker) Persistent() int64 { return t.persistent.Load() }
 
 // LastActivity returns when the most recent request completed; zero when
 // none has completed yet.

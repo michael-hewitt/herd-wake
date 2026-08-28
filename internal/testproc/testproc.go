@@ -59,6 +59,10 @@ const (
 	// SIGKILL ends it, so a graceful stop reliably takes the full shutdown
 	// timeout — a wide window for request-during-stop tests.
 	ModeHTTPStubborn = "http-stubborn"
+	// ModeWS serves a minimal WebSocket echo server on the port (see
+	// WSEchoHandler; non-upgrade requests get the plain HTTP echo) and
+	// exits 0 on SIGTERM/SIGINT.
+	ModeWS = "ws"
 	// ModeStubborn binds a TCP listener and ignores SIGTERM/SIGINT; only
 	// SIGKILL ends it.
 	ModeStubborn = "stubborn"
@@ -100,6 +104,8 @@ func run(mode string) int {
 		return serveHTTP(false)
 	case ModeHTTPStubborn:
 		return serveHTTP(true)
+	case ModeWS:
+		return serveWS()
 	case ModeStubborn:
 		return stubborn()
 	case ModeParent:
@@ -158,6 +164,27 @@ func serveHTTP(stubborn bool) int {
 		}
 		return 0 // unreachable: only SIGKILL ends this process
 	}
+	go server.Serve(ln) //nolint:errcheck // process exits on signal below
+
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
+	<-sigs
+	fmt.Println("testproc exiting on signal")
+	return 0
+}
+
+// serveHandler binds the port, serves handler on it, and exits 0 on
+// SIGTERM/SIGINT. banner is printed (with the listen address) once bound.
+func serveHandler(handler http.Handler, banner string) int {
+	writePidfile()
+	startDelay()
+	ln, err := bindPort()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "testproc:", err)
+		return 1
+	}
+	fmt.Printf(banner, ln.Addr())
+	server := &http.Server{Handler: handler}
 	go server.Serve(ln) //nolint:errcheck // process exits on signal below
 
 	sigs := make(chan os.Signal, 1)

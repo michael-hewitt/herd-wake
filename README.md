@@ -38,6 +38,8 @@ nothing is in flight:
 - Every completed request restarts the full idle window.
 - An in-flight request parks the countdown entirely — a long-running request
   or streaming response holds the stop off indefinitely.
+- An open WebSocket connection (e.g. Vite HMR) parks the countdown too,
+  unless the project sets `websockets_keep_alive: false` (see below).
 - A request that arrives exactly while an idle stop is in progress is never
   forwarded to the dying process and never dropped: it waits for the stop to
   finish, then cold-starts the project and is served by the fresh process.
@@ -65,6 +67,26 @@ A lease parks the idle countdown until it expires or is released; taking a
 new lease replaces the old one. Leasing does not start a stopped project.
 Over the control API: `POST /v1/projects/{name}/lease?ttl=45m` and
 `DELETE /v1/projects/{name}/lease`.
+
+## WebSockets and Vite HMR
+
+herd-wake proxies WebSocket upgrades and bidirectional frames like any other
+traffic, so Vite HMR works end-to-end through a Herd URL (e.g.
+`https://vite.accounts.test`): the first asset or HMR request cold-starts the
+dev server — the upgrade is held while it starts, just like an HTTP request —
+and hot updates then flow through the supervisor.
+
+By default (`websockets_keep_alive: true`) open WebSockets count as activity:
+a project with at least one open socket — a browser tab holding a live HMR
+connection — is never considered idle. When the last socket closes, a fresh
+idle window starts.
+
+Set `websockets_keep_alive: false` on a project to opt out: an upgrade then
+counts only as momentary activity, and the project idles out on HTTP traffic
+alone even while sockets are open. When a project stops — idle-stopped with
+keep-alive off, or stopped manually — its open WebSockets are closed as the
+process exits. Clients that auto-reconnect (Vite HMR does) will cold-start
+the project again with their next attempt.
 
 ### Always-on projects
 
