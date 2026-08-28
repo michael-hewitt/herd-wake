@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/michael-hewitt/herd-wake/internal/config"
+	"github.com/michael-hewitt/herd-wake/internal/idle"
 	"github.com/michael-hewitt/herd-wake/internal/process"
 )
 
@@ -56,15 +57,26 @@ func (f *fakeUpstream) Logs(int) []string {
 	return f.logs
 }
 
-// onDemandHandler builds the handler under test, giving direct access to the
-// onDemand internals for sub-second wait bounds.
+// onDemandHandler builds the handler under test — with a real activity
+// tracker — giving direct access to the onDemand internals for sub-second
+// wait bounds.
 func onDemandHandler(t *testing.T, p *config.Project, up Upstream) *onDemand {
 	t.Helper()
-	h, ok := NewOnDemand(p, up, discardLogger()).(*onDemand)
+	h, ok := NewOnDemand(p, up, idle.NewTracker(), discardLogger()).(*onDemand)
 	if !ok {
 		t.Fatal("NewOnDemand did not return *onDemand")
 	}
 	return h
+}
+
+// tracker returns the handler's activity tracker.
+func tracker(t *testing.T, h *onDemand) *idle.Tracker {
+	t.Helper()
+	tr, ok := h.activity.(*idle.Tracker)
+	if !ok {
+		t.Fatalf("handler activity = %T, want *idle.Tracker", h.activity)
+	}
+	return tr
 }
 
 func TestOnDemandHotPathForwardsWithoutStartCalls(t *testing.T) {
@@ -352,6 +364,148 @@ func TestOnDemandFailureDiagnosticHTMLEscaped(t *testing.T) {
 	}
 }
 
+// TestOnDemandTracksActivity: every request is bracketed by
+// RequestBegan/RequestEnded — the in-flight count is visible while the
+// upstream still holds the request, and completion stamps last-activity.
+func TestOnDemandTracksActivity(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(entered)
+		<-release
+		fmt.Fprint(w, "done")
+	}))
+	defer upstream.Close()
+
+	fake := newFakeUpstream(process.StateRunning)
+	h := onDemandHandler(t, testProject(serverPort(t, upstream)), fake)
+	tr := tracker(t, h)
+	front := httptest.NewServer(h)
+	defer front.Close()
+
+	if got := tr.LastActivity(); !got.IsZero() {
+		t.Errorf("LastActivity before any request = %v, want zero", got)
+	}
+
+	begin := time.Now()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		resp, err := front.Client().Get(front.URL + "/slow")
+		if err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+		}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("request never reached the upstream")
+	}
+	if got := tr.Inflight(); got != 1 {
+		t.Errorf("Inflight during request = %d, want 1", got)
+	}
+	if !tr.Parked(time.Now()) {
+		t.Error("tracker should be parked while a request is in flight")
+	}
+	close(release)
+	<-done
+
+	deadline := time.Now().Add(5 * time.Second)
+	for tr.Inflight() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("Inflight after request = %d, want 0", tr.Inflight())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := tr.LastActivity(); got.Before(begin) {
+		t.Errorf("LastActivity = %v, want at or after the request began (%v)", got, begin)
+	}
+}
+
+// TestOnDemandRequestDuringIdleStopWaitsForGateThenColdStarts is the
+// idle-stop race resolution: a request that arrives while the idle monitor
+// is stopping the process is never forwarded to the dying process — it waits
+// on the stop gate, then triggers a fresh startup and is forwarded to the
+// new process.
+func TestOnDemandRequestDuringIdleStopWaitsForGateThenColdStarts(t *testing.T) {
+	var upstreamHits atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		fmt.Fprint(w, "fresh process")
+	}))
+	defer upstream.Close()
+
+	// State still claims "running" while the gate is armed — exactly the
+	// window in which the process is about to receive its stop signal.
+	fake := newFakeUpstream(process.StateRunning)
+	fake.ensure = func() <-chan error {
+		ch := make(chan error, 1)
+		fake.state.Store(process.StateRunning)
+		ch <- nil
+		return ch
+	}
+	h := onDemandHandler(t, testProject(serverPort(t, upstream)), fake)
+	tr := tracker(t, h)
+
+	releaseStop, ok := tr.BeginStop()
+	if !ok {
+		t.Fatal("BeginStop with no activity should succeed")
+	}
+
+	type outcome struct {
+		code int
+		body string
+	}
+	results := make(chan outcome, 1)
+	front := httptest.NewServer(h)
+	defer front.Close()
+	go func() {
+		resp, err := front.Client().Get(front.URL + "/during-stop")
+		if err != nil {
+			results <- outcome{code: -1, body: err.Error()}
+			return
+		}
+		defer resp.Body.Close() //nolint:errcheck // test cleanup
+		body, _ := io.ReadAll(resp.Body)
+		results <- outcome{code: resp.StatusCode, body: string(body)}
+	}()
+
+	// While the gate is armed the request must be waiting: no forward, no
+	// startup trigger.
+	deadline := time.Now().Add(5 * time.Second)
+	for tr.Inflight() != 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("request never arrived at the handler")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if hits := upstreamHits.Load(); hits != 0 {
+		t.Fatalf("request was forwarded to the dying process (%d upstream hits before the stop finished)", hits)
+	}
+	if calls := fake.ensureCalls.Load(); calls != 0 {
+		t.Fatalf("startup was triggered while the stop was still in progress (%d calls)", calls)
+	}
+
+	// Finish the stop: the process is gone, the gate opens, and the request
+	// cold-starts the project.
+	fake.state.Store(process.StateStopped)
+	releaseStop()
+
+	select {
+	case res := <-results:
+		if res.code != http.StatusOK || res.body != "fresh process" {
+			t.Errorf("response = %d %q, want 200 from the restarted process", res.code, res.body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("request never completed after the stop finished")
+	}
+	if calls := fake.ensureCalls.Load(); calls != 1 {
+		t.Errorf("EnsureStartedOnDemand called %d times, want exactly 1 (after the gate opened)", calls)
+	}
+}
+
 // BenchmarkOnDemandHotPath measures per-request overhead of the running-state
 // fast path (run with -race to shake out contention).
 func BenchmarkOnDemandHotPath(b *testing.B) {
@@ -365,7 +519,7 @@ func BenchmarkOnDemandHotPath(b *testing.B) {
 	if _, err := fmt.Sscanf(upstream.Listener.Addr().String(), "127.0.0.1:%d", &port); err != nil {
 		b.Fatal(err)
 	}
-	front := httptest.NewServer(NewOnDemand(testProject(port), fake, discardLogger()))
+	front := httptest.NewServer(NewOnDemand(testProject(port), fake, idle.NewTracker(), discardLogger()))
 	defer front.Close()
 
 	b.ResetTimer()

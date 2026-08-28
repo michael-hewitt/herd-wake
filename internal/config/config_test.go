@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadValid(t *testing.T) {
@@ -93,6 +94,38 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	if p.AlwaysOn {
 		t.Error("AlwaysOn = true, want false by default")
 	}
+}
+
+func TestIdleTimeoutSecondsOverridesMinutes(t *testing.T) {
+	p := &Project{IdleTimeoutMinutes: 15}
+	if got := p.IdleTimeout(); got != 15*time.Minute {
+		t.Errorf("IdleTimeout() = %v, want 15m from idle_timeout_minutes", got)
+	}
+
+	p.IdleTimeoutSeconds = 2
+	if got := p.IdleTimeout(); got != 2*time.Second {
+		t.Errorf("IdleTimeout() = %v, want the idle_timeout_seconds override (2s)", got)
+	}
+}
+
+func TestValidateNegativeIdleTimeoutSeconds(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &Config{Projects: map[string]*Project{"dashboard": {
+		Name:             "dashboard",
+		PublicURL:        "https://dashboard.test",
+		SupervisorPort:   7101,
+		ApplicationPort:  17101,
+		WorkingDirectory: dir,
+		Command:          "npm run dev",
+	}}}
+	cfg.Projects["dashboard"].applyDefaults()
+	cfg.Projects["dashboard"].IdleTimeoutSeconds = -1
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() should reject a negative idle_timeout_seconds")
+	}
+	wantError(t, err.Error(), "dashboard", "idle_timeout_seconds")
 }
 
 func TestLoadMissingFile(t *testing.T) {

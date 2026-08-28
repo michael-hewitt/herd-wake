@@ -16,6 +16,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -78,10 +79,15 @@ type Project struct {
 	Command          string `yaml:"command"`
 
 	// Optional fields with defaults.
-	ReadinessStrategy      string `yaml:"readiness_strategy"`
-	ReadinessURL           string `yaml:"readiness_url"`
-	StartupTimeoutSeconds  int    `yaml:"startup_timeout_seconds"`
-	IdleTimeoutMinutes     int    `yaml:"idle_timeout_minutes"`
+	ReadinessStrategy     string `yaml:"readiness_strategy"`
+	ReadinessURL          string `yaml:"readiness_url"`
+	StartupTimeoutSeconds int    `yaml:"startup_timeout_seconds"`
+	IdleTimeoutMinutes    int    `yaml:"idle_timeout_minutes"`
+	// IdleTimeoutSeconds, when set, takes precedence over
+	// idle_timeout_minutes. It exists primarily so tests (and impatient
+	// users) can exercise idle shutdown with sub-minute timeouts; most
+	// configs should use idle_timeout_minutes.
+	IdleTimeoutSeconds     int    `yaml:"idle_timeout_seconds"`
 	ListenHost             string `yaml:"listen_host"`
 	AllowNonLoopback       bool   `yaml:"allow_non_loopback"`
 	ShutdownSignal         string `yaml:"shutdown_signal"`
@@ -190,6 +196,16 @@ func (p *Project) applyDefaults() {
 	if p.HoldMaxRequests == 0 {
 		p.HoldMaxRequests = DefaultHoldMaxRequests
 	}
+}
+
+// IdleTimeout returns the project's effective idle timeout: the
+// idle_timeout_seconds override when set (a testing hook), otherwise
+// idle_timeout_minutes.
+func (p *Project) IdleTimeout() time.Duration {
+	if p.IdleTimeoutSeconds > 0 {
+		return time.Duration(p.IdleTimeoutSeconds) * time.Second
+	}
+	return time.Duration(p.IdleTimeoutMinutes) * time.Minute
 }
 
 // Validate checks every project and returns all problems found, joined into
@@ -305,6 +321,7 @@ func (p *Project) validate() []error {
 	}{
 		{"startup_timeout_seconds", p.StartupTimeoutSeconds},
 		{"idle_timeout_minutes", p.IdleTimeoutMinutes},
+		{"idle_timeout_seconds", p.IdleTimeoutSeconds},
 		{"shutdown_timeout_seconds", p.ShutdownTimeoutSeconds},
 		{"log_retention_days", p.LogRetentionDays},
 		{"hold_max_wait_seconds", p.HoldMaxWaitSeconds},

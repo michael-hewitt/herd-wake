@@ -74,8 +74,17 @@ projects:
     hold_max_requests: 100
 
     # Optional. Stop the dev server after this many minutes without activity
-    # (requests or protected WebSocket connections). Default: 15.
+    # (requests or protected WebSocket connections). The countdown only runs
+    # while nothing is in flight: a long-running request — or an activity
+    # lease taken with `herd-wake project:lease` — holds the stop off
+    # entirely, and every completed request restarts the full window.
+    # Default: 15.
     idle_timeout_minutes: 15
+
+    # Optional. Seconds-granularity idle timeout that takes precedence over
+    # idle_timeout_minutes when set. Primarily a testing hook; prefer
+    # idle_timeout_minutes.
+    # idle_timeout_seconds: 90
 
     # Optional. Extra environment variables for the dev server.
     env:
@@ -116,8 +125,10 @@ projects:
     shutdown_signal: SIGTERM
     shutdown_timeout_seconds: 10
 
-    # Optional. Keep this project running permanently instead of starting it
-    # on demand and stopping it when idle. Default: false.
+    # Optional. Keep this project running permanently: it starts as soon as
+    # the daemon starts (a failed start is logged and retried on demand, and
+    # never keeps the daemon from running) and is never idle-stopped. Manual
+    # project:stop/project:restart still work. Default: false.
     always_on: false
 
     # Optional. How many days of process logs to keep. Default: 7.

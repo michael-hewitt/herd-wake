@@ -28,6 +28,53 @@ control API on a unix socket at
 `~/Library/Application Support/herd-wake/herd-wake.sock`, which
 `herd-wake status` queries. Stop the daemon with Ctrl-C.
 
+## Idle shutdown
+
+A running project is stopped gracefully (the configured `shutdown_signal`,
+then SIGKILL after `shutdown_timeout_seconds`) once it has seen no activity
+for `idle_timeout_minutes` (default 15). The countdown only runs while
+nothing is in flight:
+
+- Every completed request restarts the full idle window.
+- An in-flight request parks the countdown entirely — a long-running request
+  or streaming response holds the stop off indefinitely.
+- A request that arrives exactly while an idle stop is in progress is never
+  forwarded to the dying process and never dropped: it waits for the stop to
+  finish, then cold-starts the project and is served by the fresh process.
+
+After an idle stop the project is `stopped`; the next request cold-starts it
+again. Nothing auto-restarts just because the daemon or the machine
+restarted — projects wake only on demand.
+
+`herd-wake status` shows, per running project, when its last request
+completed (`LAST ACTIVITY`) and when the pending idle stop is scheduled
+(`IDLE STOP`), including what is currently holding it off (in-flight
+requests, an activity lease, or `always_on`).
+
+### Activity leases
+
+External tools that generate no HTTP traffic (editors, test watchers, ...)
+can mark a project active explicitly:
+
+```sh
+./herd-wake project:lease dashboard --ttl 45m   # no idle stop before the ttl expires (default 30m)
+./herd-wake project:release dashboard           # release the lease early
+```
+
+A lease parks the idle countdown until it expires or is released; taking a
+new lease replaces the old one. Leasing does not start a stopped project.
+Over the control API: `POST /v1/projects/{name}/lease?ttl=45m` and
+`DELETE /v1/projects/{name}/lease`.
+
+### Always-on projects
+
+A project with `always_on: true` starts as soon as the daemon starts and is
+never idle-stopped. A failed always-on start never keeps the daemon from
+running: the project is marked `failed` (see `herd-wake status` /
+`herd-wake logs`) and the usual retry paths — a request, or a manual
+`project:start` — still apply. Manual `project:stop`/`project:restart` work
+as for any other project.
+
 ## Configuration
 
 Projects are registered in a user-level config file at

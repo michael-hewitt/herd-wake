@@ -21,6 +21,7 @@ type stubProvider struct {
 	lastAction   string
 	lastName     string
 	lastMaxLines int
+	lastTTL      time.Duration
 }
 
 func (s *stubProvider) Status() StatusResponse { return s.status }
@@ -43,6 +44,15 @@ func (s *stubProvider) StopProject(_ context.Context, name string) (ProjectStatu
 
 func (s *stubProvider) RestartProject(_ context.Context, name string) (ProjectStatus, error) {
 	return s.action("restart", name)
+}
+
+func (s *stubProvider) LeaseProject(_ context.Context, name string, ttl time.Duration) (ProjectStatus, error) {
+	s.lastTTL = ttl
+	return s.action("lease", name)
+}
+
+func (s *stubProvider) ReleaseProjectLease(_ context.Context, name string) (ProjectStatus, error) {
+	return s.action("release", name)
 }
 
 func (s *stubProvider) ProjectLogs(name string, maxLines int) (LogsResponse, error) {
@@ -154,6 +164,7 @@ func TestClientProjectActionsRoundTrip(t *testing.T) {
 		{"start", client.StartProject},
 		{"stop", client.StopProject},
 		{"restart", client.RestartProject},
+		{"release", client.ReleaseProjectLease},
 	}
 	for _, action := range actions {
 		status, err := action.call(context.Background(), "dash board") // space: exercises path escaping
@@ -166,6 +177,45 @@ func TestClientProjectActionsRoundTrip(t *testing.T) {
 		if status.Name != "dash board" || status.State != "running" || status.PID != 4321 {
 			t.Errorf("%s status = %+v", action.name, status)
 		}
+	}
+}
+
+func TestClientLeaseRoundTrip(t *testing.T) {
+	stub := &stubProvider{}
+	client := startServer(t, stub)
+
+	status, err := client.LeaseProject(context.Background(), "dash board", 45*time.Minute)
+	if err != nil {
+		t.Fatalf("LeaseProject error: %v", err)
+	}
+
+	if stub.lastAction != "lease" || stub.lastName != "dash board" || stub.lastTTL != 45*time.Minute {
+		t.Errorf("provider got (%q, %q, %s), want (lease, dash board, 45m)",
+			stub.lastAction, stub.lastName, stub.lastTTL)
+	}
+	if status.Name != "dash board" {
+		t.Errorf("status = %+v", status)
+	}
+}
+
+func TestClientLeaseRejectsBadTTL(t *testing.T) {
+	stub := &stubProvider{}
+	client := startServer(t, stub)
+
+	_, err := client.LeaseProject(context.Background(), "dashboard", -time.Minute)
+
+	if err == nil {
+		t.Fatal("LeaseProject with a negative ttl should fail")
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusBadRequest {
+		t.Fatalf("error = %v, want a 400 APIError", err)
+	}
+	if !strings.Contains(apiErr.Message, "ttl") {
+		t.Errorf("Message = %q, want it to explain the ttl", apiErr.Message)
+	}
+	if stub.lastAction == "lease" {
+		t.Error("a bad ttl must be rejected before reaching the provider")
 	}
 }
 

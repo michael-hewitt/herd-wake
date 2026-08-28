@@ -18,10 +18,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/michael-hewitt/herd-wake/internal/config"
 	"github.com/michael-hewitt/herd-wake/internal/control"
+	"github.com/michael-hewitt/herd-wake/internal/idle"
+	"github.com/michael-hewitt/herd-wake/internal/process"
 	"github.com/michael-hewitt/herd-wake/internal/proxy"
 )
 
@@ -37,6 +40,27 @@ type Daemon struct {
 	logger     *log.Logger
 	states     []*projectState
 	startedAt  time.Time
+	// draining is set the moment Run begins shutting down, so a request
+	// racing shutdown cannot trigger a fresh startup of a project the
+	// daemon is about to stop for good.
+	draining atomic.Bool
+}
+
+// onDemandUpstream adapts a project's supervisor for the on-demand proxy:
+// once the daemon is draining, request-triggered starts are refused instead
+// of respawning a project that daemon shutdown is (or will be) stopping.
+type onDemandUpstream struct {
+	*process.Supervisor
+	draining *atomic.Bool
+}
+
+func (u onDemandUpstream) EnsureStartedOnDemand() <-chan error {
+	if u.draining.Load() {
+		done := make(chan error, 1)
+		done <- errors.New("the herd-wake daemon is shutting down")
+		return done
+	}
+	return u.Supervisor.EnsureStartedOnDemand()
 }
 
 // New builds a daemon for the given configuration. The control API listens
@@ -99,16 +123,38 @@ func (d *Daemon) Run(ctx context.Context) error {
 			closeAll()
 			return fmt.Errorf("project %q: listen on %s: %w", p.Name, addr, err)
 		}
+		upstream := onDemandUpstream{Supervisor: st.proc, draining: &d.draining}
 		servers = append(servers, boundServer{
 			name:     "project " + p.Name,
 			listener: listener,
-			server:   &http.Server{Handler: proxy.NewOnDemand(p, st.proc, d.logger), ErrorLog: d.logger},
+			server:   &http.Server{Handler: proxy.NewOnDemand(p, upstream, st.tracker, d.logger), ErrorLog: d.logger},
 		})
 		d.logger.Printf("project %q: proxying %s -> 127.0.0.1:%d (%s)", p.Name, addr, p.ApplicationPort, p.PublicURL)
 	}
 
 	d.startedAt = time.Now()
 	d.logger.Printf("daemon ready: %d project(s), control socket %s", len(d.states), d.socketPath)
+
+	// Idle monitors and always_on startups run until the daemon begins
+	// shutting down; runCtx also ends them when Run exits on a serve error.
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	for _, st := range d.states {
+		if st.project.AlwaysOn {
+			// always_on: start with the daemon, never idle-stop. A failed
+			// start must not abort the daemon — the project is marked failed
+			// and the usual retry paths (requests with backoff, manual
+			// project:start) still apply.
+			go func() {
+				if err := <-st.proc.EnsureStarted(); err != nil {
+					d.logger.Printf("project %q: always_on start failed: %v", st.project.Name, err)
+				}
+			}()
+			continue
+		}
+		monitor := idle.NewMonitor(st.project.Name, st.proc, st.tracker, st.project.IdleTimeout(), d.logger)
+		go monitor.Run(runCtx)
+	}
 
 	// Serve everything; the first real failure (not ErrServerClosed from our
 	// own shutdown) aborts the daemon.
@@ -128,6 +174,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	case runErr = <-serveErr:
 		d.logger.Printf("shutting down after error: %v", runErr)
 	}
+	// From here on no request may trigger a fresh startup: everything the
+	// deferred stopAllProjects stops must stay stopped.
+	d.draining.Store(true)
+	cancelRun()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()

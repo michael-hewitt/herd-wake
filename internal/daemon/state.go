@@ -11,6 +11,7 @@ import (
 
 	"github.com/michael-hewitt/herd-wake/internal/config"
 	"github.com/michael-hewitt/herd-wake/internal/control"
+	"github.com/michael-hewitt/herd-wake/internal/idle"
 	"github.com/michael-hewitt/herd-wake/internal/process"
 	"github.com/michael-hewitt/herd-wake/internal/version"
 )
@@ -26,10 +27,12 @@ const (
 )
 
 // projectState is the daemon's runtime record for one registered project:
-// its configuration plus the supervisor owning its process lifecycle.
+// its configuration, the supervisor owning its process lifecycle, and the
+// activity tracker driving its idle shutdown.
 type projectState struct {
 	project *config.Project
 	proc    *process.Supervisor
+	tracker *idle.Tracker
 }
 
 // newProjectStates builds the daemon's project table from the config, in
@@ -41,6 +44,7 @@ func newProjectStates(cfg *config.Config, logDir string, logger *log.Logger) []*
 		states = append(states, &projectState{
 			project: p,
 			proc:    process.NewSupervisor(p, logDir, logger),
+			tracker: idle.NewTracker(),
 		})
 	}
 	return states
@@ -61,18 +65,29 @@ func (d *Daemon) findProject(name string) (*projectState, error) {
 // snapshot.
 func (d *Daemon) projectStatus(st *projectState) control.ProjectStatus {
 	snap := st.proc.Snapshot()
+	now := time.Now()
 	status := control.ProjectStatus{
-		Name:            st.project.Name,
-		PublicURL:       st.project.PublicURL,
-		SupervisorPort:  st.project.SupervisorPort,
-		ApplicationPort: st.project.ApplicationPort,
-		State:           snap.State,
-		PID:             snap.PID,
-		LastExit:        snap.LastExit,
-		LastError:       snap.LastError,
+		Name:             st.project.Name,
+		PublicURL:        st.project.PublicURL,
+		SupervisorPort:   st.project.SupervisorPort,
+		ApplicationPort:  st.project.ApplicationPort,
+		State:            snap.State,
+		PID:              snap.PID,
+		LastExit:         snap.LastExit,
+		LastError:        snap.LastError,
+		AlwaysOn:         st.project.AlwaysOn,
+		InflightRequests: st.tracker.Inflight(),
+		LastActivityAt:   st.tracker.LastActivity(),
+		LeaseUntil:       st.tracker.LeaseUntil(now),
 	}
 	if !snap.StartedAt.IsZero() {
-		status.UptimeSeconds = time.Since(snap.StartedAt).Seconds()
+		status.UptimeSeconds = now.Sub(snap.StartedAt).Seconds()
+	}
+	// A scheduled idle stop only exists for a running, non-always_on project
+	// whose countdown is not parked by in-flight requests or a lease.
+	if snap.State == StateRunning && !snap.StartedAt.IsZero() &&
+		!st.project.AlwaysOn && !st.tracker.Parked(now) {
+		status.IdleStopAt = st.tracker.Deadline(snap.StartedAt, st.project.IdleTimeout())
 	}
 	return status
 }
@@ -132,6 +147,31 @@ func (d *Daemon) RestartProject(ctx context.Context, name string) (control.Proje
 	if err := st.proc.Restart(ctx); err != nil {
 		return control.ProjectStatus{}, err
 	}
+	return d.projectStatus(st), nil
+}
+
+// LeaseProject implements control.Provider: it marks the named project
+// active for ttl, parking its idle countdown until the lease expires or is
+// released. Leasing does not start a stopped project.
+func (d *Daemon) LeaseProject(_ context.Context, name string, ttl time.Duration) (control.ProjectStatus, error) {
+	st, err := d.findProject(name)
+	if err != nil {
+		return control.ProjectStatus{}, err
+	}
+	until := st.tracker.Lease(ttl)
+	d.logger.Printf("project %q: activity lease until %s (ttl %s)", name, until.Format(time.RFC3339), ttl)
+	return d.projectStatus(st), nil
+}
+
+// ReleaseProjectLease implements control.Provider: it clears the named
+// project's activity lease, so normal idle rules apply again.
+func (d *Daemon) ReleaseProjectLease(_ context.Context, name string) (control.ProjectStatus, error) {
+	st, err := d.findProject(name)
+	if err != nil {
+		return control.ProjectStatus{}, err
+	}
+	st.tracker.ReleaseLease()
+	d.logger.Printf("project %q: activity lease released", name)
 	return d.projectStatus(st), nil
 }
 

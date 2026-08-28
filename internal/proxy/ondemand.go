@@ -34,6 +34,25 @@ type Upstream interface {
 	Logs(n int) []string
 }
 
+// Activity is the per-project activity tracking the on-demand proxy feeds:
+// every request is bracketed by RequestBegan/RequestEnded (the in-flight
+// count and last-completed timestamp drive idle shutdown), and StopGate
+// keeps requests away from a process the idle monitor is stopping.
+// *idle.Tracker implements it.
+type Activity interface {
+	// RequestBegan marks one request in flight. The proxy calls it before
+	// anything else — including before the lock-free state check — so an
+	// idle stop that observes zero in-flight requests can never race this
+	// request into the dying process.
+	RequestBegan()
+	// RequestEnded records the request's completion and releases its
+	// in-flight slot.
+	RequestEnded()
+	// StopGate returns a channel closed when the in-progress idle stop has
+	// finished, or nil when no idle stop is in progress.
+	StopGate() <-chan struct{}
+}
+
 // onDemand wraps the forwarding reverse proxy with request-triggered
 // startup: requests to a running project go straight to the proxy after a
 // lock-free state check; requests to a not-running project trigger a
@@ -43,6 +62,7 @@ type Upstream interface {
 type onDemand struct {
 	project  *config.Project
 	upstream Upstream
+	activity Activity
 	forward  http.Handler
 	logger   *log.Logger
 
@@ -56,10 +76,12 @@ type onDemand struct {
 }
 
 // NewOnDemand returns the request-triggered-start proxy handler for one
-// project. Hold bounds come from the project's hold_max_wait_seconds and
-// hold_max_requests (already defaulted by config.Load; unset values fall
-// back to the documented defaults here so hand-built configs stay safe).
-func NewOnDemand(p *config.Project, upstream Upstream, logger *log.Logger) http.Handler {
+// project. Every request is reported to activity, which drives the
+// project's idle shutdown. Hold bounds come from the project's
+// hold_max_wait_seconds and hold_max_requests (already defaulted by
+// config.Load; unset values fall back to the documented defaults here so
+// hand-built configs stay safe).
+func NewOnDemand(p *config.Project, upstream Upstream, activity Activity, logger *log.Logger) http.Handler {
 	maxWait := time.Duration(p.HoldMaxWaitSeconds) * time.Second
 	if maxWait <= 0 {
 		maxWait = time.Duration(p.StartupTimeoutSeconds+config.DefaultHoldWaitBufferSeconds) * time.Second
@@ -74,6 +96,7 @@ func NewOnDemand(p *config.Project, upstream Upstream, logger *log.Logger) http.
 	return &onDemand{
 		project:  p,
 		upstream: upstream,
+		activity: activity,
 		forward:  New(p, logger),
 		logger:   logger,
 		maxWait:  maxWait,
@@ -82,7 +105,26 @@ func NewOnDemand(p *config.Project, upstream Upstream, logger *log.Logger) http.
 }
 
 func (h *onDemand) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Hot path: a running project forwards immediately. One atomic load —
+	// Every request counts as activity — even one that ends up denied — and
+	// stays in flight for the whole handler, so a long-running request or
+	// response stream parks the idle countdown indefinitely. RequestBegan
+	// runs before the gate/state checks below (see Activity).
+	h.activity.RequestBegan()
+	defer h.activity.RequestEnded()
+
+	// An idle stop in progress: the process is being torn down, so this
+	// request must not reach it. Wait for the stop to finish — it is
+	// bounded by the project's shutdown timeout plus the force-kill drain —
+	// then fall through to the cold path, which starts the project again.
+	if gate := h.activity.StopGate(); gate != nil {
+		select {
+		case <-gate:
+		case <-r.Context().Done():
+			return // the client went away while waiting
+		}
+	}
+
+	// Hot path: a running project forwards immediately. Atomic loads only —
 	// no lifecycle lock — so concurrent requests never serialize here.
 	if h.upstream.State() == process.StateRunning {
 		h.forward.ServeHTTP(w, r)

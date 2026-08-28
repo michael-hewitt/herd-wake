@@ -52,7 +52,13 @@ const (
 	ModeListen = "listen"
 	// ModeHTTP serves 200 OK on the port (echoing method, path, and Host so
 	// proxy tests can assert what arrived) and exits 0 on SIGTERM/SIGINT.
+	// A request with a ?sleep=<duration> query sleeps that long before
+	// answering, so tests can keep a request in flight deliberately.
 	ModeHTTP = "http"
+	// ModeHTTPStubborn is ModeHTTP but ignoring SIGTERM/SIGINT: only
+	// SIGKILL ends it, so a graceful stop reliably takes the full shutdown
+	// timeout — a wide window for request-during-stop tests.
+	ModeHTTPStubborn = "http-stubborn"
 	// ModeStubborn binds a TCP listener and ignores SIGTERM/SIGINT; only
 	// SIGKILL ends it.
 	ModeStubborn = "stubborn"
@@ -91,7 +97,9 @@ func run(mode string) int {
 	case ModeListen:
 		return listen()
 	case ModeHTTP:
-		return serveHTTP()
+		return serveHTTP(false)
+	case ModeHTTPStubborn:
+		return serveHTTP(true)
 	case ModeStubborn:
 		return stubborn()
 	case ModeParent:
@@ -122,8 +130,11 @@ func listen() int {
 	return 0
 }
 
-func serveHTTP() int {
+func serveHTTP(stubborn bool) int {
 	writePidfile()
+	if stubborn {
+		signal.Ignore(syscall.SIGTERM, syscall.SIGINT)
+	}
 	startDelay()
 	ln, err := bindPort()
 	if err != nil {
@@ -132,9 +143,21 @@ func serveHTTP() int {
 	}
 	fmt.Printf("testproc serving http on %s\n", ln.Addr())
 	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if v := r.URL.Query().Get("sleep"); v != "" {
+			if d, err := time.ParseDuration(v); err == nil {
+				time.Sleep(d)
+			}
+		}
 		body, _ := io.ReadAll(r.Body)
 		fmt.Fprintf(w, "ok %s %s host=%s body=%s pid=%d\n", r.Method, r.URL.Path, r.Host, body, os.Getpid())
 	})}
+	if stubborn {
+		if err := server.Serve(ln); err != nil {
+			fmt.Fprintln(os.Stderr, "testproc:", err)
+			return 1
+		}
+		return 0 // unreachable: only SIGKILL ends this process
+	}
 	go server.Serve(ln) //nolint:errcheck // process exits on signal below
 
 	sigs := make(chan os.Signal, 1)

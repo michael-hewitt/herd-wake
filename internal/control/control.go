@@ -6,11 +6,13 @@
 // endpoints (activity leases, ...) without a custom wire format. All paths
 // are versioned under /v1/:
 //
-//	GET  /v1/status
-//	POST /v1/projects/{name}/start
-//	POST /v1/projects/{name}/stop
-//	POST /v1/projects/{name}/restart
-//	GET  /v1/projects/{name}/logs?lines=N
+//	GET    /v1/status
+//	POST   /v1/projects/{name}/start
+//	POST   /v1/projects/{name}/stop
+//	POST   /v1/projects/{name}/restart
+//	POST   /v1/projects/{name}/lease?ttl=30m
+//	DELETE /v1/projects/{name}/lease
+//	GET    /v1/projects/{name}/logs?lines=N
 package control
 
 import (
@@ -60,6 +62,23 @@ type ProjectStatus struct {
 	LastExit string `json:"last_exit,omitempty"`
 	// LastError explains the most recent failure while the state is failed.
 	LastError string `json:"last_error,omitempty"`
+
+	// AlwaysOn marks projects that start with the daemon and are never
+	// idle-stopped.
+	AlwaysOn bool `json:"always_on,omitempty"`
+	// InflightRequests is how many proxied requests are in flight right
+	// now; any in-flight request parks the idle countdown.
+	InflightRequests int64 `json:"inflight_requests,omitempty"`
+	// LastActivityAt is when the most recent proxied request completed;
+	// zero when none has completed since the daemon started.
+	LastActivityAt time.Time `json:"last_activity_at,omitzero"`
+	// LeaseUntil is when the project's activity lease expires; zero when no
+	// lease is active. An active lease parks the idle countdown.
+	LeaseUntil time.Time `json:"lease_until,omitzero"`
+	// IdleStopAt is when the project is scheduled to be idle-stopped. Zero
+	// when it is not running, is always_on, or the countdown is parked by
+	// in-flight requests or an active lease.
+	IdleStopAt time.Time `json:"idle_stop_at,omitzero"`
 }
 
 // LogsResponse is the body of GET /v1/projects/{name}/logs: recent combined

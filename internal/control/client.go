@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Client talks to a running daemon over its unix control socket.
@@ -84,6 +85,27 @@ func (c *Client) StopProject(ctx context.Context, name string) (*ProjectStatus, 
 // project.
 func (c *Client) RestartProject(ctx context.Context, name string) (*ProjectStatus, error) {
 	return c.projectAction(ctx, name, "restart")
+}
+
+// LeaseProject marks the named project active for ttl, parking its idle
+// countdown until the lease expires or is released.
+func (c *Client) LeaseProject(ctx context.Context, name string, ttl time.Duration) (*ProjectStatus, error) {
+	path := "/v1/projects/" + url.PathEscape(name) + "/lease?ttl=" + url.QueryEscape(ttl.String())
+	var status ProjectStatus
+	if err := c.do(ctx, http.MethodPost, path, &status); err != nil {
+		return nil, err
+	}
+	return &status, nil
+}
+
+// ReleaseProjectLease clears the named project's activity lease.
+func (c *Client) ReleaseProjectLease(ctx context.Context, name string) (*ProjectStatus, error) {
+	path := "/v1/projects/" + url.PathEscape(name) + "/lease"
+	var status ProjectStatus
+	if err := c.do(ctx, http.MethodDelete, path, &status); err != nil {
+		return nil, err
+	}
+	return &status, nil
 }
 
 // Logs fetches up to maxLines recent output lines for the named project

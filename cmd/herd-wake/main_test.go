@@ -243,6 +243,8 @@ func TestRunStartAndStatusEndToEnd(t *testing.T) {
 		"stopped",
 		"https://dashboard.test",
 		fmt.Sprintf("%d", supervisorPort),
+		"LAST ACTIVITY",
+		"IDLE STOP",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("status output missing %q; got:\n%s", want, out)
@@ -269,7 +271,7 @@ func TestRunStartAndStatusEndToEnd(t *testing.T) {
 }
 
 func TestRunProjectCommandsRequireName(t *testing.T) {
-	for _, command := range []string{"project:start", "project:stop", "project:restart", "logs"} {
+	for _, command := range []string{"project:start", "project:stop", "project:restart", "project:lease", "project:release", "logs"} {
 		var stdout, stderr bytes.Buffer
 
 		code := run([]string{command, "--socket", testSocketPath(t)}, &stdout, &stderr)
@@ -283,8 +285,21 @@ func TestRunProjectCommandsRequireName(t *testing.T) {
 	}
 }
 
+func TestRunProjectLeaseRejectsBadTTL(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	code := run([]string{"project:lease", "--socket", testSocketPath(t), "--ttl", "-5m", "dashboard"}, &stdout, &stderr)
+
+	if code != 2 {
+		t.Fatalf("run(project:lease --ttl -5m) exit code = %d, want 2", code)
+	}
+	if !strings.Contains(stderr.String(), "--ttl") {
+		t.Errorf("stderr should explain the ttl problem; got:\n%s", stderr.String())
+	}
+}
+
 func TestRunProjectCommandsDaemonNotRunning(t *testing.T) {
-	for _, command := range []string{"project:start", "project:stop", "project:restart", "logs"} {
+	for _, command := range []string{"project:start", "project:stop", "project:restart", "project:lease", "project:release", "logs"} {
 		var stdout, stderr bytes.Buffer
 
 		code := run([]string{command, "--socket", testSocketPath(t), "dashboard"}, &stdout, &stderr)
@@ -396,6 +411,31 @@ func TestRunProjectStartFailureEndToEnd(t *testing.T) {
 	stderr.Reset()
 	if code := run([]string{"project:stop", "--socket", socket, "dashboard"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("project:stop exit code = %d, want 0 (stderr:\n%s)", code, stderr.String())
+	}
+
+	// project:lease and project:release round-trip through the daemon.
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"project:lease", "--socket", socket, "--ttl", "45m", "dashboard"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("project:lease exit code = %d, want 0 (stderr:\n%s)", code, stderr.String())
+	}
+	for _, want := range []string{"leased until", "45m", "project:release"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("project:lease output missing %q; got:\n%s", want, stdout.String())
+		}
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"status", "--socket", socket}, &stdout, &stderr); code != 0 {
+		t.Fatalf("status exit code = %d (stderr:\n%s)", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"project:release", "--socket", socket, "dashboard"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("project:release exit code = %d, want 0 (stderr:\n%s)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Released activity lease") {
+		t.Errorf("project:release output = %q, want a released-lease confirmation", stdout.String())
 	}
 
 	if err := syscall.Kill(os.Getpid(), syscall.SIGINT); err != nil {

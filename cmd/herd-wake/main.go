@@ -45,8 +45,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runStart(args[1:], stdout, stderr)
 	case "status":
 		return runStatus(args[1:], stdout, stderr)
-	case "project:start", "project:stop", "project:restart":
+	case "project:start", "project:stop", "project:restart", "project:release":
 		return runProjectCommand(args[0], args[1:], stdout, stderr)
+	case "project:lease":
+		return runProjectLease(args[1:], stdout, stderr)
 	case "logs":
 		return runLogs(args[1:], stdout, stderr)
 	default:
@@ -157,7 +159,7 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 
 	fmt.Fprintln(stdout)
 	tw := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "PROJECT\tSTATE\tPID\tUPTIME\tLAST EXIT\tURL\tSUPERVISOR PORT\tUPSTREAM")
+	fmt.Fprintln(tw, "PROJECT\tSTATE\tPID\tUPTIME\tLAST ACTIVITY\tIDLE STOP\tLAST EXIT\tURL\tSUPERVISOR PORT\tUPSTREAM")
 	for _, p := range status.Projects {
 		pid, uptime, lastExit := "-", "-", "-"
 		if p.PID != 0 {
@@ -167,8 +169,9 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 		if p.LastExit != "" {
 			lastExit = p.LastExit
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%d\t127.0.0.1:%d\n",
-			p.Name, p.State, pid, uptime, lastExit, p.PublicURL, p.SupervisorPort, p.ApplicationPort)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t127.0.0.1:%d\n",
+			p.Name, p.State, pid, uptime, describeLastActivity(p), describeIdleStop(p),
+			lastExit, p.PublicURL, p.SupervisorPort, p.ApplicationPort)
 	}
 	if err := tw.Flush(); err != nil {
 		fmt.Fprintf(stderr, "herd-wake: %v\n", err)
@@ -182,8 +185,84 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// describeLastActivity renders the status column for when a project's most
+// recent proxied request completed.
+func describeLastActivity(p control.ProjectStatus) string {
+	if p.LastActivityAt.IsZero() {
+		return "-"
+	}
+	ago := time.Since(p.LastActivityAt).Round(time.Second)
+	if ago < 0 {
+		ago = 0
+	}
+	return ago.String() + " ago"
+}
+
+// describeIdleStop renders the status column for a project's pending idle
+// stop: the scheduled time, what is holding it off, or why there is none.
+func describeIdleStop(p control.ProjectStatus) string {
+	switch {
+	case p.State != daemon.StateRunning:
+		return "-"
+	case p.AlwaysOn:
+		return "never (always on)"
+	case p.InflightRequests > 0:
+		return fmt.Sprintf("held (%d in flight)", p.InflightRequests)
+	case !p.LeaseUntil.IsZero():
+		return "leased until " + p.LeaseUntil.Local().Format("15:04:05")
+	case !p.IdleStopAt.IsZero():
+		in := time.Until(p.IdleStopAt).Round(time.Second)
+		if in < 0 {
+			in = 0
+		}
+		return fmt.Sprintf("in %s (%s)", in, p.IdleStopAt.Local().Format("15:04:05"))
+	default:
+		return "-"
+	}
+}
+
+// runProjectLease implements `herd-wake project:lease --ttl <duration>
+// <name>`: it marks the project active for the given duration so external
+// tools can hold off idle shutdown without generating traffic.
+func runProjectLease(args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("project:lease", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	socketPath := flags.String("socket", "", "path to the control socket (default: ~/Library/Application Support/herd-wake/herd-wake.sock)")
+	ttl := flags.Duration("ttl", 30*time.Minute, "how long the lease lasts, e.g. 30m or 2h")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if flags.NArg() != 1 || flags.Arg(0) == "" {
+		fmt.Fprintf(stderr, "herd-wake: usage: herd-wake project:lease [--ttl duration] <name>\n")
+		return 2
+	}
+	if *ttl <= 0 {
+		fmt.Fprintf(stderr, "herd-wake: --ttl must be positive (got %s)\n", *ttl)
+		return 2
+	}
+	name := flags.Arg(0)
+
+	socket, ok := resolveSocketPath(*socketPath, stderr)
+	if !ok {
+		return 1
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	status, err := control.NewClient(socket).LeaseProject(ctx, name, *ttl)
+	if err != nil {
+		reportDaemonError(stderr, err)
+		return 1
+	}
+
+	fmt.Fprintf(stdout, "Project %q leased until %s (ttl %s); it will not be idle-stopped before then.\n",
+		name, status.LeaseUntil.Local().Format("15:04:05"), *ttl)
+	fmt.Fprintf(stdout, "Release early with: herd-wake project:release %s\n", name)
+	return 0
+}
+
 // runProjectCommand implements `herd-wake project:start|project:stop|
-// project:restart <name>` as control-client calls against the daemon.
+// project:restart|project:release <name>` as control-client calls against
+// the daemon.
 func runProjectCommand(command string, args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	flags.SetOutput(stderr)
@@ -217,15 +296,21 @@ func runProjectCommand(command string, args []string, stdout, stderr io.Writer) 
 		status, err = client.StopProject(ctx, name)
 	case "project:restart":
 		status, err = client.RestartProject(ctx, name)
+	case "project:release":
+		status, err = client.ReleaseProjectLease(ctx, name)
 	}
 	if err != nil {
 		reportDaemonError(stderr, err)
-		if command != "project:stop" && !errors.Is(err, control.ErrDaemonUnreachable) {
+		if (command == "project:start" || command == "project:restart") && !errors.Is(err, control.ErrDaemonUnreachable) {
 			fmt.Fprintf(stderr, "See recent output with: herd-wake logs %s\n", name)
 		}
 		return 1
 	}
 
+	if command == "project:release" {
+		fmt.Fprintf(stdout, "Released activity lease for project %q; normal idle rules apply again.\n", name)
+		return 0
+	}
 	if status.State == daemon.StateRunning {
 		fmt.Fprintf(stdout, "Project %q is running (pid %d).\n", name, status.PID)
 	} else {
@@ -376,6 +461,8 @@ Commands:
   project:start <name>     Start a project's dev server and wait until it is ready
   project:stop <name>      Gracefully stop a project's dev server
   project:restart <name>   Stop (if needed) and start a project's dev server
+  project:lease <name>     Mark a project active so it is not idle-stopped (--ttl, default 30m)
+  project:release <name>   Release a project's activity lease early
   logs <name>              Print a project's recent dev-server output
   version                  Print the herd-wake version
 
@@ -386,6 +473,7 @@ Options:
                     (default: ~/Library/Application Support/herd-wake/herd-wake.sock)
   --log-dir <path>  Directory for per-project process logs (start)
                     (default: ~/Library/Application Support/herd-wake/logs)
+  --ttl <duration>  How long a lease lasts, e.g. 45m or 2h (project:lease; default 30m)
   --lines <n>       Maximum lines to print (logs; 0 = everything buffered)
 `)
 }
