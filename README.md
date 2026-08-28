@@ -17,10 +17,16 @@ go build ./cmd/herd-wake
 
 `herd-wake start` binds one loopback listener per registered project on its
 `supervisor_port` and reverse-proxies HTTP to the project's
-`application_port` (for now the dev server must be started manually — process
-management arrives in a later slice). The daemon serves a control API on a
-unix socket at `~/Library/Application Support/herd-wake/herd-wake.sock`,
-which `herd-wake status` queries. Stop the daemon with Ctrl-C.
+`application_port`. A request to a stopped project starts its dev server on
+demand: the request is held while the server starts (bounded by
+`hold_max_wait_seconds` and `hold_max_requests`) and forwarded once it is
+ready — the client just sees a slower first response. If startup fails, the
+request gets a 503 diagnostic with recent process output, and automatic
+retries back off exponentially (1s doubling to a 30s cap); a manual
+`project:start`/`project:restart` retries immediately. The daemon serves a
+control API on a unix socket at
+`~/Library/Application Support/herd-wake/herd-wake.sock`, which
+`herd-wake status` queries. Stop the daemon with Ctrl-C.
 
 ## Configuration
 

@@ -2,6 +2,7 @@ package process
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log"
 	"net"
@@ -529,6 +530,168 @@ func TestSpawnFailureFailsImmediately(t *testing.T) {
 	}
 	if s.Snapshot().LastError == "" {
 		t.Error("LastError should be set after a spawn failure")
+	}
+}
+
+func TestBackoffDelaySchedule(t *testing.T) {
+	want := []time.Duration{
+		time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second,
+		16 * time.Second, 30 * time.Second, 30 * time.Second,
+	}
+	for i, w := range want {
+		if got := backoffDelay(i + 1); got != w {
+			t.Errorf("backoffDelay(%d) = %s, want %s", i+1, got, w)
+		}
+	}
+	if got := backoffDelay(0); got != 0 {
+		t.Errorf("backoffDelay(0) = %s, want 0", got)
+	}
+	if got := backoffDelay(1000); got != backoffMax {
+		t.Errorf("backoffDelay(1000) = %s, want the %s cap (no overflow)", got, backoffMax)
+	}
+}
+
+// waitForSpawnCount polls the ring buffer until the marker line appears
+// exactly want times (each spawn of the crashing command prints it once).
+func waitForSpawnCount(t *testing.T, s *Supervisor, marker string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	count := func() int {
+		n := 0
+		for _, line := range s.Logs(0) {
+			if strings.Contains(line, marker) {
+				n++
+			}
+		}
+		return n
+	}
+	for time.Now().Before(deadline) {
+		if count() == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("spawn count = %d, want %d", count(), want)
+}
+
+func TestOnDemandStartBackoffAndManualReset(t *testing.T) {
+	s := newTestSupervisor(t, shellProject(t, "echo spawn-marker; exit 1"))
+
+	// First on-demand start spawns and fails; the outcome is delivered only
+	// after the pump captured the process output.
+	err := awaitStartup(t, s.EnsureStartedOnDemand())
+	if err == nil {
+		t.Fatal("EnsureStartedOnDemand on a crashing command should fail")
+	}
+	var be *BackoffError
+	if errors.As(err, &be) {
+		t.Fatalf("first failure should be the startup error, not backoff; got %v", err)
+	}
+	waitForSpawnCount(t, s, "spawn-marker", 1)
+	if s.Snapshot().NextRetryAt.IsZero() {
+		t.Error("NextRetryAt should be scheduled after a failed start")
+	}
+
+	// On-demand starts inside the backoff window are refused without a
+	// respawn.
+	for i := 0; i < 3; i++ {
+		err := awaitStartup(t, s.EnsureStartedOnDemand())
+		if !errors.As(err, &be) {
+			t.Fatalf("attempt %d during backoff: error = %v, want a *BackoffError", i, err)
+		}
+	}
+	waitForSpawnCount(t, s, "spawn-marker", 1)
+
+	// A manual start bypasses and resets the backoff: it respawns
+	// immediately (and fails again).
+	err = awaitStartup(t, s.EnsureStarted())
+	if err == nil {
+		t.Fatal("manual EnsureStarted on a crashing command should fail")
+	}
+	if errors.As(err, &be) {
+		t.Fatalf("manual start must bypass backoff; got %v", err)
+	}
+	waitForSpawnCount(t, s, "spawn-marker", 2)
+
+	// The reset put us back at the first backoff step (1s); inside it,
+	// on-demand starts are again refused ...
+	err = awaitStartup(t, s.EnsureStartedOnDemand())
+	if !errors.As(err, &be) {
+		t.Fatalf("error after manual failure = %v, want a *BackoffError", err)
+	}
+	waitForSpawnCount(t, s, "spawn-marker", 2)
+
+	// ... and once the window elapses, an on-demand start retries.
+	if wait := time.Until(be.RetryAt) + 100*time.Millisecond; wait > 0 {
+		time.Sleep(wait)
+	}
+	err = awaitStartup(t, s.EnsureStartedOnDemand())
+	if err == nil || errors.As(err, &be) {
+		t.Fatalf("post-backoff start should respawn and report the real failure; got %v", err)
+	}
+	waitForSpawnCount(t, s, "spawn-marker", 3)
+}
+
+func TestBackoffResetOnSuccessfulStart(t *testing.T) {
+	pidfile := filepath.Join(t.TempDir(), "helper.pid")
+	p := helperProject(t, testproc.ModeListen)
+	p.Env[testproc.EnvPidfile] = pidfile
+	s := newTestSupervisor(t, p)
+
+	if err := awaitStartup(t, s.EnsureStartedOnDemand()); err != nil {
+		t.Fatalf("EnsureStartedOnDemand: %v", err)
+	}
+	if got := s.Snapshot().NextRetryAt; !got.IsZero() {
+		t.Errorf("NextRetryAt = %v after a successful start, want zero", got)
+	}
+
+	// After an unexpected external kill, the next request-triggered start is
+	// NOT throttled: no startup failure has occurred.
+	pid := s.Snapshot().PID
+	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
+		t.Fatalf("kill: %v", err)
+	}
+	waitForState(t, s, StateFailed)
+	if err := awaitStartup(t, s.EnsureStartedOnDemand()); err != nil {
+		t.Fatalf("EnsureStartedOnDemand after external kill: %v", err)
+	}
+}
+
+func TestStateIsLockFreeMirrorOfLifecycle(t *testing.T) {
+	s := newTestSupervisor(t, helperProject(t, testproc.ModeListen))
+	if got := s.State(); got != StateStopped {
+		t.Fatalf("State() = %q, want %q", got, StateStopped)
+	}
+	if err := awaitStartup(t, s.EnsureStarted()); err != nil {
+		t.Fatalf("EnsureStarted: %v", err)
+	}
+	if got := s.State(); got != StateRunning {
+		t.Errorf("State() = %q, want %q", got, StateRunning)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := s.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if got := s.State(); got != StateStopped {
+		t.Errorf("State() = %q, want %q", got, StateStopped)
+	}
+}
+
+func TestStartupFailureOutcomeIncludesFinalOutput(t *testing.T) {
+	// The failure outcome must not race the output pump: by the time
+	// EnsureStarted reports the failure, the crash's log lines are readable.
+	s := newTestSupervisor(t, shellProject(t, "echo first-line; echo last-words >&2; exit 9"))
+
+	if err := awaitStartup(t, s.EnsureStarted()); err == nil {
+		t.Fatal("EnsureStarted should fail")
+	}
+
+	lines := strings.Join(s.Logs(0), "\n")
+	for _, want := range []string{"first-line", "last-words"} {
+		if !strings.Contains(lines, want) {
+			t.Errorf("logs at failure time missing %q; got:\n%s", want, lines)
+		}
 	}
 }
 

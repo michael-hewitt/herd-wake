@@ -17,6 +17,8 @@ projects:
     shutdown_timeout_seconds: 5
     websockets_keep_alive: false
     log_retention_days: 3
+    hold_max_wait_seconds: 20
+    hold_max_requests: 8
     always_on: true
     node_path: /usr/local/bin/node
     env:

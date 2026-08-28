@@ -25,6 +25,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -61,6 +62,17 @@ const (
 	// surviving group members (e.g. an intermediate shell died on the
 	// graceful signal but a grandchild ignored it).
 	forceKillNote = "process group force-killed"
+	// backoffBase is the delay before the first automatic (request-triggered)
+	// retry after a failed startup; each further consecutive failure doubles
+	// it (1s, 2s, 4s, ...) up to backoffMax. Manual project:start/restart
+	// bypasses and resets the backoff.
+	backoffBase = time.Second
+	// backoffMax caps the automatic-retry backoff delay.
+	backoffMax = 30 * time.Second
+	// pumpDrainTimeout bounds how long a startup failure waits for the
+	// output pump to capture the dead process's final lines before the
+	// failure is delivered to EnsureStarted callers.
+	pumpDrainTimeout = 2 * time.Second
 )
 
 // signalsByName maps the config's validated shutdown_signal whitelist to
@@ -91,6 +103,29 @@ type Snapshot struct {
 	LastExit string
 	// LastError explains the most recent failure while in StateFailed.
 	LastError string
+	// NextRetryAt is when the next automatic (request-triggered) startup may
+	// run after a failed start; zero when no backoff is in effect.
+	NextRetryAt time.Time
+}
+
+// BackoffError is delivered to EnsureStartedOnDemand callers while automatic
+// retries are suppressed after a failed startup.
+type BackoffError struct {
+	// Project is the project whose start was suppressed.
+	Project string
+	// RetryAt is when the next automatic startup attempt may run.
+	RetryAt time.Time
+	// Reason is the last startup failure's error text.
+	Reason string
+}
+
+func (e *BackoffError) Error() string {
+	wait := time.Until(e.RetryAt).Round(100 * time.Millisecond)
+	if wait < 0 {
+		wait = 0
+	}
+	return fmt.Sprintf("project %q failed to start recently (%s); automatic retry in %s, or run `herd-wake project:start %s` to retry now",
+		e.Project, e.Reason, wait, e.Project)
 }
 
 // Supervisor manages the process lifecycle of a single project. All methods
@@ -100,6 +135,11 @@ type Supervisor struct {
 	logPath string
 	logger  *log.Logger
 	probe   *http.Client
+
+	// atomicState mirrors state for the lock-free State() fast path the
+	// proxy uses on every request. It is only ever written via
+	// setStateLocked (with mu held); readers need no lock.
+	atomicState atomic.Value // string
 
 	mu        sync.Mutex
 	state     string
@@ -126,13 +166,19 @@ type Supervisor struct {
 	stopDone chan struct{}
 	// waiters are pending EnsureStarted callers for the current startup.
 	waiters []chan error
-	ring    *ringBuffer
+	// consecutiveFailures counts startup failures since the last successful
+	// start (or manual reset); it drives the automatic-retry backoff.
+	consecutiveFailures int
+	// nextRetryAt is when the next automatic (request-triggered) startup may
+	// run; zero when no backoff is in effect.
+	nextRetryAt time.Time
+	ring        *ringBuffer
 }
 
 // NewSupervisor builds a supervisor for one project. Process output is
 // appended to <logDir>/<name>.log; nothing is spawned until EnsureStarted.
 func NewSupervisor(p *config.Project, logDir string, logger *log.Logger) *Supervisor {
-	return &Supervisor{
+	s := &Supervisor{
 		project: p,
 		logPath: filepath.Join(logDir, p.Name+".log"),
 		logger:  logger,
@@ -140,13 +186,29 @@ func NewSupervisor(p *config.Project, logDir string, logger *log.Logger) *Superv
 		state:   StateStopped,
 		ring:    newRingBuffer(ringCapacity),
 	}
+	s.atomicState.Store(StateStopped)
+	return s
+}
+
+// State returns the current lifecycle state without taking the supervisor
+// lock. This is the proxy's per-request fast path: requests to a running
+// project must not contend on lifecycle locking.
+func (s *Supervisor) State() string {
+	return s.atomicState.Load().(string)
+}
+
+// setStateLocked is the single place the lifecycle state changes; it keeps
+// the lock-free mirror in sync. Called with s.mu held.
+func (s *Supervisor) setStateLocked(state string) {
+	s.state = state
+	s.atomicState.Store(state)
 }
 
 // Snapshot returns the current lifecycle state for status reporting.
 func (s *Supervisor) Snapshot() Snapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	snap := Snapshot{State: s.state, LastExit: s.lastExit, LastError: s.lastErr}
+	snap := Snapshot{State: s.state, LastExit: s.lastExit, LastError: s.lastErr, NextRetryAt: s.nextRetryAt}
 	if s.cmd != nil && s.cmd.Process != nil {
 		snap.PID = s.cmd.Process.Pid
 		snap.StartedAt = s.spawnedAt
@@ -168,12 +230,36 @@ func (s *Supervisor) LogPath() string { return s.logPath }
 // fresh startup; a stopping project reports an error (retry after it has
 // stopped, or use Restart).
 //
-// This is the hook a later slice's proxy hot path uses to hold a request
-// until the upstream is ready.
+// This is the manual path (project:start, project:restart): it resets and
+// bypasses the automatic-retry backoff, so a failed project retries
+// immediately. Request-triggered starts go through EnsureStartedOnDemand.
 func (s *Supervisor) EnsureStarted() <-chan error {
-	done := make(chan error, 1)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.consecutiveFailures = 0
+	s.nextRetryAt = time.Time{}
+	return s.ensureStartedLocked()
+}
+
+// EnsureStartedOnDemand is EnsureStarted for request-triggered (automatic)
+// starts: while a failed project is inside its retry-backoff window the
+// returned channel immediately yields a *BackoffError instead of respawning
+// the process, so a crash-looping project is not hot-looped by traffic.
+func (s *Supervisor) EnsureStartedOnDemand() <-chan error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state == StateFailed && time.Now().Before(s.nextRetryAt) {
+		done := make(chan error, 1)
+		done <- &BackoffError{Project: s.project.Name, RetryAt: s.nextRetryAt, Reason: s.lastErr}
+		return done
+	}
+	return s.ensureStartedLocked()
+}
+
+// ensureStartedLocked implements the shared EnsureStarted state machine.
+// Called with s.mu held.
+func (s *Supervisor) ensureStartedLocked() <-chan error {
+	done := make(chan error, 1)
 	switch s.state {
 	case StateRunning:
 		done <- nil
@@ -183,14 +269,43 @@ func (s *Supervisor) EnsureStarted() <-chan error {
 		done <- fmt.Errorf("project %q is stopping; retry once it has stopped", s.project.Name)
 	default: // stopped, failed
 		if err := s.spawnLocked(); err != nil {
-			s.state = StateFailed
+			s.setStateLocked(StateFailed)
 			s.lastErr = err.Error()
+			s.recordStartFailureLocked()
 			done <- err
 			break
 		}
 		s.waiters = append(s.waiters, done)
 	}
 	return done
+}
+
+// recordStartFailureLocked notes a failed startup and schedules when the
+// next automatic (request-triggered) retry may run: backoffBase doubled per
+// consecutive failure, capped at backoffMax. Called with s.mu held.
+func (s *Supervisor) recordStartFailureLocked() {
+	s.consecutiveFailures++
+	s.nextRetryAt = time.Now().Add(backoffDelay(s.consecutiveFailures))
+}
+
+// backoffDelay returns the automatic-retry delay after the given number of
+// consecutive startup failures: backoffBase << (failures-1), capped at
+// backoffMax (1s, 2s, 4s, 8s, 16s, 30s, 30s, ...).
+func backoffDelay(failures int) time.Duration {
+	if failures < 1 {
+		return 0
+	}
+	d := backoffBase
+	for i := 1; i < failures; i++ {
+		d *= 2
+		if d >= backoffMax {
+			return backoffMax
+		}
+	}
+	if d > backoffMax {
+		return backoffMax
+	}
+	return d
 }
 
 // Stop transitions a starting or running project to stopped: it sends the
@@ -223,7 +338,7 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 		s.abortErr = fmt.Errorf("project %q: stopped while starting", s.project.Name)
 		s.notifyWaitersLocked(s.abortErr)
 	}
-	s.state = StateStopping
+	s.setStateLocked(StateStopping)
 	pgid := s.pgid
 	procDone := s.procDone
 	stopDone := make(chan struct{})
@@ -269,7 +384,7 @@ func (s *Supervisor) finishStop(pgid int, procDone <-chan struct{}, stopDone cha
 	}
 
 	s.mu.Lock()
-	s.state = StateStopped
+	s.setStateLocked(StateStopped)
 	s.lastErr = ""
 	if forced {
 		// Make the exit summary truthful: the direct child's wait status
@@ -369,7 +484,7 @@ func (s *Supervisor) spawnLocked() error {
 	// pump see EOF once every process in the group has exited.
 	w.Close() //nolint:errcheck // parent's copy; the child keeps its own descriptor
 
-	s.state = StateStarting
+	s.setStateLocked(StateStarting)
 	s.cmd = cmd
 	s.pgid = cmd.Process.Pid // Setpgid: true makes the child lead its own group
 	s.spawnedAt = time.Now()
@@ -378,11 +493,12 @@ func (s *Supervisor) spawnLocked() error {
 	s.abortErr = nil
 	procDone := make(chan struct{})
 	s.procDone = procDone
+	pumpDone := make(chan struct{})
 
-	go s.pump(r, logFile)
+	go s.pump(r, logFile, pumpDone)
 	go func() {
 		waitErr := cmd.Wait()
-		s.handleExit(cmd, waitErr, procDone)
+		s.handleExit(cmd, waitErr, procDone, pumpDone)
 	}()
 	go s.probeReadiness(cmd, procDone)
 
@@ -394,9 +510,11 @@ func (s *Supervisor) spawnLocked() error {
 // transition. It runs (exactly once per spawn) when cmd.Wait returns —
 // whether the exit was graceful, forced, deliberate (stop, readiness
 // timeout), or external (someone killed the process).
-func (s *Supervisor) handleExit(cmd *exec.Cmd, waitErr error, procDone chan struct{}) {
+func (s *Supervisor) handleExit(cmd *exec.Cmd, waitErr error, procDone, pumpDone chan struct{}) {
 	exitDesc, cleanExit := describeExit(cmd.ProcessState, waitErr)
 
+	var failedWaiters []chan error
+	var failureReason error
 	s.mu.Lock()
 	prev := s.state
 	if s.cmd == cmd { // guard against a respawn racing an extremely late exit
@@ -407,7 +525,8 @@ func (s *Supervisor) handleExit(cmd *exec.Cmd, waitErr error, procDone chan stru
 		s.lastExit = exitDesc
 		switch prev {
 		case StateStarting:
-			s.state = StateFailed
+			s.setStateLocked(StateFailed)
+			s.recordStartFailureLocked()
 			reason := s.abortErr
 			if reason == nil {
 				reason = fmt.Errorf("project %q: process exited during startup (%s); see `herd-wake logs %s`",
@@ -415,7 +534,12 @@ func (s *Supervisor) handleExit(cmd *exec.Cmd, waitErr error, procDone chan stru
 			}
 			s.abortErr = nil
 			s.lastErr = reason.Error()
-			s.notifyWaitersLocked(reason)
+			// The startup outcome is delivered below, after the output pump
+			// has drained, so failure consumers (e.g. the proxy's 503
+			// diagnostic) see the process's final log lines.
+			failedWaiters = s.waiters
+			s.waiters = nil
+			failureReason = reason
 			// The direct child is gone but grandchildren may survive (e.g. a
 			// shell that spawned a background process and exited). Nothing
 			// asked them to stop gracefully, so reap the stragglers now —
@@ -426,12 +550,15 @@ func (s *Supervisor) handleExit(cmd *exec.Cmd, waitErr error, procDone chan stru
 			// the entire process group is gone (finishStop), so only the
 			// direct child's exit is recorded here.
 		case StateRunning:
-			// Unexpected exit: we did not ask the process to stop.
+			// Unexpected exit: we did not ask the process to stop. No retry
+			// backoff is recorded here — readiness had succeeded, so the next
+			// start is not part of a startup-failure loop (and if it does fail
+			// at startup, the backoff begins then).
 			if cleanExit {
-				s.state = StateStopped
+				s.setStateLocked(StateStopped)
 				s.lastErr = ""
 			} else {
-				s.state = StateFailed
+				s.setStateLocked(StateFailed)
 				s.lastErr = fmt.Sprintf("process exited unexpectedly (%s); see `herd-wake logs %s`",
 					exitDesc, s.project.Name)
 			}
@@ -445,6 +572,20 @@ func (s *Supervisor) handleExit(cmd *exec.Cmd, waitErr error, procDone chan stru
 	s.mu.Unlock()
 
 	s.logger.Printf("project %q: process exited (%s); %s -> %s", s.project.Name, exitDesc, prev, next)
+
+	if len(failedWaiters) > 0 {
+		// Startup failed: give the pump a bounded window to capture the
+		// process's final output (its EOF arrives once the SIGKILLed group is
+		// gone) before delivering the outcome, so a caller reading the logs —
+		// the 503 diagnostic — reliably sees why the process died.
+		select {
+		case <-pumpDone:
+		case <-time.After(pumpDrainTimeout):
+		}
+		for _, w := range failedWaiters {
+			w <- failureReason
+		}
+	}
 }
 
 // probeReadiness polls the configured readiness check until it succeeds, the
@@ -461,7 +602,9 @@ func (s *Supervisor) probeReadiness(cmd *exec.Cmd, procDone <-chan struct{}) {
 		if s.probeOnce() {
 			s.mu.Lock()
 			if s.state == StateStarting && s.cmd == cmd {
-				s.state = StateRunning
+				s.setStateLocked(StateRunning)
+				s.consecutiveFailures = 0
+				s.nextRetryAt = time.Time{}
 				s.notifyWaitersLocked(nil)
 				s.logger.Printf("project %q: ready (pid %d)", s.project.Name, cmd.Process.Pid)
 			}
@@ -513,9 +656,10 @@ func (s *Supervisor) probeOnce() bool {
 
 // pump copies combined stdout/stderr from the process group into the ring
 // buffer and the log file, line by line. It ends when every process holding
-// the pipe's write end has exited (EOF). Lines longer than maxLineBytes are
-// split.
-func (s *Supervisor) pump(r *os.File, logFile *os.File) {
+// the pipe's write end has exited (EOF), then closes done. Lines longer than
+// maxLineBytes are split.
+func (s *Supervisor) pump(r *os.File, logFile *os.File, done chan<- struct{}) {
+	defer close(done)
 	defer r.Close()       //nolint:errcheck // read side, nothing to recover
 	defer logFile.Close() //nolint:errcheck // best-effort flush on EOF
 	br := bufio.NewReaderSize(r, 32*1024)

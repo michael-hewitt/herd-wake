@@ -42,6 +42,9 @@ func TestLoadValid(t *testing.T) {
 	if !dash.AlwaysOn || dash.LogRetentionDays != 3 || dash.NodePath != "/usr/local/bin/node" {
 		t.Errorf("optional fields = %v/%d/%q", dash.AlwaysOn, dash.LogRetentionDays, dash.NodePath)
 	}
+	if dash.HoldMaxWaitSeconds != 20 || dash.HoldMaxRequests != 8 {
+		t.Errorf("hold limits = %d/%d, want 20/8", dash.HoldMaxWaitSeconds, dash.HoldMaxRequests)
+	}
 	if dash.Env["APP_ENV"] != "local" {
 		t.Errorf("Env = %v, want APP_ENV=local", dash.Env)
 	}
@@ -80,6 +83,12 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	}
 	if p.LogRetentionDays != DefaultLogRetentionDays {
 		t.Errorf("LogRetentionDays = %d, want %d", p.LogRetentionDays, DefaultLogRetentionDays)
+	}
+	if want := DefaultStartupTimeoutSeconds + DefaultHoldWaitBufferSeconds; p.HoldMaxWaitSeconds != want {
+		t.Errorf("HoldMaxWaitSeconds = %d, want %d (startup timeout + buffer)", p.HoldMaxWaitSeconds, want)
+	}
+	if p.HoldMaxRequests != DefaultHoldMaxRequests {
+		t.Errorf("HoldMaxRequests = %d, want %d", p.HoldMaxRequests, DefaultHoldMaxRequests)
 	}
 	if p.AlwaysOn {
 		t.Error("AlwaysOn = true, want false by default")
@@ -242,6 +251,8 @@ func TestValidateBadOptionalFields(t *testing.T) {
 	wantError(t, got, "chaotic", "readiness_strategy")
 	wantError(t, got, "chaotic", "shutdown_signal")
 	wantError(t, got, "chaotic", "idle_timeout_minutes")
+	wantError(t, got, "chaotic", "hold_max_wait_seconds")
+	wantError(t, got, "chaotic", "hold_max_requests")
 	wantError(t, got, "twinned", "application_port")
 }
 

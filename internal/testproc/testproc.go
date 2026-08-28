@@ -11,6 +11,7 @@ package testproc
 
 import (
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -39,13 +40,18 @@ const (
 	// EnvLinger is how long mode "listen-exit" stays alive (Go duration,
 	// default 300ms).
 	EnvLinger = "HW_TESTPROC_LINGER"
+	// EnvStartDelay, when set (Go duration), makes the listener modes sleep
+	// before binding their port — a slow-starting server for cold-start and
+	// request-holding tests.
+	EnvStartDelay = "HW_TESTPROC_START_DELAY"
 )
 
 // Helper modes.
 const (
 	// ModeListen binds a TCP listener and exits 0 on SIGTERM/SIGINT.
 	ModeListen = "listen"
-	// ModeHTTP serves 200 OK on the port and exits 0 on SIGTERM/SIGINT.
+	// ModeHTTP serves 200 OK on the port (echoing method, path, and Host so
+	// proxy tests can assert what arrived) and exits 0 on SIGTERM/SIGINT.
 	ModeHTTP = "http"
 	// ModeStubborn binds a TCP listener and ignores SIGTERM/SIGINT; only
 	// SIGKILL ends it.
@@ -100,6 +106,7 @@ func run(mode string) int {
 
 func listen() int {
 	writePidfile()
+	startDelay()
 	ln, err := bindPort()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "testproc:", err)
@@ -117,14 +124,16 @@ func listen() int {
 
 func serveHTTP() int {
 	writePidfile()
+	startDelay()
 	ln, err := bindPort()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "testproc:", err)
 		return 1
 	}
 	fmt.Printf("testproc serving http on %s\n", ln.Addr())
-	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprintln(w, "ok")
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		fmt.Fprintf(w, "ok %s %s host=%s body=%s pid=%d\n", r.Method, r.URL.Path, r.Host, body, os.Getpid())
 	})}
 	go server.Serve(ln) //nolint:errcheck // process exits on signal below
 
@@ -221,5 +230,15 @@ func acceptLoop(ln net.Listener) {
 func writePidfile() {
 	if path := os.Getenv(EnvPidfile); path != "" {
 		_ = os.WriteFile(path, []byte(strconv.Itoa(os.Getpid())), 0o644)
+	}
+}
+
+// startDelay sleeps for EnvStartDelay (if set) to simulate a server that
+// takes a while to become ready.
+func startDelay() {
+	if v := os.Getenv(EnvStartDelay); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			time.Sleep(d)
+		}
 	}
 }

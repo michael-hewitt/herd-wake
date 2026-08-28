@@ -29,6 +29,14 @@ const (
 	DefaultShutdownSignal         = "SIGTERM"
 	DefaultShutdownTimeoutSeconds = 10
 	DefaultLogRetentionDays       = 7
+	// DefaultHoldMaxRequests bounds how many requests may be held at once
+	// while a project cold-starts.
+	DefaultHoldMaxRequests = 100
+	// DefaultHoldWaitBufferSeconds is added to startup_timeout_seconds to
+	// derive the default hold_max_wait_seconds: a held request should outlive
+	// the startup attempt it is waiting on by a small margin, so the caller
+	// sees the startup's real outcome instead of a generic wait timeout.
+	DefaultHoldWaitBufferSeconds = 5
 )
 
 // Readiness strategies.
@@ -80,6 +88,8 @@ type Project struct {
 	ShutdownTimeoutSeconds int    `yaml:"shutdown_timeout_seconds"`
 	WebSocketsKeepAlive    *bool  `yaml:"websockets_keep_alive"`
 	LogRetentionDays       int    `yaml:"log_retention_days"`
+	HoldMaxWaitSeconds     int    `yaml:"hold_max_wait_seconds"`
+	HoldMaxRequests        int    `yaml:"hold_max_requests"`
 
 	// Optional fields without defaults.
 	Env      map[string]string `yaml:"env"`
@@ -173,6 +183,12 @@ func (p *Project) applyDefaults() {
 	}
 	if p.LogRetentionDays == 0 {
 		p.LogRetentionDays = DefaultLogRetentionDays
+	}
+	if p.HoldMaxWaitSeconds == 0 {
+		p.HoldMaxWaitSeconds = p.StartupTimeoutSeconds + DefaultHoldWaitBufferSeconds
+	}
+	if p.HoldMaxRequests == 0 {
+		p.HoldMaxRequests = DefaultHoldMaxRequests
 	}
 }
 
@@ -291,6 +307,8 @@ func (p *Project) validate() []error {
 		{"idle_timeout_minutes", p.IdleTimeoutMinutes},
 		{"shutdown_timeout_seconds", p.ShutdownTimeoutSeconds},
 		{"log_retention_days", p.LogRetentionDays},
+		{"hold_max_wait_seconds", p.HoldMaxWaitSeconds},
+		{"hold_max_requests", p.HoldMaxRequests},
 	} {
 		if timeout.value < 0 {
 			fail(timeout.field, "must not be negative (got %d)", timeout.value)

@@ -6,9 +6,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"net/http"
-	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -47,20 +44,6 @@ func freePort(t *testing.T) int {
 		t.Fatalf("release port: %v", err)
 	}
 	return port
-}
-
-// serverPort extracts the TCP port an httptest server is listening on.
-func serverPort(t *testing.T, ts *httptest.Server) int {
-	t.Helper()
-	u, err := url.Parse(ts.URL)
-	if err != nil {
-		t.Fatalf("parse test server URL: %v", err)
-	}
-	var n int
-	if _, err := fmt.Sscanf(u.Port(), "%d", &n); err != nil {
-		t.Fatalf("parse port %q: %v", u.Port(), err)
-	}
-	return n
 }
 
 // testConfig builds a one-project config proxying supervisorPort ->
@@ -121,64 +104,6 @@ func waitForDaemon(t *testing.T, socket string, runDone <-chan error) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("daemon control socket never became ready")
-}
-
-func TestDaemonProxiesEndToEnd(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "upstream saw %s %s host=%s", r.Method, r.URL.Path, r.Host)
-	}))
-	defer upstream.Close()
-
-	supervisorPort := freePort(t)
-	startDaemon(t, testConfig(supervisorPort, serverPort(t, upstream)))
-
-	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/hello", supervisorPort), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Host = "dashboard.test"
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("request through supervisor port: %v", err)
-	}
-	defer resp.Body.Close() //nolint:errcheck // test cleanup
-	body, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("status = %d, want 200", resp.StatusCode)
-	}
-	want := "upstream saw GET /hello host=dashboard.test"
-	if string(body) != want {
-		t.Errorf("body = %q, want %q", body, want)
-	}
-}
-
-func TestDaemonUpstreamDownReturns503(t *testing.T) {
-	supervisorPort := freePort(t)
-	applicationPort := freePort(t) // nothing listens here
-	socket, _, _ := startDaemon(t, testConfig(supervisorPort, applicationPort))
-
-	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/", supervisorPort))
-	if err != nil {
-		t.Fatalf("request through supervisor port: %v", err)
-	}
-	defer resp.Body.Close() //nolint:errcheck // test cleanup
-	body, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503", resp.StatusCode)
-	}
-	if !strings.Contains(string(body), `"dashboard"`) {
-		t.Errorf("503 body should name the project; got:\n%s", body)
-	}
-	if !strings.Contains(string(body), fmt.Sprintf("127.0.0.1:%d", applicationPort)) {
-		t.Errorf("503 body should name the upstream address; got:\n%s", body)
-	}
-
-	// The supervisor stays healthy: the control socket still answers.
-	if _, err := control.NewClient(socket).Status(context.Background()); err != nil {
-		t.Errorf("daemon stopped answering after a proxy 503: %v", err)
-	}
 }
 
 func TestDaemonStatusReportsDaemonAndProjects(t *testing.T) {

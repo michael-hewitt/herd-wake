@@ -61,6 +61,18 @@ projects:
     # Default: 60.
     startup_timeout_seconds: 60
 
+    # Optional. Requests that arrive while the project is starting are held
+    # and forwarded once the server is ready (the client just sees a slower
+    # first response). hold_max_wait_seconds bounds how long one held request
+    # may wait (default: startup_timeout_seconds + 5, so the request outlives
+    # the startup attempt and sees its real outcome). hold_max_requests bounds
+    # how many requests may be held at once (default: 100). A request over
+    # either limit receives a 503 explaining the breach. Held request bodies
+    # are never buffered by herd-wake: they are streamed to the dev server
+    # only once it is ready.
+    hold_max_wait_seconds: 65
+    hold_max_requests: 100
+
     # Optional. Stop the dev server after this many minutes without activity
     # (requests or protected WebSocket connections). Default: 15.
     idle_timeout_minutes: 15

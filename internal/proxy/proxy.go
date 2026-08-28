@@ -22,11 +22,12 @@ import (
 	"github.com/michael-hewitt/herd-wake/internal/config"
 )
 
-// New returns the reverse proxy handler for one project. It forwards every
-// request to 127.0.0.1:<application_port>, assuming (in this slice) that the
-// upstream dev server is already running. If the upstream cannot be reached
-// the handler answers 503 with a short diagnostic naming the project and the
-// upstream address it tried.
+// New returns the plain forwarding reverse proxy for one project: every
+// request goes to 127.0.0.1:<application_port>, assuming the upstream dev
+// server is already running. If the upstream cannot be reached the handler
+// answers 503 with a short diagnostic naming the project and the upstream
+// address it tried. NewOnDemand wraps this handler with request-triggered
+// startup; the daemon serves that wrapper.
 func New(p *config.Project, logger *log.Logger) http.Handler {
 	upstream := net.JoinHostPort("127.0.0.1", strconv.Itoa(p.ApplicationPort))
 
@@ -83,8 +84,8 @@ func New(p *config.Project, logger *log.Logger) http.Handler {
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 			w.Header().Set("Cache-Control", "no-store")
 			w.WriteHeader(http.StatusServiceUnavailable)
-			fmt.Fprintf(w, "herd-wake: project %q is unavailable.\n\nCould not reach its dev server at http://%s: %v\n\nherd-wake does not start servers yet; start the dev server manually and retry.\n",
-				p.Name, upstream, err)
+			fmt.Fprintf(w, "herd-wake: project %q is unavailable.\n\nCould not reach its dev server at http://%s: %v\n\nThe server may have just stopped or crashed; retrying will start it again (see `herd-wake logs %s`).\n",
+				p.Name, upstream, err, p.Name)
 		},
 	}
 }

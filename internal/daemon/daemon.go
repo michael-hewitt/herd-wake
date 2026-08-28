@@ -102,7 +102,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		servers = append(servers, boundServer{
 			name:     "project " + p.Name,
 			listener: listener,
-			server:   &http.Server{Handler: proxy.New(p, d.logger), ErrorLog: d.logger},
+			server:   &http.Server{Handler: proxy.NewOnDemand(p, st.proc, d.logger), ErrorLog: d.logger},
 		})
 		d.logger.Printf("project %q: proxying %s -> 127.0.0.1:%d (%s)", p.Name, addr, p.ApplicationPort, p.PublicURL)
 	}

@@ -12,6 +12,8 @@ projects:
     readiness_url: http://127.0.0.1:17101/
     shutdown_signal: SIGDANCE
     idle_timeout_minutes: -5
+    hold_max_wait_seconds: -1
+    hold_max_requests: -3
   twinned:
     public_url: https://twinned.test
     supervisor_port: 17102
