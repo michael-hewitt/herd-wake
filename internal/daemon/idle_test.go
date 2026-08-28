@@ -412,14 +412,17 @@ func TestIdleStopIsolatedBetweenProjects(t *testing.T) {
 		t.Fatalf("beta cold start = %d; body:\n%s", code, body)
 	}
 	betaPid := echoPid(t, body)
+	// The supervisor's PID is the direct child (/bin/sh), which only equals
+	// the echoed helper pid on shells that exec; compare it to itself instead.
+	betaSupPid := projectStatusByName(t, socket, "beta").PID
 
 	// Alpha idles out; beta must be completely unaffected.
 	waitForProjectState(t, socket, "alpha", StateStopped, 10*time.Second)
 	waitProcessGone(t, alphaPid)
 
 	beta := projectStatusByName(t, socket, "beta")
-	if beta.State != StateRunning || beta.PID != betaPid {
-		t.Fatalf("beta after alpha's idle stop = state %q pid %d, want running with pid %d", beta.State, beta.PID, betaPid)
+	if beta.State != StateRunning || beta.PID != betaSupPid {
+		t.Fatalf("beta after alpha's idle stop = state %q pid %d, want running with pid %d", beta.State, beta.PID, betaSupPid)
 	}
 	code, body = get("beta", "/still-alive")
 	if code != 200 || echoPid(t, body) != betaPid {
