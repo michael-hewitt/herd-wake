@@ -63,6 +63,11 @@ func TestRunProjectsListsConfiguredProjects(t *testing.T) {
 		"7102",
 		"17102",
 		"(always on)",
+		// Merged from testdata/projects.d/reports.yaml, with its source shown.
+		"reports",
+		"https://reports.test",
+		"Source:            projects.d/reports.yaml",
+		"Source:            config.yaml",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("run(projects) stdout missing %q; got:\n%s", want, out)
@@ -267,6 +272,128 @@ func TestRunStartAndStatusEndToEnd(t *testing.T) {
 	}
 	if _, err := os.Lstat(socket); !os.IsNotExist(err) {
 		t.Errorf("control socket %s should be removed after shutdown (stat err: %v)", socket, err)
+	}
+}
+
+func TestRunReloadDaemonNotRunning(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	code := run([]string{"reload", "--socket", testSocketPath(t)}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("run(reload) exit code = %d, want 1 when no daemon is running", code)
+	}
+	if !strings.Contains(stderr.String(), "daemon is not running") {
+		t.Errorf("stderr should say the daemon is not running; got:\n%s", stderr.String())
+	}
+}
+
+// TestRunReloadEndToEnd drives a real daemon through the CLI: `reload`
+// picks up a project added under projects.d and reports the diff, `status`
+// shows the config path and reload time, and an invalid config is rejected
+// with its errors.
+func TestRunReloadEndToEnd(t *testing.T) {
+	workDir := t.TempDir()
+	configDir := t.TempDir()
+	configPath := filepath.Join(configDir, "config.yaml")
+	project := func(name string, supervisorPort, applicationPort int) string {
+		return fmt.Sprintf(`  %s:
+    public_url: https://%s.test
+    supervisor_port: %d
+    application_port: %d
+    working_directory: %s
+    command: sleep 300
+    readiness_strategy: tcp
+`, name, name, supervisorPort, applicationPort, workDir)
+	}
+	if err := os.WriteFile(configPath, []byte("projects:\n"+project("dashboard", freePort(t), freePort(t))), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	socket := testSocketPath(t)
+
+	var startOut, startErr bytes.Buffer
+	var mu sync.Mutex
+	startDone := make(chan int, 1)
+	go func() {
+		mu.Lock()
+		defer mu.Unlock()
+		startDone <- run([]string{"start", "--config", configPath, "--socket", socket, "--log-dir", t.TempDir()}, &startOut, &startErr)
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var statusOut, statusErr bytes.Buffer
+		if code := run([]string{"status", "--socket", socket}, &statusOut, &statusErr); code == 0 {
+			break
+		}
+		select {
+		case code := <-startDone:
+			t.Fatalf("start exited early with code %d", code)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("daemon never answered on the control socket")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Add a project under projects.d and reload.
+	if err := os.MkdirAll(filepath.Join(configDir, "projects.d"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "projects.d", "reports.yaml"),
+		[]byte("projects:\n"+project("reports", freePort(t), freePort(t))), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"reload", "--socket", socket}, &stdout, &stderr); code != 0 {
+		t.Fatalf("reload exit code = %d, want 0 (stderr:\n%s)", code, stderr.String())
+	}
+	for _, want := range []string{"Reloaded " + configPath, "added:     reports", "unchanged: dashboard", "removed:   (none)"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("reload output missing %q; got:\n%s", want, stdout.String())
+		}
+	}
+
+	// status shows the config path and that a reload happened.
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"status", "--socket", socket}, &stdout, &stderr); code != 0 {
+		t.Fatalf("status exit code = %d (stderr:\n%s)", code, stderr.String())
+	}
+	for _, want := range []string{"config: " + configPath, "(reloaded ", "reports", "dashboard"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("status output missing %q; got:\n%s", want, stdout.String())
+		}
+	}
+
+	// An invalid projects.d file rejects the reload with its errors.
+	if err := os.WriteFile(filepath.Join(configDir, "projects.d", "broken.yaml"),
+		[]byte("projects:\n  broken:\n    public_url: https://broken.test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"reload", "--socket", socket}, &stdout, &stderr); code != 1 {
+		t.Fatalf("reload of an invalid config: exit code = %d, want 1 (stdout:\n%s)", code, stdout.String())
+	}
+	for _, want := range []string{"reload rejected", `project "broken": command`, "Nothing was changed"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("rejected reload stderr missing %q; got:\n%s", want, stderr.String())
+		}
+	}
+
+	if err := syscall.Kill(os.Getpid(), syscall.SIGINT); err != nil {
+		t.Fatalf("send SIGINT: %v", err)
+	}
+	select {
+	case code := <-startDone:
+		if code != 0 {
+			mu.Lock()
+			defer mu.Unlock()
+			t.Fatalf("start exit code = %d after SIGINT, want 0 (stderr:\n%s)", code, startErr.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("start did not exit after SIGINT")
 	}
 }
 

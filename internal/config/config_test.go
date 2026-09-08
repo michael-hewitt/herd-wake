@@ -49,6 +49,18 @@ func TestLoadValid(t *testing.T) {
 	if dash.Env["APP_ENV"] != "local" {
 		t.Errorf("Env = %v, want APP_ENV=local", dash.Env)
 	}
+	if !dash.RewriteHost {
+		t.Error("RewriteHost = false, want true (explicitly set)")
+	}
+	if cfg.Projects["minimal"].RewriteHost {
+		t.Error("minimal.RewriteHost = true, want false by default")
+	}
+	if dash.Source != "valid.yaml" || cfg.Projects["minimal"].Source != "valid.yaml" {
+		t.Errorf("Sources = %q/%q, want the main file name", dash.Source, cfg.Projects["minimal"].Source)
+	}
+	if want, _ := filepath.Abs(filepath.Join("testdata", "valid.yaml")); cfg.Path != want {
+		t.Errorf("Path = %q, want %q", cfg.Path, want)
+	}
 }
 
 func TestLoadAppliesDefaults(t *testing.T) {

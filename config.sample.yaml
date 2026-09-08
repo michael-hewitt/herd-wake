@@ -14,9 +14,19 @@
 #   herd proxy dashboard http://127.0.0.1:7101 --secure
 #   herd proxy vite.accounts http://127.0.0.1:7102 --secure
 #
+# Additional projects may live in one file each under a projects.d directory
+# next to this file (~/Library/Application Support/herd-wake/projects.d/
+# *.yaml, same layout: a `projects:` map per file, one project or many). They
+# are merged into this file's projects; a name defined twice anywhere is an
+# error. Tooling that registers projects automatically writes there, so this
+# hand-written file is never rewritten.
+#
+# A running daemon picks up edits with `herd-wake reload` (or SIGHUP):
+# projects whose settings did not change are left completely alone.
+#
 # Conventions used below: supervisor ports in the 71xx range, application
 # ports in the 171xx range. Any free high-numbered loopback ports work; every
-# port must be unique across the whole file.
+# port must be unique across the whole configuration.
 
 projects:
   # ---------------------------------------------------------------------
@@ -114,6 +124,18 @@ projects:
     working_directory: ~/Code/accounts
     command: npm run dev -- --host 127.0.0.1 --port 17102 --strictPort
     idle_timeout_minutes: 30
+
+    # Optional. Present the dev server with `Host: 127.0.0.1:<application_port>`
+    # instead of the public host (vite.accounts.test). Vite 5.4.12+/6.0.9+
+    # and webpack-dev-server refuse requests for hosts outside their
+    # allowedHosts list (Vite answers "403 Blocked request. This host is not
+    # allowed."); with rewrite_host the server only ever sees its own
+    # loopback address, so no allowedHosts entry is needed. The public host
+    # is still passed along in X-Forwarded-Host (and X-Forwarded-Proto stays
+    # https), and the rewrite applies to WebSocket/HMR upgrades too. Leave it
+    # false for servers that build absolute URLs from the Host header.
+    # Default: false.
+    rewrite_host: false
 
     # Optional. Whether open WebSocket connections (such as Vite HMR) keep
     # the project from being considered idle. Default: true — the project is

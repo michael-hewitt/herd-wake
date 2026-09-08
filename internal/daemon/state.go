@@ -4,8 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"net/http"
 	"os"
+	"sort"
 	"sync"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/michael-hewitt/herd-wake/internal/control"
 	"github.com/michael-hewitt/herd-wake/internal/idle"
 	"github.com/michael-hewitt/herd-wake/internal/process"
+	"github.com/michael-hewitt/herd-wake/internal/proxy"
 	"github.com/michael-hewitt/herd-wake/internal/version"
 )
 
@@ -27,35 +29,67 @@ const (
 )
 
 // projectState is the daemon's runtime record for one registered project:
-// its configuration, the supervisor owning its process lifecycle, and the
-// activity tracker driving its idle shutdown.
+// its configuration, the supervisor owning its process lifecycle, the
+// activity tracker driving its idle shutdown, and the listener it is served
+// on. A reload that changes a project builds a fresh record (new supervisor
+// for the new config) but keeps the tracker — leases and activity history
+// survive — and keeps the listener when the address did not change.
 type projectState struct {
 	project *config.Project
 	proc    *process.Supervisor
 	tracker *idle.Tracker
+	// bind is the listener the project is served on; nil until Run (or the
+	// reload that added the project) binds it.
+	bind *binding
+	// deactivate ends the project's idle monitor (or always_on starter);
+	// nil until activate.
+	deactivate context.CancelFunc
 }
 
-// newProjectStates builds the daemon's project table from the config, in
-// sorted name order.
-func newProjectStates(cfg *config.Config, logDir string, logger *log.Logger) []*projectState {
-	states := make([]*projectState, 0, len(cfg.Projects))
-	for _, name := range cfg.ProjectNames() {
-		p := cfg.Projects[name]
-		states = append(states, &projectState{
-			project: p,
-			proc:    process.NewSupervisor(p, logDir, logger),
-			tracker: idle.NewTracker(),
-		})
+// newProjectState builds the runtime record for p with the given activity
+// tracker; nothing is bound or started yet.
+func (d *Daemon) newProjectState(p *config.Project, tracker *idle.Tracker) *projectState {
+	return &projectState{
+		project: p,
+		proc:    process.NewSupervisor(p, d.logDir, d.logger),
+		tracker: tracker,
+	}
+}
+
+// handler builds the project's on-demand proxy handler.
+func (d *Daemon) handler(st *projectState) http.Handler {
+	upstream := onDemandUpstream{Supervisor: st.proc, draining: &d.draining}
+	return proxy.NewOnDemand(st.project, upstream, st.tracker, d.logger)
+}
+
+// sortedStates returns the registered projects in name order.
+func (d *Daemon) sortedStates() []*projectState {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.sortedStatesLocked()
+}
+
+// sortedStatesLocked is sortedStates with d.mu already held.
+func (d *Daemon) sortedStatesLocked() []*projectState {
+	names := make([]string, 0, len(d.states))
+	for name := range d.states {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	states := make([]*projectState, 0, len(names))
+	for _, name := range names {
+		states = append(states, d.states[name])
 	}
 	return states
 }
 
 // findProject looks up a registered project by name.
 func (d *Daemon) findProject(name string) (*projectState, error) {
-	for _, st := range d.states {
-		if st.project.Name == name {
-			return st, nil
-		}
+	d.mu.RLock()
+	st, ok := d.states[name]
+	d.mu.RUnlock()
+	if ok {
+		return st, nil
 	}
 	return nil, fmt.Errorf("%w %q (run `herd-wake projects` to list registered projects)",
 		control.ErrUnknownProject, name)
@@ -94,14 +128,18 @@ func (d *Daemon) projectStatus(st *projectState) control.ProjectStatus {
 
 // Status implements control.Provider.
 func (d *Daemon) Status() control.StatusResponse {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	resp := control.StatusResponse{
 		Version:       version.String(),
 		PID:           os.Getpid(),
 		StartedAt:     d.startedAt,
 		UptimeSeconds: time.Since(d.startedAt).Seconds(),
+		ConfigPath:    d.configPath,
+		LastReloadAt:  d.lastReloadAt,
 		Projects:      make([]control.ProjectStatus, 0, len(d.states)),
 	}
-	for _, st := range d.states {
+	for _, st := range d.sortedStatesLocked() {
 		resp.Projects = append(resp.Projects, d.projectStatus(st))
 	}
 	return resp
@@ -189,15 +227,29 @@ func (d *Daemon) ProjectLogs(name string, maxLines int) (control.LogsResponse, e
 	}, nil
 }
 
-// stopAllProjects gracefully stops every supervised process group, in
-// parallel, each bounded by its own shutdown timeout (plus margin for the
-// force-kill). It runs on every daemon exit — including the panic path via
-// defer — and is idempotent: supervisors that never started anything are
-// no-ops, and only tracked PGIDs are ever signaled.
-func (d *Daemon) stopAllProjects() {
+// retiring is one project being taken out of service by a reload (or by
+// daemon shutdown), and whether its listener is kept for a replacement on
+// the same address.
+type retiring struct {
+	st          *projectState
+	keepBinding bool
+}
+
+// retireAll takes the given projects out of service, in parallel: each
+// project's monitor is stopped, its listener closed (unless kept for a
+// replacement), its supervisor retired so nothing can respawn it, and its
+// process group stopped gracefully — each bounded by its own shutdown
+// timeout plus the force-kill drain. Closing the listener first means a
+// removed port stops accepting before its process goes away; retiring
+// before stopping means a request that slipped past the closing listener
+// cannot restart what the stop is ending. retireAll returns once every
+// process group is gone (or the bound elapsed). It is idempotent:
+// supervisors that never started anything are no-ops, and only tracked
+// PGIDs are ever signaled.
+func (d *Daemon) retireAll(items []retiring) {
 	maxWait := 15 * time.Second
-	for _, st := range d.states {
-		if wait := time.Duration(st.project.ShutdownTimeoutSeconds)*time.Second + 5*time.Second; wait > maxWait {
+	for _, item := range items {
+		if wait := time.Duration(item.st.project.ShutdownTimeoutSeconds)*time.Second + 15*time.Second; wait > maxWait {
 			maxWait = wait
 		}
 	}
@@ -205,14 +257,37 @@ func (d *Daemon) stopAllProjects() {
 	defer cancel()
 
 	var wg sync.WaitGroup
-	for _, st := range d.states {
+	for _, item := range items {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			st := item.st
+			if st.deactivate != nil {
+				st.deactivate()
+			}
+			if !item.keepBinding && st.bind != nil {
+				d.unbind(st.bind)
+			}
+			st.proc.Retire()
 			if err := st.proc.Stop(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				d.logger.Printf("project %q: stop during daemon shutdown: %v", st.project.Name, err)
+				d.logger.Printf("project %q: stop while retiring: %v", st.project.Name, err)
 			}
 		}()
 	}
 	wg.Wait()
+}
+
+// stopAllProjects closes every project listener and gracefully stops every
+// supervised process group. It runs on every daemon exit — including the
+// panic path via defer — and waits for any reload in progress to finish
+// first, so a project a reload is just adding is stopped too.
+func (d *Daemon) stopAllProjects() {
+	d.reloadMu.Lock()
+	defer d.reloadMu.Unlock()
+	states := d.sortedStates()
+	items := make([]retiring, 0, len(states))
+	for _, st := range states {
+		items = append(items, retiring{st: st})
+	}
+	d.retireAll(items)
 }

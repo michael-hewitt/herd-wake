@@ -5,15 +5,24 @@
 // names to per-project settings: the public Herd URL, the loopback ports the
 // supervisor and the application listen on, the command to run, readiness
 // detection, and lifecycle timeouts.
+//
+// Next to the main file, an optional projects.d directory holds additional
+// project files (see Load): tooling that registers projects automatically
+// writes one file per project there, so the hand-written main file is never
+// rewritten.
 package config
 
 import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -63,6 +72,11 @@ var validShutdownSignals = map[string]bool{
 // Config is the root of the herd-wake configuration file.
 type Config struct {
 	Projects map[string]*Project `yaml:"projects"`
+
+	// Path is the absolute path of the main config file this configuration
+	// was loaded from (empty for configs built in memory). The daemon
+	// re-reads it on reload. Filled in by Load, not read from YAML.
+	Path string `yaml:"-"`
 }
 
 // Project is the configuration for one registered project.
@@ -70,6 +84,11 @@ type Project struct {
 	// Name is the project's key in the projects map. It is filled in by
 	// Load, not read from YAML.
 	Name string `yaml:"-"`
+	// Source is the file the project was defined in, relative to the config
+	// directory: the main file's name (e.g. "config.yaml") or
+	// "projects.d/<file>.yaml". Filled in by Load; informational only —
+	// it never affects behaviour (see Equivalent).
+	Source string `yaml:"-"`
 
 	// Required fields.
 	PublicURL        string `yaml:"public_url"`
@@ -101,6 +120,12 @@ type Project struct {
 	Env      map[string]string `yaml:"env"`
 	NodePath string            `yaml:"node_path"`
 	AlwaysOn bool              `yaml:"always_on"`
+	// RewriteHost, when true, makes the proxy present the dev server with
+	// Host: 127.0.0.1:<application_port> instead of the public host, for
+	// servers that refuse non-localhost hosts (Vite's server.allowedHosts,
+	// webpack-dev-server's allowedHosts). The public host is still carried
+	// in X-Forwarded-Host.
+	RewriteHost bool `yaml:"rewrite_host"`
 }
 
 // FieldError is a validation error tied to one field of one project.
@@ -124,13 +149,93 @@ func (c *Config) ProjectNames() []string {
 	return names
 }
 
-// Load reads, parses, defaults, and validates the config file at path.
+// ProjectsDirName is the name of the optional per-project config directory
+// next to the main config file.
+const ProjectsDirName = "projects.d"
+
+// ProjectsDir returns the projects.d directory belonging to the config file
+// at configPath: a "projects.d" directory next to it.
+func ProjectsDir(configPath string) string {
+	return filepath.Join(filepath.Dir(configPath), ProjectsDirName)
+}
+
+// Load reads, parses, defaults, and validates the config file at path, then
+// merges the project files in the projects.d directory next to it.
 //
-// A missing file is reported with an error satisfying
+// Every projects.d/*.yaml file (taken in name order; other names, hidden
+// files, and subdirectories are ignored) has the same schema as the main
+// file — a projects: map holding one project or many — and may be empty.
+// Its projects are added to the main file's; a name defined more than once
+// anywhere is a validation error naming both sources. A missing projects.d
+// directory is fine.
+//
+// A missing main file is reported with an error satisfying
 // errors.Is(err, os.ErrNotExist). Validation problems are collected and
 // returned joined into a single error: every FieldError names the offending
 // project and field.
 func Load(path string) (*Config, error) {
+	cfg, err := decodeFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	cfg.Path = path
+	if cfg.Projects == nil {
+		cfg.Projects = map[string]*Project{}
+	}
+
+	mainSource := filepath.Base(path)
+	for name, p := range cfg.Projects {
+		if p == nil {
+			p = &Project{}
+			cfg.Projects[name] = p
+		}
+		p.Name = name
+		p.Source = mainSource
+		p.applyDefaults()
+	}
+
+	var errs []error
+	fragments, err := listProjectFiles(ProjectsDir(path))
+	if err != nil {
+		return nil, err
+	}
+	for _, file := range fragments {
+		frag, err := decodeFile(file)
+		if err != nil {
+			return nil, err
+		}
+		source := ProjectsDirName + "/" + filepath.Base(file)
+		for _, name := range frag.ProjectNames() {
+			if prev, ok := cfg.Projects[name]; ok {
+				errs = append(errs, &FieldError{name, "name", fmt.Sprintf(
+					"defined in both %s and %s; a project name may only be defined once across %s and %s/",
+					prev.Source, source, mainSource, ProjectsDirName)})
+				continue
+			}
+			p := frag.Projects[name]
+			if p == nil {
+				p = &Project{}
+			}
+			p.Name = name
+			p.Source = source
+			p.applyDefaults()
+			cfg.Projects[name] = p
+		}
+	}
+
+	errs = append(errs, cfg.Validate())
+	if err := errors.Join(errs...); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+// decodeFile strictly decodes one config-shaped YAML file. An empty file (or
+// one holding only comments) decodes to an empty Config.
+func decodeFile(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
@@ -140,23 +245,42 @@ func Load(path string) (*Config, error) {
 	dec.KnownFields(true)
 
 	var cfg Config
-	if err := dec.Decode(&cfg); err != nil {
+	if err := dec.Decode(&cfg); err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
-
-	for name, p := range cfg.Projects {
-		if p == nil {
-			p = &Project{}
-			cfg.Projects[name] = p
-		}
-		p.Name = name
-		p.applyDefaults()
-	}
-
-	if err := cfg.Validate(); err != nil {
-		return nil, err
-	}
 	return &cfg, nil
+}
+
+// listProjectFiles returns the *.yaml files directly inside dir, sorted by
+// name. A missing directory yields no files and no error.
+func listProjectFiles(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read %s directory %s: %w", ProjectsDirName, dir, err)
+	}
+	var files []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || strings.HasPrefix(name, ".") || !strings.HasSuffix(name, ".yaml") {
+			continue
+		}
+		files = append(files, filepath.Join(dir, name))
+	}
+	sort.Strings(files)
+	return files, nil
+}
+
+// Equivalent reports whether p and o describe the same registration: every
+// field is equal except Source, which only records where the definition was
+// read from. The daemon uses it to tell changed projects from unchanged ones
+// on reload, so moving a project between config files is not a change.
+func (p *Project) Equivalent(o *Project) bool {
+	a, b := *p, *o
+	a.Source, b.Source = "", ""
+	return reflect.DeepEqual(a, b)
 }
 
 // applyDefaults fills unset optional fields with their documented defaults.

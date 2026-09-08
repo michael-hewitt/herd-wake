@@ -172,7 +172,11 @@ type Supervisor struct {
 	// nextRetryAt is when the next automatic (request-triggered) startup may
 	// run; zero when no backoff is in effect.
 	nextRetryAt time.Time
-	ring        *ringBuffer
+	// retired is set by Retire: the supervisor's project has been removed or
+	// replaced by a config reload, so no new process may ever be spawned by
+	// it (stopping the current one still works).
+	retired bool
+	ring    *ringBuffer
 }
 
 // NewSupervisor builds a supervisor for one project. Process output is
@@ -256,6 +260,18 @@ func (s *Supervisor) EnsureStartedOnDemand() <-chan error {
 	return s.ensureStartedLocked()
 }
 
+// Retire permanently refuses further startups: the project was removed or
+// reconfigured by a config reload and a replacement supervisor (if any) owns
+// it from now on. Stop keeps working, so the current process — if one is
+// alive — can still be shut down. Retiring closes the window in which a
+// request that had already passed the proxy's checks could respawn the old
+// configuration after the reload stopped it.
+func (s *Supervisor) Retire() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.retired = true
+}
+
 // ensureStartedLocked implements the shared EnsureStarted state machine.
 // Called with s.mu held.
 func (s *Supervisor) ensureStartedLocked() <-chan error {
@@ -268,6 +284,10 @@ func (s *Supervisor) ensureStartedLocked() <-chan error {
 	case StateStopping:
 		done <- fmt.Errorf("project %q is stopping; retry once it has stopped", s.project.Name)
 	default: // stopped, failed
+		if s.retired {
+			done <- fmt.Errorf("project %q was removed or reconfigured by a config reload; retry the request", s.project.Name)
+			break
+		}
 		if err := s.spawnLocked(); err != nil {
 			s.setStateLocked(StateFailed)
 			s.lastErr = err.Error()

@@ -29,6 +29,11 @@ type Provider interface {
 	// ProjectLogs returns up to maxLines recent output lines (all buffered
 	// lines when maxLines <= 0).
 	ProjectLogs(name string, maxLines int) (LogsResponse, error)
+	// Reload re-reads the configuration and applies the difference to the
+	// running project set. A config that fails to load is reported in the
+	// response (Applied false), not as an error; the error return is for a
+	// reload that could not be attempted at all.
+	Reload(ctx context.Context) (ReloadResponse, error)
 }
 
 // NewHandler returns the HTTP handler the daemon serves on the control
@@ -37,6 +42,14 @@ func NewHandler(provider Provider) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/status", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, provider.Status())
+	})
+	mux.HandleFunc("POST /v1/reload", func(w http.ResponseWriter, r *http.Request) {
+		resp, err := provider.Reload(r.Context())
+		if err != nil {
+			writeError(w, errorStatusCode(err), err)
+			return
+		}
+		writeJSON(w, resp)
 	})
 
 	action := func(pattern string, do func(ctx context.Context, name string) (ProjectStatus, error)) {

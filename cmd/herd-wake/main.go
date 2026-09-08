@@ -45,6 +45,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runStart(args[1:], stdout, stderr)
 	case "status":
 		return runStatus(args[1:], stdout, stderr)
+	case "reload":
+		return runReload(args[1:], stdout, stderr)
 	case "project:start", "project:stop", "project:restart", "project:release":
 		return runProjectCommand(args[0], args[1:], stdout, stderr)
 	case "project:lease":
@@ -74,7 +76,7 @@ func runProjects(args []string, stdout, stderr io.Writer) int {
 	}
 
 	if len(cfg.Projects) == 0 {
-		fmt.Fprintf(stdout, "No projects configured in %s\n", path)
+		fmt.Fprintf(stdout, "No projects configured in %s (or %s)\n", path, config.ProjectsDir(path))
 		return 0
 	}
 
@@ -152,6 +154,13 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 
 	fmt.Fprintf(stdout, "herd-wake daemon running: pid %d, uptime %s, version %s\n",
 		status.PID, status.Uptime().Round(time.Second), status.Version)
+	if status.ConfigPath != "" {
+		reloaded := "not reloaded since start"
+		if !status.LastReloadAt.IsZero() {
+			reloaded = "reloaded " + status.LastReloadAt.Local().Format("15:04:05")
+		}
+		fmt.Fprintf(stdout, "config: %s (%s)\n", status.ConfigPath, reloaded)
+	}
 	if len(status.Projects) == 0 {
 		fmt.Fprintln(stdout, "No projects configured.")
 		return 0
@@ -219,6 +228,66 @@ func describeIdleStop(p control.ProjectStatus) string {
 	default:
 		return "-"
 	}
+}
+
+// runReload implements `herd-wake reload`: it asks the daemon to re-read
+// its config file (and projects.d) and apply the difference, then prints
+// which projects were added, removed, changed, or left untouched.
+func runReload(args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("reload", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	socketPath := flags.String("socket", "", "path to the control socket (default: ~/Library/Application Support/herd-wake/herd-wake.sock)")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+
+	socket, ok := resolveSocketPath(*socketPath, stderr)
+	if !ok {
+		return 1
+	}
+	// Removed and changed projects are stopped gracefully before the reload
+	// returns, so the bound has to cover their shutdown timeouts.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	resp, err := control.NewClient(socket).Reload(ctx)
+	if err != nil {
+		reportDaemonError(stderr, err)
+		return 1
+	}
+
+	if !resp.Applied {
+		fmt.Fprintf(stderr, "herd-wake: reload rejected: config %s is invalid:\n", resp.ConfigPath)
+		for _, line := range resp.Errors {
+			fmt.Fprintf(stderr, "  - %s\n", line)
+		}
+		fmt.Fprintln(stderr, "Nothing was changed; the daemon keeps running with its previous configuration.")
+		return 1
+	}
+
+	fmt.Fprintf(stdout, "Reloaded %s\n", resp.ConfigPath)
+	for _, group := range []struct {
+		label string
+		names []string
+	}{
+		{"added", resp.Added},
+		{"removed", resp.Removed},
+		{"changed", resp.Changed},
+		{"unchanged", resp.Unchanged},
+	} {
+		value := "(none)"
+		if len(group.names) > 0 {
+			value = strings.Join(group.names, ", ")
+		}
+		fmt.Fprintf(stdout, "  %-10s %s\n", group.label+":", value)
+	}
+	if len(resp.Errors) > 0 {
+		fmt.Fprintf(stderr, "herd-wake: %d problem(s) applying the reload:\n", len(resp.Errors))
+		for _, line := range resp.Errors {
+			fmt.Fprintf(stderr, "  - %s\n", line)
+		}
+		return 1
+	}
+	return 0
 }
 
 // runProjectLease implements `herd-wake project:lease --ttl <duration>
@@ -418,6 +487,7 @@ func printProject(w io.Writer, p *config.Project) {
 		name += "  (always on)"
 	}
 	fmt.Fprintln(w, name)
+	fmt.Fprintf(w, "  Source:            %s\n", p.Source)
 	fmt.Fprintf(w, "  URL:               %s\n", p.PublicURL)
 	fmt.Fprintf(w, "  Supervisor port:   %d  (herd proxy target %s:%d)\n", p.SupervisorPort, p.ListenHost, p.SupervisorPort)
 	fmt.Fprintf(w, "  Application port:  %d\n", p.ApplicationPort)
@@ -429,6 +499,9 @@ func printProject(w io.Writer, p *config.Project) {
 	}
 	fmt.Fprintln(w)
 	fmt.Fprintf(w, "  Timeouts:          startup %ds, idle %dm\n", p.StartupTimeoutSeconds, p.IdleTimeoutMinutes)
+	if p.RewriteHost {
+		fmt.Fprintf(w, "  Upstream Host:     127.0.0.1:%d (rewrite_host)\n", p.ApplicationPort)
+	}
 }
 
 // printMissingConfig tells the user where the config file belongs and shows a
@@ -446,18 +519,22 @@ Create one there to register your projects. A minimal example:
       working_directory: /Users/you/Code/dashboard
       command: npm run dev -- --host 127.0.0.1 --port 17101 --strictPort
 
+Additional projects may live in one file each under %s/*.yaml
+(same layout, a projects: map per file); they are merged into the main file.
+
 A fully documented example ships with herd-wake as config.sample.yaml:
 https://github.com/michael-hewitt/herd-wake/blob/main/config.sample.yaml
-`, path)
+`, path, config.ProjectsDir(path))
 }
 
 func usage(w io.Writer) {
 	fmt.Fprint(w, `Usage: herd-wake <command>
 
 Commands:
-  start                    Run the supervisor daemon in the foreground (Ctrl-C to stop)
-  status                   Show daemon uptime and per-project state
-  projects                 List registered projects from the config file
+  start                    Run the supervisor daemon in the foreground (Ctrl-C to stop, SIGHUP to reload)
+  status                   Show daemon uptime, config path, and per-project state
+  reload                   Re-read the config file and projects.d and apply the changes live
+  projects                 List registered projects from the config file and projects.d
   project:start <name>     Start a project's dev server and wait until it is ready
   project:stop <name>      Gracefully stop a project's dev server
   project:restart <name>   Stop (if needed) and start a project's dev server
@@ -467,9 +544,9 @@ Commands:
   version                  Print the herd-wake version
 
 Options:
-  --config <path>   Config file to load (start, projects)
+  --config <path>   Config file to load (start, projects); projects.d/ next to it is merged in
                     (default: ~/Library/Application Support/herd-wake/config.yaml)
-  --socket <path>   Control socket to use (start, status, project:*, logs)
+  --socket <path>   Control socket to use (start, status, reload, project:*, logs)
                     (default: ~/Library/Application Support/herd-wake/herd-wake.sock)
   --log-dir <path>  Directory for per-project process logs (start)
                     (default: ~/Library/Application Support/herd-wake/logs)

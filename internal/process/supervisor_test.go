@@ -708,3 +708,42 @@ func TestProjectEnvReachesProcess(t *testing.T) {
 		t.Errorf("configured env did not reach the process; logs:\n%s", lines)
 	}
 }
+
+// TestRetireRefusesFurtherStartsButStillStops: a retired supervisor (its
+// project removed or replaced by a config reload) never spawns again — not
+// via the manual path, not via the on-demand path — while Stop still
+// terminates the process it was running.
+func TestRetireRefusesFurtherStartsButStillStops(t *testing.T) {
+	s := newTestSupervisor(t, helperProject(t, testproc.ModeListen))
+	if err := awaitStartup(t, s.EnsureStarted()); err != nil {
+		t.Fatalf("initial start: %v", err)
+	}
+	pid := s.Snapshot().PID
+
+	s.Retire()
+
+	// Running: a start request is still satisfied by the running process.
+	if err := awaitStartup(t, s.EnsureStarted()); err != nil {
+		t.Errorf("EnsureStarted on a running retired supervisor = %v, want nil", err)
+	}
+	if err := s.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop after Retire: %v", err)
+	}
+	waitProcessGone(t, pid)
+	if got := s.State(); got != StateStopped {
+		t.Fatalf("state after stop = %q, want %q", got, StateStopped)
+	}
+
+	for name, start := range map[string]func() <-chan error{
+		"manual":    s.EnsureStarted,
+		"on-demand": s.EnsureStartedOnDemand,
+	} {
+		err := awaitStartup(t, start())
+		if err == nil || !strings.Contains(err.Error(), "config reload") {
+			t.Errorf("%s start after Retire = %v, want a refusal mentioning the config reload", name, err)
+		}
+	}
+	if got := s.State(); got != StateStopped {
+		t.Errorf("state after refused starts = %q, want %q (nothing spawned)", got, StateStopped)
+	}
+}

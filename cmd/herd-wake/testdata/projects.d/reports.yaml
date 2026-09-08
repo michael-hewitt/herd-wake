@@ -1,0 +1,9 @@
+# Test fixture: a project registered through projects.d rather than the main
+# config file (merged into testdata/config.yaml by `herd-wake projects`).
+projects:
+  reports:
+    public_url: https://reports.test
+    supervisor_port: 7103
+    application_port: 17103
+    working_directory: /tmp
+    command: npm run dev -- --port 17103 --strictPort

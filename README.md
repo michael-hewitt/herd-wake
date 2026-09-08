@@ -15,6 +15,8 @@ The full specification lives in [issue #1](https://github.com/michael-hewitt/her
   - [Node-only application](#node-only-application)
   - [Laravel + Vite](#laravel--vite)
 - [Configuration reference](#configuration-reference)
+  - [The projects.d directory](#the-projectsd-directory)
+- [Reloading the configuration](#reloading-the-configuration)
 - [CLI reference](#cli-reference)
 - [Idle shutdown, leases, and WebSockets](#idle-shutdown-leases-and-websockets)
 - [Troubleshooting](#troubleshooting)
@@ -50,7 +52,7 @@ A request arriving at a supervisor port goes through this lifecycle:
 4. **Ready?** Forward the held request(s). The client just sees a slower first response.
 5. **Failed or timed out?** Answer `503` with a diagnostic (state, exit status, recent process output). Automatic request-triggered retries back off exponentially (1s doubling to a 30s cap); `project:start`/`project:restart` retries immediately and resets the backoff.
 
-Idle shutdown, WebSocket keep-alive, and manual controls are covered [below](#idle-shutdown-leases-and-websockets). Process safety: herd-wake tracks the exact process group it spawned and signals only that group — never anything matched by name — and stops every group it owns before the daemon itself exits.
+Idle shutdown, WebSocket keep-alive, and manual controls are covered [below](#idle-shutdown-leases-and-websockets); [reloading the configuration](#reloading-the-configuration) applies config edits to the running daemon without touching unchanged projects. Process safety: herd-wake tracks the exact process group it spawned and signals only that group — never anything matched by name — and stops every group it owns before the daemon itself exits.
 
 ## Install
 
@@ -189,13 +191,14 @@ With that in place: a page load on `https://accounts.test` emits asset URLs on `
 
 ## Configuration reference
 
-Projects are registered in a single user-level YAML file — nothing is stored in your project repositories:
+Projects are registered in a user-level YAML file — nothing is stored in your project repositories:
 
 ```
 ~/Library/Application Support/herd-wake/config.yaml     (override: --config)
+~/Library/Application Support/herd-wake/projects.d/     (optional, see below)
 ```
 
-The file is a `projects:` map of project names to settings. Unknown fields are rejected (typos fail loudly), validation reports every problem with its project and field, and all `supervisor_port`/`application_port` values must be unique across the whole file. [config.sample.yaml](config.sample.yaml) is a fully commented example kept in sync with this table.
+The file is a `projects:` map of project names to settings. Unknown fields are rejected (typos fail loudly), validation reports every problem with its project and field, and all `supervisor_port`/`application_port` values must be unique across the whole configuration (main file and `projects.d` together). [config.sample.yaml](config.sample.yaml) is a fully commented example kept in sync with this table. A running daemon picks up edits with [`herd-wake reload`](#reloading-the-configuration).
 
 ### Required fields
 
@@ -219,6 +222,7 @@ The file is a `projects:` map of project names to settings. Unknown fields are r
 | `hold_max_wait_seconds` | int | `startup_timeout_seconds + 5` | How long one request may be held while the project starts. The default outlives the startup attempt so the caller sees its real outcome. |
 | `hold_max_requests` | int | `100` | How many requests may be held at once during a cold start; requests over the limit get a 503. |
 | `websockets_keep_alive` | bool | `true` | Whether open WebSocket connections (e.g. Vite HMR) keep the project from being considered idle. With `false`, an upgrade counts only as momentary activity and an idle stop closes any open sockets. |
+| `rewrite_host` | bool | `false` | How the dev server sees the `Host` header. `false` forwards the inbound public host (e.g. `dashboard.test`) unchanged. `true` sends `Host: 127.0.0.1:<application_port>` upstream while `X-Forwarded-Host` carries the public host (the other `X-Forwarded-*` headers are unaffected) — for servers that refuse non-localhost hosts, such as Vite's `server.allowedHosts` (`403 Blocked request`) or webpack-dev-server's `allowedHosts`. Applies to WebSocket upgrades (HMR) too. |
 | `shutdown_signal` | string | `SIGTERM` | Graceful-termination signal sent to the process group. One of `SIGTERM`, `SIGINT`, `SIGQUIT`, `SIGHUP`, `SIGUSR1`, `SIGUSR2`, `SIGKILL`. |
 | `shutdown_timeout_seconds` | int | `10` | How long to wait for the process group to exit after `shutdown_signal` before it is force-killed (SIGKILL). |
 | `always_on` | bool | `false` | Start this project as soon as the daemon starts and never idle-stop it. A failed always-on start never keeps the daemon from running. Manual `project:stop`/`project:restart` still work. |
@@ -228,6 +232,50 @@ The file is a `projects:` map of project names to settings. Unknown fields are r
 | `listen_host` | string | `127.0.0.1` | Address the supervisor listener binds for this project. Non-loopback values are rejected unless `allow_non_loopback: true`. |
 | `allow_non_loopback` | bool | `false` | Explicit opt-in required to bind a non-loopback `listen_host`. |
 
+### The projects.d directory
+
+Next to the main config file, an optional `projects.d/` directory holds additional project files:
+
+```
+~/Library/Application Support/herd-wake/
+├── config.yaml                 # hand-written, never touched by tooling
+└── projects.d/
+    ├── issue-3265.yaml         # one project (or several) per file
+    └── worktree-feature-x.yaml
+```
+
+Each `projects.d/*.yaml` file has the same layout as the main file — a `projects:` map with one project or many — and may be empty. Files are read in name order and their projects are merged into the main file's; a project name defined more than once anywhere (main file or any `projects.d` file) is a validation error naming both sources, e.g. `project "webapp": name: defined in both config.yaml and projects.d/webapp.yaml`. Only `*.yaml` files directly inside the directory count (hidden files, other extensions, and subdirectories are ignored), and a missing directory is fine. Unknown top-level keys are rejected in these files exactly as in the main file.
+
+The directory is always derived from the main file's location (`--config /some/dir/config.yaml` means `/some/dir/projects.d/`). This is the layout automation writes into — one file per worktree or preview server — so your hand-written `config.yaml` is never rewritten. `herd-wake projects` shows each project's source file.
+
+## Reloading the configuration
+
+The daemon re-reads its configuration without restarting and without disturbing projects whose settings did not change:
+
+```sh
+herd-wake reload            # over the control socket; prints the diff
+kill -HUP $(pgrep -x herd-wake)   # the same reload, via signal
+```
+
+A reload re-loads and re-validates the main file plus `projects.d`, then diffs the result by project name against the live set:
+
+| Project is… | What happens |
+| --- | --- |
+| **added** | Supervisor, activity tracker, idle monitor, and listener are created and the port bound. `always_on` projects start immediately; anything else cold-starts on its first request. |
+| **removed** | Its listener closes first (the port stops accepting), then its process group is stopped gracefully (signal, force-kill after the shutdown timeout), and its idle monitor ends. |
+| **changed** (any field differs) | If it is starting or running it is stopped (whole group drained). The new config is swapped in with a fresh supervisor (failure backoff reset); it cold-starts on the next request (`always_on`: immediately). When `supervisor_port`/`listen_host` are unchanged the listener is kept and requests that arrive during the swap simply wait for it — none are refused. When the address changes, the old port is released and the new one bound. Activity leases survive the change. |
+| **unchanged** | Untouched: the running process keeps running, its idle countdown and lease are not reset, in-flight requests and open WebSockets are unaffected. |
+
+Rules and guarantees:
+
+- **Invalid config → nothing changes.** If the config fails to load or validate (including a duplicate name across files or a malformed `projects.d` file), the reload is rejected, the validation errors are returned to the caller, and the daemon keeps running exactly as before.
+- **One bad bind does not abort the rest.** If an added project's port is already taken, that project is reported in the reload's errors and skipped; every other change is applied. If a *changed* project's new port cannot be bound, the project keeps its previous port and settings (it is stopped at that point and cold-starts on demand) and the error is reported; fix the conflict and reload again — it is retried as "changed".
+- **Reloads are serialized** with each other and with daemon shutdown, and a reload runs to completion even if the caller disconnects.
+- Requests to unchanged projects never wait on a reload: the request path does not take the reload lock.
+- The response (and the CLI output) lists the added / removed / changed / unchanged names and any errors; `herd-wake reload` exits non-zero when the reload was rejected or reported errors. `herd-wake status` shows the config path and when it was last reloaded successfully.
+
+`herd-wake start` runs in the foreground; because SIGHUP now means "reload", closing the terminal that runs it no longer terminates the daemon (it only loses its log output). Stop it with Ctrl-C or SIGTERM.
+
 ## CLI reference
 
 ```
@@ -236,9 +284,10 @@ herd-wake <command> [flags] [args]
 
 | Command | What it does |
 | --- | --- |
-| `herd-wake start` | Run the supervisor daemon in the foreground: binds one listener per project, serves the control API on the unix socket, starts `always_on` projects. Ctrl-C (or SIGTERM) stops the daemon *and* every dev server it started. |
-| `herd-wake status` | Daemon PID/uptime/version plus a per-project table: state, PID, uptime, last activity, scheduled idle stop (and what is holding it off), last exit, URL, ports. |
-| `herd-wake projects` | List every registered project from the config file (works without the daemon running). |
+| `herd-wake start` | Run the supervisor daemon in the foreground: binds one listener per project, serves the control API on the unix socket, starts `always_on` projects. Ctrl-C (or SIGTERM) stops the daemon *and* every dev server it started; SIGHUP reloads the configuration. |
+| `herd-wake status` | Daemon PID/uptime/version, the config path and last reload time, plus a per-project table: state, PID, uptime, last activity, scheduled idle stop (and what is holding it off), last exit, URL, ports. |
+| `herd-wake reload` | Re-read the config file and `projects.d` and apply the difference to the running daemon (see [Reloading the configuration](#reloading-the-configuration)). Prints added / removed / changed / unchanged projects; exits 1 if the config is invalid (nothing changes) or a project could not be applied. |
+| `herd-wake projects` | List every registered project from the config file and `projects.d`, with each project's source file (works without the daemon running). |
 | `herd-wake project:start <name>` | Start a project's dev server and wait until it is ready. Bypasses and resets the failure backoff. |
 | `herd-wake project:stop <name>` | Gracefully stop a project's dev server (signal, then force-kill after its shutdown timeout). |
 | `herd-wake project:restart <name>` | Stop (if needed) and start a project's dev server. |
@@ -251,13 +300,13 @@ Flags (place them before positional arguments):
 
 | Flag | Applies to | Default | Meaning |
 | --- | --- | --- | --- |
-| `--config <path>` | `start`, `projects` | `~/Library/Application Support/herd-wake/config.yaml` | Config file to load. |
-| `--socket <path>` | `start`, `status`, `project:*`, `logs` | `~/Library/Application Support/herd-wake/herd-wake.sock` | Control socket the daemon serves / clients query. |
+| `--config <path>` | `start`, `projects` | `~/Library/Application Support/herd-wake/config.yaml` | Config file to load; `projects.d/` next to it is merged in. |
+| `--socket <path>` | `start`, `status`, `reload`, `project:*`, `logs` | `~/Library/Application Support/herd-wake/herd-wake.sock` | Control socket the daemon serves / clients query. |
 | `--log-dir <path>` | `start` | `~/Library/Application Support/herd-wake/logs` | Directory for per-project process logs (`<name>.log`). |
 | `--ttl <duration>` | `project:lease` | `30m` | How long the lease lasts, e.g. `45m`, `2h`. |
 | `--lines <n>` | `logs` | `0` | Maximum lines to print (0 = everything buffered, up to 200). |
 
-The control API behind the CLI is plain HTTP+JSON over the unix socket, versioned under `/v1/`: `GET /v1/status`, `POST /v1/projects/{name}/start|stop|restart`, `POST /v1/projects/{name}/lease?ttl=45m`, `DELETE /v1/projects/{name}/lease`, `GET /v1/projects/{name}/logs?lines=N`.
+The control API behind the CLI is plain HTTP+JSON over the unix socket, versioned under `/v1/`: `GET /v1/status` (includes `config_path` and `last_reload_at`), `POST /v1/reload` (returns `{applied, added, removed, changed, unchanged, errors}`; `applied` is false when the config was rejected), `POST /v1/projects/{name}/start|stop|restart`, `POST /v1/projects/{name}/lease?ttl=45m`, `DELETE /v1/projects/{name}/lease`, `GET /v1/projects/{name}/logs?lines=N`.
 
 ## Idle shutdown, leases, and WebSockets
 
@@ -277,7 +326,7 @@ WebSocket upgrades are proxied like any other traffic, including through a cold 
 
 ## Troubleshooting
 
-**Where everything lives.** Config `~/Library/Application Support/herd-wake/config.yaml`; control socket `~/Library/Application Support/herd-wake/herd-wake.sock`; process logs `~/Library/Application Support/herd-wake/logs/<name>.log` (also surfaced by `herd-wake logs <name>`, and quoted in 503 diagnostics). All overridable with `--config` / `--socket` / `--log-dir`.
+**Where everything lives.** Config `~/Library/Application Support/herd-wake/config.yaml` plus `projects.d/*.yaml` next to it; control socket `~/Library/Application Support/herd-wake/herd-wake.sock`; process logs `~/Library/Application Support/herd-wake/logs/<name>.log` (also surfaced by `herd-wake logs <name>`, and quoted in 503 diagnostics). All overridable with `--config` / `--socket` / `--log-dir`.
 
 **Cold start returns 503 "readiness … timeout".** The command started but never answered the readiness probe within `startup_timeout_seconds`. In rough order of likelihood:
 
@@ -289,6 +338,15 @@ WebSocket upgrades are proxied like any other traffic, including through a cold 
 `herd-wake logs <name>` shows what the server actually printed.
 
 **Port conflict.** If something else already holds `application_port`, a `--strictPort`-style command exits immediately and the 503 diagnostic shows the exit and its output. If something holds a `supervisor_port`, `herd-wake start` itself refuses to start with a bind error naming the project — pick a different port or stop the squatter (`lsof -nP -iTCP:<port>` shows who it is).
+
+**Vite answers `403 Blocked request. This host ("dashboard.test") is not allowed. To allow this host, add "dashboard.test" to server.allowedHosts`.** Vite (since 5.4.12 / 6.0.9, and in 7/8) only accepts requests whose `Host` is localhost-ish or listed in `server.allowedHosts`; webpack-dev-server's `allowedHosts` behaves the same. herd-wake forwards the public `Host` by default so servers that build absolute URLs see the real origin. Two fixes — pick one:
+
+1. Set `rewrite_host: true` on the project. Upstream then sees `Host: 127.0.0.1:<application_port>` (its own address, always allowed) while `X-Forwarded-Host: dashboard.test` and `X-Forwarded-Proto: https` still tell it the public origin; HMR upgrades get the same treatment. Then `herd-wake reload`.
+2. Or allow the host in the dev server: `server: { allowedHosts: ['dashboard.test'] }` in `vite.config.js` (or `allowedHosts: 'all'`).
+
+**`herd-wake reload` says the config is invalid.** Nothing was changed; the daemon keeps running with its previous configuration. The listed errors name the project, field, and — for a name defined twice — both files. Fix them and reload again. `herd-wake projects` validates the same way without touching the daemon.
+
+**Reload reported an error for one project.** The rest of the reload was applied. A `listen on 127.0.0.1:<port>: address already in use` error for an *added* project means it was skipped; for a *changed* project it means the project kept its previous port. Free the port (or pick another) and reload again.
 
 **503s keep coming after a failure.** That is the backoff, not a hang: after a failed start, request-triggered retries wait 1s, 2s, 4s, … capped at 30s, and requests during the wait get an immediate 503 saying when the next retry may run. `herd-wake project:start <name>` (or `project:restart`) retries immediately and resets the backoff.
 
@@ -304,7 +362,7 @@ WebSocket upgrades are proxied like any other traffic, including through a cold 
 
 ## Development
 
-Layout: `cmd/herd-wake` (CLI), `internal/config` (config load/validate), `internal/daemon` (wiring, states, control-API provider), `internal/proxy` (reverse proxy, on-demand holding, WebSocket tunneling), `internal/process` (process-group supervisor, logs, backoff), `internal/idle` (activity tracking, idle monitor), `internal/control` (unix-socket HTTP API + client), `internal/testproc` (test-only child-process helpers and WebSocket test client).
+Layout: `cmd/herd-wake` (CLI), `internal/config` (config load/validate, `projects.d` merge), `internal/daemon` (wiring, states, control-API provider, live reload), `internal/proxy` (reverse proxy, on-demand holding, WebSocket tunneling), `internal/process` (process-group supervisor, logs, backoff), `internal/idle` (activity tracking, idle monitor), `internal/control` (unix-socket HTTP API + client), `internal/testproc` (test-only child-process helpers and WebSocket test client).
 
 ```sh
 go test -race ./...                          # fast inner loop (e2e tests skip themselves)

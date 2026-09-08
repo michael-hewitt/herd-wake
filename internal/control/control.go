@@ -7,6 +7,7 @@
 // are versioned under /v1/:
 //
 //	GET    /v1/status
+//	POST   /v1/reload
 //	POST   /v1/projects/{name}/start
 //	POST   /v1/projects/{name}/stop
 //	POST   /v1/projects/{name}/restart
@@ -32,11 +33,17 @@ var ErrDaemonUnreachable = errors.New("daemon unreachable")
 // StatusResponse is the body of GET /v1/status: daemon identity and the
 // current state of every registered project.
 type StatusResponse struct {
-	Version       string          `json:"version"`
-	PID           int             `json:"pid"`
-	StartedAt     time.Time       `json:"started_at"`
-	UptimeSeconds float64         `json:"uptime_seconds"`
-	Projects      []ProjectStatus `json:"projects"`
+	Version       string    `json:"version"`
+	PID           int       `json:"pid"`
+	StartedAt     time.Time `json:"started_at"`
+	UptimeSeconds float64   `json:"uptime_seconds"`
+	// ConfigPath is the main config file the daemon loaded and re-reads on
+	// reload (empty when the daemon runs from an in-memory config).
+	ConfigPath string `json:"config_path,omitempty"`
+	// LastReloadAt is when the configuration was last reloaded successfully;
+	// zero when it has not been reloaded since the daemon started.
+	LastReloadAt time.Time       `json:"last_reload_at,omitzero"`
+	Projects     []ProjectStatus `json:"projects"`
 }
 
 // Uptime returns the daemon uptime as a duration.
@@ -79,6 +86,30 @@ type ProjectStatus struct {
 	// when it is not running, is always_on, or the countdown is parked by
 	// in-flight requests or an active lease.
 	IdleStopAt time.Time `json:"idle_stop_at,omitzero"`
+}
+
+// ReloadResponse is the body of POST /v1/reload: the outcome of re-reading
+// the configuration and diffing it against the running project set.
+type ReloadResponse struct {
+	// ConfigPath is the main config file that was (re-)read.
+	ConfigPath string `json:"config_path"`
+	// Applied is false when the reload was rejected outright — the config
+	// failed to load or validate — and the running state is untouched.
+	// Errors then holds the reasons. When true, the diff below was applied;
+	// Errors may still list per-project problems (e.g. a bind failure for
+	// an added project) that did not abort the rest of the reload.
+	Applied bool `json:"applied"`
+	// ReloadedAt is when the reload was applied; zero when rejected.
+	ReloadedAt time.Time `json:"reloaded_at,omitzero"`
+	// Added, Removed, Changed, and Unchanged list project names (sorted) by
+	// how the reload treated them.
+	Added     []string `json:"added"`
+	Removed   []string `json:"removed"`
+	Changed   []string `json:"changed"`
+	Unchanged []string `json:"unchanged"`
+	// Errors are validation errors (Applied false) or per-project apply
+	// errors (Applied true), one message each.
+	Errors []string `json:"errors,omitempty"`
 }
 
 // LogsResponse is the body of GET /v1/projects/{name}/logs: recent combined

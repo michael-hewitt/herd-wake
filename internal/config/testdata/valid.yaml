@@ -20,6 +20,7 @@ projects:
     hold_max_wait_seconds: 20
     hold_max_requests: 8
     always_on: true
+    rewrite_host: true
     node_path: /usr/local/bin/node
     env:
       APP_ENV: local

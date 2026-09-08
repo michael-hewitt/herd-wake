@@ -70,6 +70,17 @@ func (c *Client) Status(ctx context.Context) (*StatusResponse, error) {
 	return &status, nil
 }
 
+// Reload asks the daemon to re-read its configuration and apply the
+// difference. A rejected reload (invalid config) is a successful call whose
+// response has Applied false and the validation errors in Errors.
+func (c *Client) Reload(ctx context.Context) (*ReloadResponse, error) {
+	var resp ReloadResponse
+	if err := c.do(ctx, http.MethodPost, "/v1/reload", &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // StartProject asks the daemon to start the named project, returning once it
 // is running or startup failed.
 func (c *Client) StartProject(ctx context.Context, name string) (*ProjectStatus, error) {

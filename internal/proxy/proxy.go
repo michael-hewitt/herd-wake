@@ -3,9 +3,10 @@
 //
 // Requests arrive from Laravel Herd, which owns the public .test URL and
 // terminates HTTPS before forwarding plain HTTP to the supervisor. The proxy
-// therefore preserves the inbound Host header and sets the X-Forwarded-*
-// headers so the upstream dev server sees the public origin, streams bodies
-// in both directions, and propagates client cancellation.
+// therefore preserves the inbound Host header (or, with rewrite_host,
+// presents the loopback upstream address instead) and sets the
+// X-Forwarded-* headers so the upstream dev server sees the public origin,
+// streams bodies in both directions, and propagates client cancellation.
 package proxy
 
 import (
@@ -39,13 +40,23 @@ func New(p *config.Project, logger *log.Logger) http.Handler {
 	}
 
 	return &httputil.ReverseProxy{
+		// Rewrite runs for every request, protocol upgrades (WebSockets)
+		// included, so the Host policy below applies to HMR handshakes too.
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.Out.URL.Scheme = "http"
 			r.Out.URL.Host = upstream
 
-			// Keep the public Host (e.g. dashboard.test) so dev servers that
-			// check allowed hosts or build absolute URLs see the real origin.
-			r.Out.Host = r.In.Host
+			if p.RewriteHost {
+				// rewrite_host: present the loopback upstream address as the
+				// Host, for dev servers that refuse any other host (Vite's
+				// server.allowedHosts, webpack-dev-server's allowedHosts).
+				// The public host still travels in X-Forwarded-Host below.
+				r.Out.Host = upstream
+			} else {
+				// Keep the public Host (e.g. dashboard.test) so dev servers
+				// that build absolute URLs see the real origin.
+				r.Out.Host = r.In.Host
+			}
 
 			// ReverseProxy strips inbound X-Forwarded-* headers before
 			// calling Rewrite; restore Herd's X-Forwarded-For so
@@ -53,6 +64,8 @@ func New(p *config.Project, logger *log.Logger) http.Handler {
 			if prior := r.In.Header.Values("X-Forwarded-For"); len(prior) > 0 {
 				r.Out.Header["X-Forwarded-For"] = prior
 			}
+			// SetXForwarded derives X-Forwarded-Host from the inbound Host,
+			// not from r.Out.Host, so the public host is carried either way.
 			r.SetXForwarded()
 
 			// Prefer the values Herd set on the public-facing hop: the

@@ -22,6 +22,8 @@ type stubProvider struct {
 	lastName     string
 	lastMaxLines int
 	lastTTL      time.Duration
+
+	reload ReloadResponse // returned by Reload
 }
 
 func (s *stubProvider) Status() StatusResponse { return s.status }
@@ -63,6 +65,14 @@ func (s *stubProvider) ProjectLogs(name string, maxLines int) (LogsResponse, err
 	return s.logs, nil
 }
 
+func (s *stubProvider) Reload(_ context.Context) (ReloadResponse, error) {
+	s.lastAction = "reload"
+	if s.err != nil {
+		return ReloadResponse{}, s.err
+	}
+	return s.reload, nil
+}
+
 // startServer serves the control API for provider on a test unix socket and
 // returns a client for it.
 func startServer(t *testing.T, provider Provider) *Client {
@@ -101,6 +111,8 @@ func TestClientStatusRoundTrip(t *testing.T) {
 		PID:           4242,
 		StartedAt:     time.Now().Add(-90 * time.Second).UTC(),
 		UptimeSeconds: 90,
+		ConfigPath:    "/tmp/herd-wake/config.yaml",
+		LastReloadAt:  time.Now().Add(-30 * time.Second).UTC(),
 		Projects: []ProjectStatus{{
 			Name:            "dashboard",
 			PublicURL:       "https://dashboard.test",
@@ -128,6 +140,9 @@ func TestClientStatusRoundTrip(t *testing.T) {
 	}
 	if !got.StartedAt.Equal(want.StartedAt) {
 		t.Errorf("StartedAt = %v, want %v", got.StartedAt, want.StartedAt)
+	}
+	if got.ConfigPath != want.ConfigPath || !got.LastReloadAt.Equal(want.LastReloadAt) {
+		t.Errorf("config fields = (%q, %v), want (%q, %v)", got.ConfigPath, got.LastReloadAt, want.ConfigPath, want.LastReloadAt)
 	}
 	if len(got.Projects) != 1 || got.Projects[0] != want.Projects[0] {
 		t.Errorf("Projects = %+v, want %+v", got.Projects, want.Projects)
@@ -261,5 +276,75 @@ func TestClientUnknownProjectIs404(t *testing.T) {
 	}
 	if errors.Is(err, ErrDaemonUnreachable) {
 		t.Error("an API error must not match ErrDaemonUnreachable")
+	}
+}
+
+func TestClientReloadRoundTrip(t *testing.T) {
+	want := ReloadResponse{
+		ConfigPath: "/tmp/herd-wake/config.yaml",
+		Applied:    true,
+		ReloadedAt: time.Now().UTC(),
+		Added:      []string{"beta"},
+		Removed:    []string{},
+		Changed:    []string{"alpha"},
+		Unchanged:  []string{"gamma"},
+		Errors:     []string{`project "beta": listen on 127.0.0.1:7105: address already in use`},
+	}
+	stub := &stubProvider{reload: want}
+	client := startServer(t, stub)
+
+	got, err := client.Reload(context.Background())
+	if err != nil {
+		t.Fatalf("Reload() error: %v", err)
+	}
+
+	if stub.lastAction != "reload" {
+		t.Errorf("provider action = %q, want reload", stub.lastAction)
+	}
+	if got.ConfigPath != want.ConfigPath || got.Applied != want.Applied || !got.ReloadedAt.Equal(want.ReloadedAt) {
+		t.Errorf("Reload() = %+v, want %+v", got, want)
+	}
+	for name, pair := range map[string][2][]string{
+		"Added":     {got.Added, want.Added},
+		"Removed":   {got.Removed, want.Removed},
+		"Changed":   {got.Changed, want.Changed},
+		"Unchanged": {got.Unchanged, want.Unchanged},
+		"Errors":    {got.Errors, want.Errors},
+	} {
+		if strings.Join(pair[0], ",") != strings.Join(pair[1], ",") || (pair[0] == nil) != (pair[1] == nil) {
+			t.Errorf("%s = %#v, want %#v", name, pair[0], pair[1])
+		}
+	}
+}
+
+func TestClientReloadRejectedConfigIsNotAnError(t *testing.T) {
+	stub := &stubProvider{reload: ReloadResponse{
+		ConfigPath: "/tmp/herd-wake/config.yaml",
+		Applied:    false,
+		Errors:     []string{`project "beta": command: required`},
+	}}
+	client := startServer(t, stub)
+
+	got, err := client.Reload(context.Background())
+	if err != nil {
+		t.Fatalf("Reload() error: %v, want the rejection reported in the response", err)
+	}
+	if got.Applied || len(got.Errors) != 1 {
+		t.Errorf("Reload() = %+v, want Applied false with one error", got)
+	}
+}
+
+func TestClientReloadProviderError(t *testing.T) {
+	stub := &stubProvider{err: errors.New("reload unavailable: no config file")}
+	client := startServer(t, stub)
+
+	_, err := client.Reload(context.Background())
+
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("error = %v, want a 500 APIError", err)
+	}
+	if !strings.Contains(apiErr.Message, "reload unavailable") {
+		t.Errorf("Message = %q", apiErr.Message)
 	}
 }
