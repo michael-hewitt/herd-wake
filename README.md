@@ -2,7 +2,7 @@
 
 **herd-wake starts your Node.js dev servers when their [Laravel Herd](https://herd.laravel.com) URL is visited and stops them again when you stop using them** — so a machine full of Vite, Next.js, and Express projects costs nothing while you are not looking at them.
 
-It is a single-binary lifecycle supervisor that sits behind Herd. Visiting a registered URL starts the right dev server, holds the request until the server is ready, then forwards it; HTTP and WebSocket traffic (including Vite HMR) is proxied transparently; after a configurable idle period the server is stopped gracefully. Herd's normal PHP behavior is never touched: only URLs you explicitly register with `herd proxy` reach herd-wake at all.
+It is a single-binary lifecycle supervisor that sits behind Herd. Visiting a registered URL starts the right dev server, holds the request until the server is ready, then forwards it; HTTP and WebSocket traffic (including Vite HMR) is proxied transparently; after a configurable idle period the server is stopped gracefully. Herd's normal PHP behavior is never touched: only URLs registered with `herd proxy` — by you, or by `herd-wake sync` for git worktrees it discovers — reach herd-wake at all.
 
 The full specification lives in [issue #1](https://github.com/michael-hewitt/herd-wake/issues/1).
 
@@ -17,6 +17,12 @@ The full specification lives in [issue #1](https://github.com/michael-hewitt/her
 - [Configuration reference](#configuration-reference)
   - [The projects.d directory](#the-projectsd-directory)
 - [Reloading the configuration](#reloading-the-configuration)
+- [Worktrees: automatic URLs](#worktrees-automatic-urls)
+  - [Discovery configuration](#discovery-configuration)
+  - [Running sync](#running-sync)
+  - [Hooking sync into worktree tooling](#hooking-sync-into-worktree-tooling)
+  - [What happens on removal](#what-happens-on-removal)
+  - [The Herd-collision safeguard](#the-herd-collision-safeguard)
 - [CLI reference](#cli-reference)
 - [Idle shutdown, leases, and WebSockets](#idle-shutdown-leases-and-websockets)
 - [Troubleshooting](#troubleshooting)
@@ -120,7 +126,7 @@ Now open `https://dashboard.test` in a browser. Herd terminates HTTPS and forwar
 
 ## Registering URLs with Herd
 
-herd-wake never touches Herd's configuration. You register each project's public URL once with `herd proxy`, pointing it at the project's `supervisor_port`. Only those URLs reach herd-wake; every other Herd site behaves exactly as before, whether herd-wake is running, stopped, or uninstalled.
+For hand-written projects you register each public URL once with `herd proxy`, pointing it at the project's `supervisor_port` (for discovered worktrees, [`herd-wake sync`](#worktrees-automatic-urls) runs the same command for you). Only those URLs reach herd-wake; every other Herd site behaves exactly as before, whether herd-wake is running, stopped, or uninstalled. herd-wake never edits Herd's global nginx configuration — the only Herd state it touches is the per-site proxy entry `herd proxy`/`herd unproxy` manage.
 
 Always pass `--secure`: it makes Herd issue a trusted TLS certificate for the domain so the `https://` URL (and `wss://` HMR) actually works. Without it Herd registers the proxy HTTP-only and browsers/curl fail certificate verification on the `https://` URL.
 
@@ -187,7 +193,7 @@ With that in place: a page load on `https://accounts.test` emits asset URLs on `
 
 - `laravel-vite-plugin` decides between dev server and built assets by the presence of the `public/hot` file, which *it* creates while Vite runs and removes when Vite exits. So after herd-wake idle-stops Vite, Laravel falls back to built assets, and page loads alone will not wake Vite again (nothing references the vite URL anymore). Wake it explicitly (`herd-wake project:start accounts-vite`, or reload once Vite is running), pin the hot file yourself (`echo 'https://vite.accounts.test' > public/hot` — the plugin may still remove it on Vite's next exit), or sidestep the whole issue with `always_on: true` on the Vite project if you prefer it permanently up.
 - Verify the `server.origin`-to-hot-file behavior against your `laravel-vite-plugin` version; older versions differ.
-- First-class management of this handshake (auto-maintained hot file, automatic Herd proxy registration) is deliberately out of scope for the MVP.
+- First-class management of this handshake (an auto-maintained hot file) is deliberately out of scope for the MVP. Automatic Herd proxy registration exists for [discovered worktrees](#worktrees-automatic-urls); hand-written projects still register with `herd proxy` themselves.
 
 ## Configuration reference
 
@@ -198,7 +204,7 @@ Projects are registered in a user-level YAML file — nothing is stored in your 
 ~/Library/Application Support/herd-wake/projects.d/     (optional, see below)
 ```
 
-The file is a `projects:` map of project names to settings. Unknown fields are rejected (typos fail loudly), validation reports every problem with its project and field, and all `supervisor_port`/`application_port` values must be unique across the whole configuration (main file and `projects.d` together). [config.sample.yaml](config.sample.yaml) is a fully commented example kept in sync with this table. A running daemon picks up edits with [`herd-wake reload`](#reloading-the-configuration).
+The file is a `projects:` map of project names to settings, plus an optional `discovery:` list of [worktree templates](#discovery-configuration). Unknown fields are rejected (typos fail loudly), validation reports every problem with its project (or discovery entry) and field, and all `supervisor_port`/`application_port` values must be unique across the whole configuration (main file and `projects.d` together). [config.sample.yaml](config.sample.yaml) is a fully commented example kept in sync with these tables. A running daemon picks up edits with [`herd-wake reload`](#reloading-the-configuration).
 
 ### Required fields
 
@@ -232,6 +238,25 @@ The file is a `projects:` map of project names to settings. Unknown fields are r
 | `listen_host` | string | `127.0.0.1` | Address the supervisor listener binds for this project. Non-loopback values are rejected unless `allow_non_loopback: true`. |
 | `allow_non_loopback` | bool | `false` | Explicit opt-in required to bind a non-loopback `listen_host`. |
 
+### Discovery entries
+
+Each entry of the top-level `discovery:` list is a template for one family of git worktrees; [`herd-wake sync`](#worktrees-automatic-urls) turns it into generated projects in `projects.d/<name>.yaml`. Entries are only allowed in the main file.
+
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `name` | string | required | Identifies the entry and names its managed file `projects.d/<name>.yaml`. A DNS label (lowercase letters, digits, hyphens; ≤63 chars); unique across entries. |
+| `directory` | string | required | The directory whose immediate subdirectories are scanned. Must exist; `~/` is expanded. |
+| `repository` | string | — | Restrict candidates to *linked worktrees* of this git repository: the subdirectory's `.git` must be a file whose `gitdir:` resolves under `<repository>/.git/worktrees/`. Standalone repositories and worktrees of other repositories in the folder are skipped (and listed as such). Without it, any subdirectory with a `.git` file or directory is a candidate. Must exist and contain `.git`; `~/` is expanded. |
+| `require_files` | list | — | Relative paths that must all exist inside a subdirectory for it to become a project. |
+| `url_template` | string | `https://{name}.test` | Each project's `public_url`; `{name}` (required) is the subdirectory name. |
+| `command` | string | required | The template's `command`, run in each worktree. It must make the server listen on `127.0.0.1:<application_port>` — since that port differs per worktree, derive it the way `port_command` does rather than hard-coding it. |
+| `port_command` | string | — | Run in the worktree on every sync (`/bin/sh -c`, with the template's `env` and `node_path` on `PATH`, 15 s timeout). Its output — a bare port on the last line, or a URL (explicit port, else 80/443 by scheme) — becomes `application_port`, and a changed port updates the project. On failure the worktree is skipped with a warning this time; an already-registered project keeps its previous settings. |
+| `application_port_range` | `[low, high]` | required without `port_command` | Where new projects get their `application_port` when there is no `port_command`: the lowest port not used anywhere in the configuration. |
+| `supervisor_port_range` | `[low, high]` | required | Where new projects get their `supervisor_port`: the lowest port not used anywhere in the configuration (main file and every `projects.d` file). Allocated ports are written to the managed file and never change afterwards, so URLs and Herd proxies stay stable across syncs. |
+| `herd` | bool | `true` | Create/remove Herd proxy entries for this entry's projects. With `false` (or when the `herd` CLI is not found) sync prints the commands for you to run instead. |
+| `exclude` | list | `[".*"]` | `path.Match` glob patterns on the subdirectory name; matches are never candidates. Setting it replaces the default. |
+| *any per-project field* | | | `env`, `node_path`, `rewrite_host`, `readiness_strategy`, `startup_timeout_seconds`, `idle_timeout_minutes`, `websockets_keep_alive`, `shutdown_signal`, `shutdown_timeout_seconds`, `log_retention_days`, `always_on`, `hold_*`, … are accepted in the template and copied verbatim to every generated project. `public_url`, `supervisor_port`, `application_port`, and `working_directory` are generated and therefore rejected in a template. |
+
 ### The projects.d directory
 
 Next to the main config file, an optional `projects.d/` directory holds additional project files:
@@ -240,13 +265,13 @@ Next to the main config file, an optional `projects.d/` directory holds addition
 ~/Library/Application Support/herd-wake/
 ├── config.yaml                 # hand-written, never touched by tooling
 └── projects.d/
-    ├── issue-3265.yaml         # one project (or several) per file
-    └── worktree-feature-x.yaml
+    ├── webapp.yaml             # managed by `herd-wake sync` (discovery "webapp"), one project per worktree
+    └── preview-42.yaml         # or hand-written: one project (or several) per file
 ```
 
 Each `projects.d/*.yaml` file has the same layout as the main file — a `projects:` map with one project or many — and may be empty. Files are read in name order and their projects are merged into the main file's; a project name defined more than once anywhere (main file or any `projects.d` file) is a validation error naming both sources, e.g. `project "webapp": name: defined in both config.yaml and projects.d/webapp.yaml`. Only `*.yaml` files directly inside the directory count (hidden files, other extensions, and subdirectories are ignored), and a missing directory is fine. Unknown top-level keys are rejected in these files exactly as in the main file.
 
-The directory is always derived from the main file's location (`--config /some/dir/config.yaml` means `/some/dir/projects.d/`). This is the layout automation writes into — one file per worktree or preview server — so your hand-written `config.yaml` is never rewritten. `herd-wake projects` shows each project's source file.
+The directory is always derived from the main file's location (`--config /some/dir/config.yaml` means `/some/dir/projects.d/`). This is the layout automation writes into — [`herd-wake sync`](#worktrees-automatic-urls) keeps one file per discovery entry, opened by a `# Managed by herd-wake sync — do not edit.` header — so your hand-written `config.yaml` is never rewritten, and sync in turn never overwrites a `projects.d` file that lacks that header. `herd-wake projects` shows each project's source file.
 
 ## Reloading the configuration
 
@@ -276,6 +301,78 @@ Rules and guarantees:
 
 `herd-wake start` runs in the foreground; because SIGHUP now means "reload", closing the terminal that runs it no longer terminates the daemon (it only loses its log output). Stop it with Ctrl-C or SIGTERM.
 
+## Worktrees: automatic URLs
+
+If you work in git worktrees — one directory per branch or issue under a workspace folder — herd-wake can be the master of the URL↔worktree registry: creating a worktree is the single action that makes `https://<worktree-name>.test` live, and deleting it cleans everything up. `herd-wake sync` scans the configured directories, keeps one generated project per worktree in a managed `projects.d` file, allocates stable ports, creates and removes the matching Herd proxy entries, and reloads the daemon.
+
+### Discovery configuration
+
+Add a `discovery:` list to `config.yaml` (only the main file may hold it). Each entry is a template for one family of worktrees — the full field reference is [above](#discovery-entries):
+
+```yaml
+discovery:
+  - name: webapp                          # managed projects go to projects.d/webapp.yaml
+    directory: ~/orca/workspaces/webapp   # immediate subdirectories are candidates
+    repository: ~/dev/webapp              # only linked worktrees of this repo; unrelated repos in the folder are ignored
+    require_files: [start.sh, package.json]
+    url_template: https://{name}.test     # default; {name} = directory name
+    command: ./start.sh
+    port_command: node scripts/dev-port.mjs   # prints the port (or URL) the dev server will use
+    supervisor_port_range: [41000, 41999]
+    application_port_range: [42000, 42999]    # used when port_command is absent
+    env: { ENVIRONMENT: dev }
+    node_path: ~/.nvm/versions/node/v24.15.0/bin
+    rewrite_host: true
+    readiness_strategy: tcp
+    startup_timeout_seconds: 180
+    idle_timeout_minutes: 30
+```
+
+A subdirectory of `directory` becomes a project when it is not excluded (dot-directories by default), is a git worktree or repository (has a `.git` file or directory), passes the `repository` filter when set (only *linked* worktrees whose `.git` file points into `<repository>/.git/worktrees/` — a workspace folder often holds unrelated data or asset repos next to the worktrees, and those must never become projects), contains every `require_files` entry, and has a DNS-label name (lowercase letters, digits, hyphens). Anything else is skipped with the reason in the sync output; a directory such as `Feature_X` gets a warning telling you to rename it. The project name is the directory name and its URL comes from `url_template`.
+
+The generated project is the template's fields plus:
+
+- `working_directory` — the worktree itself;
+- `public_url` — `url_template` with `{name}` filled in;
+- `supervisor_port` — the lowest port in `supervisor_port_range` not used anywhere in the configuration, allocated once and kept forever after (Herd's proxy points at it);
+- `application_port` — what `port_command` printed (re-run every sync; a changed port updates the project), or the lowest free port in `application_port_range` when there is no `port_command`.
+
+### Running sync
+
+```sh
+herd-wake sync                 # reconcile, update Herd, reload the daemon
+herd-wake sync --dry-run       # show what would change; writes nothing, changes nothing in Herd
+herd-wake sync --json          # machine-readable result (the same shape, plus the reload outcome)
+herd-wake sync --no-herd       # never run the herd CLI; print the Herd commands to run by hand
+```
+
+For every discovery entry, sync rewrites `projects.d/<name>.yaml` atomically from the current worktree set (the file opens with `# Managed by herd-wake sync — do not edit.`; sync refuses to overwrite a file without that header), then:
+
+- **Herd** (`herd: true`, the default): for each project it runs `herd proxy <name> http://127.0.0.1:<supervisor_port> --secure` unless Herd's site file for the host (`~/Library/Application Support/Herd/config/valet/Nginx/<host>`) already proxies to that port — each `herd proxy` restarts Herd's nginx, so sync avoids needless ones; for each removed project whose site file proxies to its port it runs `herd unproxy <name>`. The CLI is `herd` on `PATH`, else the bundled `~/Library/Application Support/Herd/bin/herd`. If it is missing, or a command fails, sync keeps going and prints the exact commands for you to run.
+- **Reload**: if the daemon is running, sync triggers [`reload`](#reloading-the-configuration) over the control socket and reports the result (added/removed/changed/unchanged); otherwise it says so — the daemon reads the files when it starts.
+
+The output lists, per entry, the projects added, updated, unchanged, and removed, every skipped directory with its reason, each Herd action and its outcome, and whether the managed file was written. `sync` exits non-zero when an entry could not be synced (an unreadable directory, an unmanaged file in the way) or the daemon rejected the reload; Herd problems are reported but never fail the command. Nothing in `config.yaml` is ever changed. A worktree whose name is already used by a hand-written project (or by another discovery entry) is skipped, not hijacked.
+
+### Hooking sync into worktree tooling
+
+Run `herd-wake sync` after creating a worktree and after removing one — from a wrapper script, a `post-checkout` hook in the repository (`git worktree add` runs it in the new worktree), or whatever your worktree manager offers. It is idempotent: running it again with nothing changed writes nothing and runs no Herd command. Because removal has to run *before* the directory disappears if you want the Herd proxy cleaned up immediately, an archive hook is the natural place for `herd-wake project:remove <name>` (below); a plain `sync` afterwards also works, since sync loads the configuration with missing worktree directories tolerated.
+
+### What happens on removal
+
+Delete a worktree and run `sync`: its project is removed from the managed file, `herd unproxy <name>` runs (only when Herd's site file still proxies to that project's supervisor port — a site file pointing elsewhere is left alone), and the daemon reload stops the dev server if it was running and closes its supervisor port. The ports it held are free for the next new worktree.
+
+`herd-wake project:remove <name> [--keep-herd]` does the same for one project on demand, managed or hand-written in `projects.d`: it removes the project from its file (a hand-written `projects.d` file is rewritten without comments; the file stays, possibly with an empty `projects:` map), runs `herd unproxy` unless `--keep-herd`, and reloads the daemon. It is meant for worktree-archive hooks that run before the directory is gone. A name that is not registered is a no-op (exit 0), so hooks can call it unconditionally; a project defined in the main `config.yaml` is never touched — the command prints what to remove by hand and exits 1. Note that removing a *managed* project whose worktree still exists is temporary: the next `sync` re-creates it.
+
+### The Herd-collision safeguard
+
+herd-wake must never claim a domain that already belongs to a PHP site (spec §11): a proxy entry for `accounts.test` would silently shadow a parked or linked Laravel app of that name. So before registering a new name, sync refuses it — with a message naming the conflict, and without writing the project or touching Herd — when:
+
+- a directory called `<name>` exists directly inside any Herd parked path (`herd paths`), or
+- `herd links` lists a site of that name, or
+- Herd already has a site file for the host that is not a proxy (a site secured with `herd secure`).
+
+`herd paths` and `herd links` are each called at most once per sync, however many names are checked. Rename the worktree (or the PHP site) to resolve a conflict. With `--no-herd`, or when the `herd` CLI is unavailable, the check cannot run; sync says so and still writes the projects — the printed `herd proxy` commands are yours to vet.
+
 ## CLI reference
 
 ```
@@ -287,12 +384,14 @@ herd-wake <command> [flags] [args]
 | `herd-wake start` | Run the supervisor daemon in the foreground: binds one listener per project, serves the control API on the unix socket, starts `always_on` projects. Ctrl-C (or SIGTERM) stops the daemon *and* every dev server it started; SIGHUP reloads the configuration. |
 | `herd-wake status` | Daemon PID/uptime/version, the config path and last reload time, plus a per-project table: state, PID, uptime, last activity, scheduled idle stop (and what is holding it off), last exit, URL, ports. |
 | `herd-wake reload` | Re-read the config file and `projects.d` and apply the difference to the running daemon (see [Reloading the configuration](#reloading-the-configuration)). Prints added / removed / changed / unchanged projects; exits 1 if the config is invalid (nothing changes) or a project could not be applied. |
+| `herd-wake sync` | Discover worktrees for every `discovery:` entry, rewrite the managed `projects.d/<name>.yaml` files, create/remove Herd proxies, and reload the daemon if it is running (see [Worktrees: automatic URLs](#worktrees-automatic-urls)). `--dry-run` prints without writing or touching Herd; `--no-herd` skips the Herd CLI and prints the commands; `--json` for scripting. Exits 1 when an entry failed or the reload was rejected. |
 | `herd-wake projects` | List every registered project from the config file and `projects.d`, with each project's source file (works without the daemon running). |
 | `herd-wake project:start <name>` | Start a project's dev server and wait until it is ready. Bypasses and resets the failure backoff. |
 | `herd-wake project:stop <name>` | Gracefully stop a project's dev server (signal, then force-kill after its shutdown timeout). |
 | `herd-wake project:restart <name>` | Stop (if needed) and start a project's dev server. |
 | `herd-wake project:lease <name>` | Mark a project active for `--ttl` (default 30m) so it is not idle-stopped — for tools that generate no HTTP traffic. Does not start a stopped project; a new lease replaces the old one. |
 | `herd-wake project:release <name>` | Release a project's activity lease early. |
+| `herd-wake project:remove <name>` | Remove a project from its `projects.d` file, run `herd unproxy` for it (unless `--keep-herd`), and reload the daemon. Unknown names are a no-op; projects in the main `config.yaml` are left for you to remove by hand (exit 1). |
 | `herd-wake logs <name>` | Print the project's recent combined stdout/stderr and the path of the full on-disk log. |
 | `herd-wake version` | Print the herd-wake version. |
 
@@ -300,11 +399,15 @@ Flags (place them before positional arguments):
 
 | Flag | Applies to | Default | Meaning |
 | --- | --- | --- | --- |
-| `--config <path>` | `start`, `projects` | `~/Library/Application Support/herd-wake/config.yaml` | Config file to load; `projects.d/` next to it is merged in. |
-| `--socket <path>` | `start`, `status`, `reload`, `project:*`, `logs` | `~/Library/Application Support/herd-wake/herd-wake.sock` | Control socket the daemon serves / clients query. |
+| `--config <path>` | `start`, `projects`, `sync`, `project:remove` | `~/Library/Application Support/herd-wake/config.yaml` | Config file to load; `projects.d/` next to it is merged in. |
+| `--socket <path>` | `start`, `status`, `reload`, `sync`, `project:*`, `logs` | `~/Library/Application Support/herd-wake/herd-wake.sock` | Control socket the daemon serves / clients query. |
 | `--log-dir <path>` | `start` | `~/Library/Application Support/herd-wake/logs` | Directory for per-project process logs (`<name>.log`). |
 | `--ttl <duration>` | `project:lease` | `30m` | How long the lease lasts, e.g. `45m`, `2h`. |
 | `--lines <n>` | `logs` | `0` | Maximum lines to print (0 = everything buffered, up to 200). |
+| `--dry-run` | `sync` | off | Compute and print the changes without writing files or touching Herd (`herd paths`/`herd links` are still read). |
+| `--no-herd` | `sync` | off | Never run the `herd` CLI; print the Herd commands to run by hand. |
+| `--json` | `sync` | off | Print the result as JSON. |
+| `--keep-herd` | `project:remove` | off | Leave the project's Herd proxy in place. |
 
 The control API behind the CLI is plain HTTP+JSON over the unix socket, versioned under `/v1/`: `GET /v1/status` (includes `config_path` and `last_reload_at`), `POST /v1/reload` (returns `{applied, added, removed, changed, unchanged, errors}`; `applied` is false when the config was rejected), `POST /v1/projects/{name}/start|stop|restart`, `POST /v1/projects/{name}/lease?ttl=45m`, `DELETE /v1/projects/{name}/lease`, `GET /v1/projects/{name}/logs?lines=N`.
 
@@ -356,13 +459,21 @@ WebSocket upgrades are proxied like any other traffic, including through a cold 
 
 **Herd URL gives 502/504 but `curl 127.0.0.1:<supervisor_port>` works.** The Herd proxy target does not match the project's `supervisor_port` — re-register with `herd proxy <name> http://127.0.0.1:<supervisor_port> --secure`. If the direct curl fails too, the daemon is not running.
 
+**`sync` refused a worktree: "a directory named … exists in Herd parked path …".** A parked or linked Herd site already answers on that name, and a proxy would shadow it — see [the safeguard](#the-herd-collision-safeguard). Rename the worktree (or the site). Nothing was written for it.
+
+**`sync` skipped a worktree.** The reason is printed next to it: not a DNS label (rename `Feature_X` to `feature-x`), a standalone repository or a worktree of another repository when `repository` is set, a missing `require_files` entry, a failing `port_command` (its output is quoted; an already-registered worktree keeps its previous settings until it succeeds), or a name already taken by a hand-written project.
+
+**`sync` says the herd CLI was not found.** It looked for `herd` on `PATH` and at `~/Library/Application Support/Herd/bin/herd`. The projects were still written and the daemon reloaded; run the printed `herd proxy`/`herd unproxy` commands yourself.
+
+**`sync` refuses to overwrite `projects.d/<name>.yaml`.** A file of that name exists without the managed header — probably hand-written. Move it aside or rename the discovery entry; sync never clobbers files it did not write.
+
 **Project stops while I'm still working.** Idle detection sees HTTP traffic and open WebSockets. Tools that make neither (editors, test watchers) can hold a project up with `herd-wake project:lease <name> --ttl 2h`, or set `always_on: true` for permanently-up projects, or raise `idle_timeout_minutes`.
 
 **A project I stopped came back.** Any request to its URL wakes it — that is the point. Stop traffic (close the browser tab with the HMR socket) or unregister the Herd proxy if you want it to stay down.
 
 ## Development
 
-Layout: `cmd/herd-wake` (CLI), `internal/config` (config load/validate, `projects.d` merge), `internal/daemon` (wiring, states, control-API provider, live reload), `internal/proxy` (reverse proxy, on-demand holding, WebSocket tunneling), `internal/process` (process-group supervisor, logs, backoff), `internal/idle` (activity tracking, idle monitor), `internal/control` (unix-socket HTTP API + client), `internal/testproc` (test-only child-process helpers and WebSocket test client).
+Layout: `cmd/herd-wake` (CLI), `internal/config` (config load/validate, `projects.d` merge, `discovery:` schema), `internal/discovery` (worktree scanning, port allocation, managed-file writer, `sync`/`project:remove`), `internal/herd` (Herd CLI wrapper: `paths`, `links`, site files, `proxy`/`unproxy`), `internal/daemon` (wiring, states, control-API provider, live reload), `internal/proxy` (reverse proxy, on-demand holding, WebSocket tunneling), `internal/process` (process-group supervisor, logs, backoff), `internal/idle` (activity tracking, idle monitor), `internal/control` (unix-socket HTTP API + client), `internal/testproc` (test-only child-process helpers, WebSocket test client, and the fake `herd` script the discovery tests run against — no test ever invokes a real Herd).
 
 ```sh
 go test -race ./...                          # fast inner loop (e2e tests skip themselves)

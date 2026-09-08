@@ -47,6 +47,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runStatus(args[1:], stdout, stderr)
 	case "reload":
 		return runReload(args[1:], stdout, stderr)
+	case "sync":
+		return runSync(args[1:], stdout, stderr)
+	case "project:remove":
+		return runProjectRemove(args[1:], stdout, stderr)
 	case "project:start", "project:stop", "project:restart", "project:release":
 		return runProjectCommand(args[0], args[1:], stdout, stderr)
 	case "project:lease":
@@ -441,29 +445,7 @@ func reportDaemonError(stderr io.Writer, err error) {
 // loads it, reporting problems to stderr. The bool result is false when the
 // caller should exit with an error.
 func loadConfig(flagPath string, stderr io.Writer) (cfg *config.Config, path string, ok bool) {
-	path = flagPath
-	if path == "" {
-		defaultPath, err := config.DefaultPath()
-		if err != nil {
-			fmt.Fprintf(stderr, "herd-wake: %v\n", err)
-			return nil, "", false
-		}
-		path = defaultPath
-	}
-
-	cfg, err := config.Load(path)
-	if errors.Is(err, os.ErrNotExist) {
-		printMissingConfig(stderr, path)
-		return nil, path, false
-	}
-	if err != nil {
-		fmt.Fprintf(stderr, "herd-wake: config %s is invalid:\n", path)
-		for _, line := range strings.Split(err.Error(), "\n") {
-			fmt.Fprintf(stderr, "  - %s\n", line)
-		}
-		return nil, path, false
-	}
-	return cfg, path, true
+	return loadConfigWithOptions(flagPath, config.LoadOptions{}, stderr)
 }
 
 // resolveSocketPath returns the control socket path: the flag value if set,
@@ -534,23 +516,29 @@ Commands:
   start                    Run the supervisor daemon in the foreground (Ctrl-C to stop, SIGHUP to reload)
   status                   Show daemon uptime, config path, and per-project state
   reload                   Re-read the config file and projects.d and apply the changes live
+  sync                     Discover worktrees, update projects.d and Herd proxies, reload the daemon
   projects                 List registered projects from the config file and projects.d
   project:start <name>     Start a project's dev server and wait until it is ready
   project:stop <name>      Gracefully stop a project's dev server
   project:restart <name>   Stop (if needed) and start a project's dev server
   project:lease <name>     Mark a project active so it is not idle-stopped (--ttl, default 30m)
   project:release <name>   Release a project's activity lease early
+  project:remove <name>    Remove a project from projects.d, drop its Herd proxy, reload the daemon
   logs <name>              Print a project's recent dev-server output
   version                  Print the herd-wake version
 
 Options:
-  --config <path>   Config file to load (start, projects); projects.d/ next to it is merged in
+  --config <path>   Config file to load (start, projects, sync, project:remove); projects.d/ next to it is merged in
                     (default: ~/Library/Application Support/herd-wake/config.yaml)
-  --socket <path>   Control socket to use (start, status, reload, project:*, logs)
+  --socket <path>   Control socket to use (start, status, reload, sync, project:*, logs)
                     (default: ~/Library/Application Support/herd-wake/herd-wake.sock)
   --log-dir <path>  Directory for per-project process logs (start)
                     (default: ~/Library/Application Support/herd-wake/logs)
   --ttl <duration>  How long a lease lasts, e.g. 45m or 2h (project:lease; default 30m)
   --lines <n>       Maximum lines to print (logs; 0 = everything buffered)
+  --dry-run         Compute and print what sync would change without writing or touching Herd (sync)
+  --no-herd         Never run the herd CLI; print the Herd commands to run by hand (sync)
+  --json            Print the result as JSON (sync)
+  --keep-herd       Leave the project's Herd proxy in place (project:remove)
 `)
 }

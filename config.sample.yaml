@@ -167,3 +167,94 @@ projects:
     # explicitly opt in with allow_non_loopback: true.
     listen_host: 127.0.0.1
     # allow_non_loopback: false
+
+# -----------------------------------------------------------------------
+# Worktree discovery: automatic URLs for git worktrees.
+#
+# Each entry under `discovery:` is a template for one family of worktrees.
+# `herd-wake sync` scans the directory, and for every linked git worktree it
+# finds writes a generated project — the template's fields plus a generated
+# public_url, supervisor_port, application_port, and working_directory — to
+# projects.d/<name>.yaml (a file it owns; never edit it), registers the Herd
+# proxy (`herd proxy <worktree> http://127.0.0.1:<supervisor_port> --secure`,
+# which restarts Herd's nginx), and reloads the daemon. Deleting a worktree
+# and syncing again removes its project and proxy. Ports are allocated once
+# and never change afterwards.
+#
+# A name is refused — never written, never proxied — when it would shadow
+# an existing Herd site: a directory of that name inside a parked path
+# (`herd paths`) or a linked site (`herd links`).
+# -----------------------------------------------------------------------
+discovery:
+  - # Required. Identifies the entry; its projects live in
+    # projects.d/webapp.yaml. A DNS label (lowercase letters, digits,
+    # hyphens).
+    name: webapp
+
+    # Required. The directory whose immediate subdirectories are scanned.
+    # Must exist. A leading "~/" is expanded.
+    directory: ~/Code/worktrees
+
+    # Optional. Only linked worktrees of this repository become projects
+    # (the subdirectory's .git *file* must point into
+    # <repository>/.git/worktrees/). Unrelated repositories checked out in
+    # the same folder — asset or data repos, say — are skipped. Without it,
+    # every subdirectory holding a .git file or directory is a candidate.
+    repository: ~/Code/webapp
+
+    # Optional. Only subdirectories containing all of these files become
+    # projects.
+    require_files: [package.json]
+
+    # Optional. The public_url of each project; {name} is the subdirectory
+    # name, so the worktree "issue-3265" gets https://issue-3265.test.
+    # Default: https://{name}.test
+    url_template: https://{name}.test
+
+    # Required (a template field). The command run in each worktree, via
+    # /bin/sh -c from the worktree itself. It must make the dev server
+    # listen on 127.0.0.1:<application_port>. Because that port differs per
+    # worktree, the command usually computes it the same way port_command
+    # does (a script that derives it from the worktree name, a per-worktree
+    # .env, ...) instead of hard-coding it.
+    command: ./start.sh
+
+    # Optional. Run in the worktree on every sync (via /bin/sh -c, with the
+    # env below and node_path on PATH, 15 s timeout); it prints the port the
+    # dev server will listen on — as a bare number or a URL — and that
+    # becomes application_port. If it fails, the worktree is skipped this
+    # time (an already-registered one keeps its previous settings). Without
+    # port_command, application_port is allocated from
+    # application_port_range instead.
+    port_command: node scripts/dev-port.mjs
+
+    # Ranges to allocate ports from: a new project gets the lowest port not
+    # used anywhere in the configuration (config.yaml and every projects.d
+    # file), and keeps it for good. supervisor_port_range is required;
+    # application_port_range is used only when port_command is absent.
+    supervisor_port_range: [41000, 41999]
+    application_port_range: [42000, 42999]
+
+    # Optional. Manage Herd proxy entries for these projects: `herd proxy`
+    # for new ones, `herd unproxy` for removed ones. Default: true. With
+    # false (or when the herd CLI cannot be found), sync prints the commands
+    # for you to run instead.
+    herd: true
+
+    # Optional. Glob patterns on the subdirectory name; matches are never
+    # candidates. Default: [".*"] (dot-directories). Setting it replaces the
+    # default, so include ".*" yourself if you still want it.
+    exclude: [".*", "node_modules"]
+
+    # Any other per-project field is accepted here and copied verbatim to
+    # every generated project: env, node_path, rewrite_host,
+    # readiness_strategy, startup_timeout_seconds, idle_timeout_minutes,
+    # websockets_keep_alive, shutdown_*, log_retention_days, always_on, ...
+    # public_url, supervisor_port, application_port, and working_directory
+    # are generated and therefore rejected in a template.
+    env:
+      ENVIRONMENT: dev
+    rewrite_host: true
+    readiness_strategy: tcp
+    startup_timeout_seconds: 180
+    idle_timeout_minutes: 30

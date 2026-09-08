@@ -72,6 +72,10 @@ var validShutdownSignals = map[string]bool{
 // Config is the root of the herd-wake configuration file.
 type Config struct {
 	Projects map[string]*Project `yaml:"projects"`
+	// Discovery lists worktree-discovery templates (see Discovery). Only
+	// the main file may define them; `herd-wake sync` turns each into a
+	// managed projects.d file.
+	Discovery []*Discovery `yaml:"discovery,omitempty"`
 
 	// Path is the absolute path of the main config file this configuration
 	// was loaded from (empty for configs built in memory). The daemon
@@ -97,46 +101,62 @@ type Project struct {
 	WorkingDirectory string `yaml:"working_directory"`
 	Command          string `yaml:"command"`
 
-	// Optional fields with defaults.
-	ReadinessStrategy     string `yaml:"readiness_strategy"`
-	ReadinessURL          string `yaml:"readiness_url"`
-	StartupTimeoutSeconds int    `yaml:"startup_timeout_seconds"`
-	IdleTimeoutMinutes    int    `yaml:"idle_timeout_minutes"`
+	// Optional fields with defaults. They carry omitempty so a Project
+	// written back to YAML (the managed files `herd-wake sync` generates)
+	// lists only what was set, never the defaults.
+	ReadinessStrategy     string `yaml:"readiness_strategy,omitempty"`
+	ReadinessURL          string `yaml:"readiness_url,omitempty"`
+	StartupTimeoutSeconds int    `yaml:"startup_timeout_seconds,omitempty"`
+	IdleTimeoutMinutes    int    `yaml:"idle_timeout_minutes,omitempty"`
 	// IdleTimeoutSeconds, when set, takes precedence over
 	// idle_timeout_minutes. It exists primarily so tests (and impatient
 	// users) can exercise idle shutdown with sub-minute timeouts; most
 	// configs should use idle_timeout_minutes.
-	IdleTimeoutSeconds     int    `yaml:"idle_timeout_seconds"`
-	ListenHost             string `yaml:"listen_host"`
-	AllowNonLoopback       bool   `yaml:"allow_non_loopback"`
-	ShutdownSignal         string `yaml:"shutdown_signal"`
-	ShutdownTimeoutSeconds int    `yaml:"shutdown_timeout_seconds"`
-	WebSocketsKeepAlive    *bool  `yaml:"websockets_keep_alive"`
-	LogRetentionDays       int    `yaml:"log_retention_days"`
-	HoldMaxWaitSeconds     int    `yaml:"hold_max_wait_seconds"`
-	HoldMaxRequests        int    `yaml:"hold_max_requests"`
+	IdleTimeoutSeconds     int    `yaml:"idle_timeout_seconds,omitempty"`
+	ListenHost             string `yaml:"listen_host,omitempty"`
+	AllowNonLoopback       bool   `yaml:"allow_non_loopback,omitempty"`
+	ShutdownSignal         string `yaml:"shutdown_signal,omitempty"`
+	ShutdownTimeoutSeconds int    `yaml:"shutdown_timeout_seconds,omitempty"`
+	WebSocketsKeepAlive    *bool  `yaml:"websockets_keep_alive,omitempty"`
+	LogRetentionDays       int    `yaml:"log_retention_days,omitempty"`
+	HoldMaxWaitSeconds     int    `yaml:"hold_max_wait_seconds,omitempty"`
+	HoldMaxRequests        int    `yaml:"hold_max_requests,omitempty"`
 
 	// Optional fields without defaults.
-	Env      map[string]string `yaml:"env"`
-	NodePath string            `yaml:"node_path"`
-	AlwaysOn bool              `yaml:"always_on"`
+	Env      map[string]string `yaml:"env,omitempty"`
+	NodePath string            `yaml:"node_path,omitempty"`
+	AlwaysOn bool              `yaml:"always_on,omitempty"`
 	// RewriteHost, when true, makes the proxy present the dev server with
 	// Host: 127.0.0.1:<application_port> instead of the public host, for
 	// servers that refuse non-localhost hosts (Vite's server.allowedHosts,
 	// webpack-dev-server's allowedHosts). The public host is still carried
 	// in X-Forwarded-Host.
-	RewriteHost bool `yaml:"rewrite_host"`
+	RewriteHost bool `yaml:"rewrite_host,omitempty"`
 }
 
-// FieldError is a validation error tied to one field of one project.
+// FieldError is a validation error tied to one field of one project (or,
+// with Scope set to ScopeDiscovery, of one discovery entry).
 type FieldError struct {
 	Project string
 	Field   string
 	Message string
+	// Scope is what Project names: a project (the default, ScopeProject)
+	// or a discovery entry (ScopeDiscovery).
+	Scope string
 }
 
+// FieldError scopes.
+const (
+	ScopeProject   = "project"
+	ScopeDiscovery = "discovery"
+)
+
 func (e *FieldError) Error() string {
-	return fmt.Sprintf("project %q: %s: %s", e.Project, e.Field, e.Message)
+	scope := e.Scope
+	if scope == "" {
+		scope = ScopeProject
+	}
+	return fmt.Sprintf("%s %q: %s: %s", scope, e.Project, e.Field, e.Message)
 }
 
 // ProjectNames returns the configured project names in sorted order.
@@ -172,8 +192,23 @@ func ProjectsDir(configPath string) string {
 // A missing main file is reported with an error satisfying
 // errors.Is(err, os.ErrNotExist). Validation problems are collected and
 // returned joined into a single error: every FieldError names the offending
-// project and field.
+// project (or discovery entry) and field.
 func Load(path string) (*Config, error) {
+	return LoadWithOptions(path, LoadOptions{})
+}
+
+// LoadOptions tunes LoadWithOptions for callers that repair a configuration
+// rather than run it.
+type LoadOptions struct {
+	// SkipWorkingDirectoryCheck accepts projects whose working_directory
+	// no longer exists. `herd-wake sync` and `project:remove` use it: a
+	// managed project whose worktree was deleted must still load so it can
+	// be removed, whereas the daemon (which would try to run it) rejects it.
+	SkipWorkingDirectoryCheck bool
+}
+
+// LoadWithOptions is Load with options.
+func LoadWithOptions(path string, opts LoadOptions) (*Config, error) {
 	cfg, err := decodeFile(path)
 	if err != nil {
 		return nil, err
@@ -196,6 +231,9 @@ func Load(path string) (*Config, error) {
 		p.Source = mainSource
 		p.applyDefaults()
 	}
+	for _, d := range cfg.Discovery {
+		d.applyDefaults()
+	}
 
 	var errs []error
 	fragments, err := listProjectFiles(ProjectsDir(path))
@@ -208,9 +246,12 @@ func Load(path string) (*Config, error) {
 			return nil, err
 		}
 		source := ProjectsDirName + "/" + filepath.Base(file)
+		if len(frag.Discovery) > 0 {
+			errs = append(errs, fmt.Errorf("%s: discovery entries belong in the main config file %s, not in %s/ files", source, mainSource, ProjectsDirName))
+		}
 		for _, name := range frag.ProjectNames() {
 			if prev, ok := cfg.Projects[name]; ok {
-				errs = append(errs, &FieldError{name, "name", fmt.Sprintf(
+				errs = append(errs, &FieldError{Project: name, Field: "name", Message: fmt.Sprintf(
 					"defined in both %s and %s; a project name may only be defined once across %s and %s/",
 					prev.Source, source, mainSource, ProjectsDirName)})
 				continue
@@ -226,11 +267,36 @@ func Load(path string) (*Config, error) {
 		}
 	}
 
-	errs = append(errs, cfg.Validate())
+	errs = append(errs, cfg.validate(opts))
 	if err := errors.Join(errs...); err != nil {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+// DecodeFragment strictly decodes one projects.d-style file without applying
+// defaults or validating: the projects exactly as written, keyed by name
+// (Name filled in, Source left empty). Tooling that rewrites such a file
+// uses it so the values it writes back are the ones that were there. A
+// missing file is reported with an error satisfying errors.Is(err,
+// os.ErrNotExist).
+func DecodeFragment(path string) (map[string]*Project, error) {
+	frag, err := decodeFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if len(frag.Discovery) > 0 {
+		return nil, fmt.Errorf("%s: discovery entries belong in the main config file, not in %s/ files", path, ProjectsDirName)
+	}
+	projects := make(map[string]*Project, len(frag.Projects))
+	for name, p := range frag.Projects {
+		if p == nil {
+			p = &Project{}
+		}
+		p.Name = name
+		projects[name] = p
+	}
+	return projects, nil
 }
 
 // decodeFile strictly decodes one config-shaped YAML file. An empty file (or
@@ -332,9 +398,14 @@ func (p *Project) IdleTimeout() time.Duration {
 	return time.Duration(p.IdleTimeoutMinutes) * time.Minute
 }
 
-// Validate checks every project and returns all problems found, joined into
-// one error. It returns nil when the configuration is valid.
+// Validate checks every project and discovery entry and returns all
+// problems found, joined into one error. It returns nil when the
+// configuration is valid.
 func (c *Config) Validate() error {
+	return c.validate(LoadOptions{})
+}
+
+func (c *Config) validate(opts LoadOptions) error {
 	var errs []error
 
 	type portClaim struct {
@@ -347,10 +418,10 @@ func (c *Config) Validate() error {
 		p := c.Projects[name]
 
 		if strings.TrimSpace(name) == "" {
-			errs = append(errs, &FieldError{name, "name", "project name must not be empty"})
+			errs = append(errs, &FieldError{Project: name, Field: "name", Message: "project name must not be empty"})
 		}
 
-		errs = append(errs, p.validate()...)
+		errs = append(errs, p.validate(opts)...)
 
 		for _, port := range []struct {
 			field string
@@ -363,7 +434,7 @@ func (c *Config) Validate() error {
 				continue // already reported by p.validate
 			}
 			if prev, ok := claimed[port.value]; ok {
-				errs = append(errs, &FieldError{name, port.field, fmt.Sprintf(
+				errs = append(errs, &FieldError{Project: name, Field: port.field, Message: fmt.Sprintf(
 					"port %d is already used by project %q (%s); every port must be unique across the config",
 					port.value, prev.project, prev.field)})
 				continue
@@ -372,15 +443,17 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	errs = append(errs, c.validateDiscovery()...)
+
 	return errors.Join(errs...)
 }
 
 // validate checks a single project's fields, returning one FieldError per
 // problem.
-func (p *Project) validate() []error {
+func (p *Project) validate(opts LoadOptions) []error {
 	var errs []error
 	fail := func(field, format string, args ...any) {
-		errs = append(errs, &FieldError{p.Name, field, fmt.Sprintf(format, args...)})
+		errs = append(errs, &FieldError{Project: p.Name, Field: field, Message: fmt.Sprintf(format, args...)})
 	}
 
 	if p.PublicURL == "" {
@@ -410,7 +483,9 @@ func (p *Project) validate() []error {
 	if p.WorkingDirectory == "" {
 		fail("working_directory", "required: the absolute path the command runs in")
 	} else if info, err := os.Stat(p.WorkingDirectory); err != nil {
-		fail("working_directory", "directory %q does not exist", p.WorkingDirectory)
+		if !opts.SkipWorkingDirectoryCheck {
+			fail("working_directory", "directory %q does not exist", p.WorkingDirectory)
+		}
 	} else if !info.IsDir() {
 		fail("working_directory", "%q is not a directory", p.WorkingDirectory)
 	}

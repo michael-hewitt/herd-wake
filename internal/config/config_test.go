@@ -303,15 +303,20 @@ func TestValidateBadOptionalFields(t *testing.T) {
 
 // TestSampleConfigMatchesSchema guards config.sample.yaml against drifting
 // from the schema: it must decode strictly, and the only acceptable
-// validation errors are the example working directories not existing on this
-// machine.
+// validation errors are the example directories (projects' working
+// directories, the discovery example's directory and repository) not
+// existing on this machine.
 func TestSampleConfigMatchesSchema(t *testing.T) {
 	_, err := Load(filepath.Join("..", "..", "config.sample.yaml"))
 	if err == nil {
 		return
 	}
 	for _, line := range strings.Split(err.Error(), "\n") {
-		if !strings.Contains(line, "working_directory") {
+		switch {
+		case strings.Contains(line, `": working_directory: directory "`):
+		case strings.Contains(line, `": directory: directory "`):
+		case strings.Contains(line, `": repository: directory "`):
+		default:
 			t.Errorf("config.sample.yaml no longer matches the schema: %s", line)
 		}
 	}
