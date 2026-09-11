@@ -271,7 +271,7 @@ func TestWildcardMaterialisesWorktreesOnDemand(t *testing.T) {
 	pa := status.Projects[0]
 	if pa.Name != "a" || !pa.Dynamic || pa.Source != "discovery:webapp" || pa.Host != "a.webapp.test" ||
 		pa.PublicURL != "https://a.webapp.test" || pa.SupervisorPort != f.port || pa.ApplicationPort != aPort ||
-		pa.WorkingDirectory != aDir || pa.State != StateRunning || pa.PID != aPid {
+		pa.WorkingDirectory != aDir || pa.State != StateRunning || pa.PID <= 0 {
 		t.Errorf("a status = %+v", pa)
 	}
 	if len(status.Wildcards) != 1 || status.Wildcards[0].Name != "webapp" || status.Wildcards[0].Projects != 2 ||
@@ -491,8 +491,8 @@ func TestWildcardControlAPIByLabel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RestartProject(a): %v", err)
 	}
-	if restarted.PID == pid1 || restarted.ApplicationPort != before.ApplicationPort || restarted.State != StateRunning {
-		t.Errorf("restart = %+v (old pid %d)", restarted, pid1)
+	if restarted.PID == before.PID || restarted.ApplicationPort != before.ApplicationPort || restarted.State != StateRunning {
+		t.Errorf("restart = %+v (old pid %d)", restarted, before.PID)
 	}
 	if runs := f.portRuns("a"); runs != 2 {
 		t.Errorf("port_command ran %d times after one restart, want 2", runs)
@@ -510,9 +510,11 @@ func TestWildcardControlAPIByLabel(t *testing.T) {
 	if restarted.ApplicationPort != newPort || restarted.State != StateRunning || restarted.LeaseUntil.IsZero() {
 		t.Errorf("restart after port change = %+v, want running on %d with the lease kept", restarted, newPort)
 	}
+	// The echoed pid is the helper's own; the status PID is the shell that spawned it
+	// (equal only on exec-ing shells), so assert a fresh process rather than equality.
 	code, body, pid3 := f.get(f.host("a"), "/moved", nil)
-	if code != http.StatusOK || pid3 != restarted.PID {
-		t.Errorf("after port change = %d pid %d (want %d); body:\n%s", code, pid3, restarted.PID, body)
+	if code != http.StatusOK || pid3 <= 0 || pid3 == pid1 {
+		t.Errorf("after port change = %d pid %d (old pid %d); body:\n%s", code, pid3, pid1, body)
 	}
 
 	// Stop by label; the project stays registered (its directory exists).
@@ -607,8 +609,10 @@ func TestReloadWildcardEntries(t *testing.T) {
 		t.Fatalf("Wildcards = %+v, want webapp unchanged", resp.Wildcards)
 	}
 	after := projectStatusByName(t, f.socket, "a")
-	if after.PID != pid1 || after.State != StateRunning || !after.IdleStopAt.Equal(before.IdleStopAt) {
-		t.Errorf("a after unchanged reload = %+v, want untouched (pid %d)", after, pid1)
+	// Status PIDs are the supervisor's direct child (the shell), which only equals the
+	// echoed helper pid on shells that exec; compare status to status.
+	if after.PID != before.PID || after.State != StateRunning || !after.IdleStopAt.Equal(before.IdleStopAt) {
+		t.Errorf("a after unchanged reload = %+v, want untouched (pid %d)", after, before.PID)
 	}
 	if _, _, pid := f.get(f.host("a"), "/", nil); pid != pid1 {
 		t.Errorf("a served by %d after unchanged reload, want %d", pid, pid1)
