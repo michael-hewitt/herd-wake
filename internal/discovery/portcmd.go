@@ -18,10 +18,15 @@ import (
 	"github.com/michael-hewitt/herd-wake/internal/config"
 )
 
-// runPortCommand runs a discovery entry's port_command in the worktree at
+// RunPortCommand runs a discovery entry's port_command in the worktree at
 // dir (via /bin/sh -c, with the template's env and node_path applied like
-// the project's own command gets them) and parses the port it prints.
-func runPortCommand(ctx context.Context, dir, command string, template *config.Project, timeout time.Duration) (int, error) {
+// the project's own command gets them) and parses the port it prints: a
+// bare number, a URL, or a trailing integer (see parsePort). A run is
+// bounded by timeout (DefaultPortCommandTimeout when zero).
+func RunPortCommand(ctx context.Context, dir, command string, template *config.Project, timeout time.Duration) (int, error) {
+	if timeout <= 0 {
+		timeout = DefaultPortCommandTimeout
+	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 

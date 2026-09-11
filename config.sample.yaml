@@ -26,7 +26,9 @@
 #
 # Conventions used below: supervisor ports in the 71xx range, application
 # ports in the 171xx range. Any free high-numbered loopback ports work; every
-# port must be unique across the whole configuration.
+# application_port must be unique across the whole configuration, and so
+# must every supervisor_port — except that projects which all set `host`
+# may share one (example 3).
 
 projects:
   # ---------------------------------------------------------------------
@@ -168,48 +170,106 @@ projects:
     listen_host: 127.0.0.1
     # allow_non_loopback: false
 
+  # ---------------------------------------------------------------------
+  # Example 3: several projects sharing one supervisor port, routed by the
+  # request's Host header. Useful behind a wildcard proxy that must never
+  # be reconfigured per project — nginx on a preview box forwarding
+  # *.preview.example.com to one port, say, or a Herd proxy for a parent
+  # site. A hostname no project claims gets a 404 diagnostic naming it.
+  # ---------------------------------------------------------------------
+  preview-alpha:
+    # Optional. The exact hostname this project answers to (compared
+    # case-insensitively, without the port). Projects that set host may
+    # share a supervisor_port; a port is used either by exactly one
+    # project without host, or only by projects that all set host (with
+    # distinct hosts and the same listen_host). public_url defaults to
+    # https://<host> when host is set.
+    host: alpha.preview.example.com
+    supervisor_port: 7103
+    application_port: 17103
+    working_directory: ~/previews/alpha
+    command: node --import tsx src/server.ts
+    env:
+      SYP_SERVER_PORT: "17103"
+  preview-beta:
+    host: beta.preview.example.com
+    supervisor_port: 7103               # shared with preview-alpha
+    application_port: 17104
+    working_directory: ~/previews/beta
+    command: node --import tsx src/server.ts
+    env:
+      SYP_SERVER_PORT: "17104"
+
 # -----------------------------------------------------------------------
 # Worktree discovery: automatic URLs for git worktrees.
 #
-# Each entry under `discovery:` is a template for one family of worktrees.
-# `herd-wake sync` scans the directory, and for every linked git worktree it
-# finds writes a generated project — the template's fields plus a generated
-# public_url, supervisor_port, application_port, and working_directory — to
-# projects.d/<name>.yaml (a file it owns; never edit it), registers the Herd
-# proxy (`herd proxy <worktree> http://127.0.0.1:<supervisor_port> --secure`,
-# which restarts Herd's nginx), and reloads the daemon. Deleting a worktree
-# and syncing again removes its project and proxy. Ports are allocated once
-# and never change afterwards.
+# Each entry under `discovery:` is a template for one family of worktrees
+# (one directory per branch under a workspace folder). Two modes:
 #
-# A name is refused — never written, never proxied — when it would shadow
-# an existing Herd site: a directory of that name inside a parked path
-# (`herd paths`) or a linked site (`herd links`).
+#   wildcard (recommended): the daemon binds ONE supervisor_port for the
+#     entry and serves https://<label>.<base_domain> from
+#     <directory>/<label> on demand — the worktree is resolved from the
+#     request's Host header the first time it is asked for, becomes a
+#     project in memory, and is forgotten when its directory disappears.
+#     `herd-wake sync` runs exactly one Herd command, once:
+#     `herd proxy <base name> http://127.0.0.1:<supervisor_port> --secure`
+#     (Herd's site file and certificate cover *.<base_domain>). Creating or
+#     deleting a worktree needs no sync, reload, or watcher.
+#
+#   proxy (the default): `herd-wake sync` scans the directory and writes
+#     one generated project per worktree — the template's fields plus a
+#     generated public_url, supervisor_port, application_port, and
+#     working_directory — to projects.d/<name>.yaml (a file it owns; never
+#     edit it), registers a Herd proxy per worktree (each `herd proxy`
+#     restarts Herd's nginx), and reloads the daemon. Deleting a worktree
+#     and syncing again removes its project and proxy. Ports are allocated
+#     once and never change afterwards.
+#
+# In both modes a name is refused — never proxied — when it would shadow an
+# existing Herd site: a directory of that name inside a parked path
+# (`herd paths`), a linked site (`herd links`), or a non-proxy site file.
+# In wildcard mode the check applies to the base name.
 # -----------------------------------------------------------------------
 discovery:
-  - # Required. Identifies the entry; its projects live in
-    # projects.d/webapp.yaml. A DNS label (lowercase letters, digits,
-    # hyphens).
+  # ---------------------------------------------------------------------
+  # Wildcard mode: https://<worktree>.webapp.test for every worktree under
+  # ~/Code/worktrees, through one listener on port 41000.
+  # ---------------------------------------------------------------------
+  - # Required. Identifies the entry. A DNS label (lowercase letters,
+    # digits, hyphens). In wildcard mode it is the default base_domain's
+    # first label (<name>.test).
     name: webapp
 
-    # Required. The directory whose immediate subdirectories are scanned.
-    # Must exist. A leading "~/" is expanded.
+    # Optional. "wildcard" or "proxy". Default: proxy.
+    mode: wildcard
+
+    # Optional (wildcard mode). The domain worktrees are served under: the
+    # worktree <directory>/<label> answers at https://<label>.<base_domain>.
+    # At least two labels; the Herd site is the domain without its TLD
+    # (webapp.test -> `herd proxy webapp ...`, which covers *.webapp.test).
+    # Default: <name>.test
+    base_domain: webapp.test
+
+    # Required (wildcard mode). The one loopback port the entry's shared
+    # listener binds — the `herd proxy` target. It is the entry's own: no
+    # project or other entry may use it.
+    supervisor_port: 41000
+
+    # Required. The directory holding the worktrees; <directory>/<label>
+    # is what a request for <label>.<base_domain> resolves to. Must exist.
+    # A leading "~/" is expanded.
     directory: ~/Code/worktrees
 
-    # Optional. Only linked worktrees of this repository become projects
-    # (the subdirectory's .git *file* must point into
-    # <repository>/.git/worktrees/). Unrelated repositories checked out in
-    # the same folder — asset or data repos, say — are skipped. Without it,
-    # every subdirectory holding a .git file or directory is a candidate.
+    # Optional. Only linked worktrees of this repository are served (the
+    # subdirectory's .git *file* must point into <repository>/.git/
+    # worktrees/). Unrelated repositories checked out in the same folder —
+    # asset or data repos, say — get a 404. Without it, every subdirectory
+    # holding a .git file or directory is a candidate.
     repository: ~/Code/webapp
 
-    # Optional. Only subdirectories containing all of these files become
-    # projects.
+    # Optional. Only subdirectories containing all of these files are
+    # served; others get a 404 naming the missing file.
     require_files: [package.json]
-
-    # Optional. The public_url of each project; {name} is the subdirectory
-    # name, so the worktree "issue-3265" gets https://issue-3265.test.
-    # Default: https://{name}.test
-    url_template: https://{name}.test
 
     # Required (a template field). The command run in each worktree, via
     # /bin/sh -c from the worktree itself. It must make the dev server
@@ -219,39 +279,86 @@ discovery:
     # .env, ...) instead of hard-coding it.
     command: ./start.sh
 
-    # Optional. Run in the worktree on every sync (via /bin/sh -c, with the
-    # env below and node_path on PATH, 15 s timeout); it prints the port the
-    # dev server will listen on — as a bare number or a URL — and that
-    # becomes application_port. If it fails, the worktree is skipped this
-    # time (an already-registered one keeps its previous settings). Without
-    # port_command, application_port is allocated from
-    # application_port_range instead.
+    # Optional. Run in the worktree (via /bin/sh -c, with the env below and
+    # node_path on PATH, 15 s timeout) when the worktree is first served
+    # and again on `project:restart`; it prints the port the dev server
+    # will listen on — as a bare number or a URL — and that becomes
+    # application_port. A failure is a 503 diagnostic quoting the output,
+    # retried with backoff. Without port_command, application_port is the
+    # lowest port of application_port_range no live project uses.
     port_command: node scripts/dev-port.mjs
 
-    # Ranges to allocate ports from: a new project gets the lowest port not
-    # used anywhere in the configuration (config.yaml and every projects.d
-    # file), and keeps it for good. supervisor_port_range is required;
-    # application_port_range is used only when port_command is absent.
-    supervisor_port_range: [41000, 41999]
+    # Optional; required without port_command.
     application_port_range: [42000, 42999]
 
-    # Optional. Manage Herd proxy entries for these projects: `herd proxy`
-    # for new ones, `herd unproxy` for removed ones. Default: true. With
-    # false (or when the herd CLI cannot be found), sync prints the commands
-    # for you to run instead.
+    # Optional. Let sync manage the wildcard Herd proxy. Default: true.
+    # With false (or when the herd CLI cannot be found), sync prints the
+    # command for you to run instead.
     herd: true
 
     # Optional. Glob patterns on the subdirectory name; matches are never
-    # candidates. Default: [".*"] (dot-directories). Setting it replaces the
+    # served. Default: [".*"] (dot-directories). Setting it replaces the
     # default, so include ".*" yourself if you still want it.
     exclude: [".*", "node_modules"]
 
     # Any other per-project field is accepted here and copied verbatim to
-    # every generated project: env, node_path, rewrite_host,
+    # every worktree project: env, node_path, rewrite_host,
     # readiness_strategy, startup_timeout_seconds, idle_timeout_minutes,
-    # websockets_keep_alive, shutdown_*, log_retention_days, always_on, ...
-    # public_url, supervisor_port, application_port, and working_directory
-    # are generated and therefore rejected in a template.
+    # websockets_keep_alive, shutdown_*, log_retention_days, always_on,
+    # hold_*, listen_host, ... public_url, host, application_port, and
+    # working_directory are generated and therefore rejected in a template.
+    env:
+      ENVIRONMENT: dev
+    rewrite_host: true
+    readiness_strategy: tcp
+    startup_timeout_seconds: 180
+    idle_timeout_minutes: 30
+
+  # ---------------------------------------------------------------------
+  # Proxy mode: one project, port, and Herd proxy per worktree, kept in
+  # projects.d/legacy.yaml by `herd-wake sync`. Use it when worktrees need
+  # flat https://<worktree>.test URLs (any url_template) or a port each.
+  # ---------------------------------------------------------------------
+  - # Required. Identifies the entry; its projects live in
+    # projects.d/legacy.yaml.
+    name: legacy
+
+    # Required. The directory whose immediate subdirectories are scanned.
+    directory: ~/Code/legacy-worktrees
+
+    # Optional. See above.
+    repository: ~/Code/legacy
+    require_files: [package.json]
+
+    # Optional. The public_url of each project; {name} is the subdirectory
+    # name, so the worktree "issue-3265" gets https://issue-3265.test.
+    # Default: https://{name}.test
+    url_template: https://{name}.test
+
+    # Required. See above.
+    command: ./start.sh
+
+    # Optional. Run in the worktree on every sync; a changed port updates
+    # the project. If it fails, the worktree is skipped this time (an
+    # already-registered one keeps its previous settings).
+    port_command: node scripts/dev-port.mjs
+
+    # Ranges to allocate ports from: a new project gets the lowest port not
+    # used anywhere in the configuration (config.yaml and every projects.d
+    # file), and keeps it for good. supervisor_port_range is required in
+    # proxy mode; application_port_range is used only when port_command is
+    # absent.
+    supervisor_port_range: [43000, 43999]
+    application_port_range: [44000, 44999]
+
+    # Optional. Manage Herd proxy entries for these projects: `herd proxy`
+    # for new ones, `herd unproxy` for removed ones. Default: true.
+    herd: true
+
+    # Optional. See above.
+    exclude: [".*", "node_modules"]
+
+    # Template fields, copied to every generated project (see above).
     env:
       ENVIRONMENT: dev
     rewrite_host: true

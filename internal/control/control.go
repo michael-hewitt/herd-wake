@@ -44,6 +44,25 @@ type StatusResponse struct {
 	// zero when it has not been reloaded since the daemon started.
 	LastReloadAt time.Time       `json:"last_reload_at,omitzero"`
 	Projects     []ProjectStatus `json:"projects"`
+	// Wildcards lists the wildcard discovery entries (shared listeners
+	// resolving worktrees on demand); omitted when there are none.
+	Wildcards []WildcardStatus `json:"wildcards,omitempty"`
+}
+
+// WildcardStatus is one wildcard discovery entry in a StatusResponse.
+type WildcardStatus struct {
+	Name string `json:"name"`
+	// BaseDomain is the domain worktrees are served under; URLPattern
+	// renders it as https://<label>.<base_domain>.
+	BaseDomain string `json:"base_domain"`
+	URLPattern string `json:"url_pattern"`
+	// Directory holds the worktrees; <label> resolves to Directory/<label>.
+	Directory string `json:"directory"`
+	// SupervisorPort is the entry's one shared listener port.
+	SupervisorPort int `json:"supervisor_port"`
+	// Projects is how many dynamic projects the entry has materialised
+	// (they appear in Projects with Dynamic set).
+	Projects int `json:"projects"`
 }
 
 // Uptime returns the daemon uptime as a duration.
@@ -54,11 +73,21 @@ func (s *StatusResponse) Uptime() time.Duration {
 // ProjectStatus is one project's entry in a StatusResponse, and the body of
 // successful project lifecycle responses.
 type ProjectStatus struct {
-	Name            string `json:"name"`
-	PublicURL       string `json:"public_url"`
-	SupervisorPort  int    `json:"supervisor_port"`
-	ApplicationPort int    `json:"application_port"`
-	State           string `json:"state"`
+	Name      string `json:"name"`
+	PublicURL string `json:"public_url"`
+	// Host is the hostname the project is routed by on a shared
+	// supervisor_port; empty when it owns its port outright.
+	Host             string `json:"host,omitempty"`
+	SupervisorPort   int    `json:"supervisor_port"`
+	ApplicationPort  int    `json:"application_port"`
+	WorkingDirectory string `json:"working_directory,omitempty"`
+	// Source is where the project was defined: the config file name, a
+	// projects.d file, or "discovery:<entry>" for a dynamic project.
+	Source string `json:"source,omitempty"`
+	// Dynamic marks a project a wildcard discovery entry materialised on
+	// demand; it exists in memory only.
+	Dynamic bool   `json:"dynamic,omitempty"`
+	State   string `json:"state"`
 
 	// PID and UptimeSeconds are set while the project's process is alive.
 	PID           int     `json:"pid,omitempty"`
@@ -107,9 +136,21 @@ type ReloadResponse struct {
 	Removed   []string `json:"removed"`
 	Changed   []string `json:"changed"`
 	Unchanged []string `json:"unchanged"`
+	// Wildcards classifies the wildcard discovery entries the same way;
+	// nil when neither the old nor the new configuration has any. The
+	// dynamic projects of a changed or removed entry are listed in Removed.
+	Wildcards *ReloadDiff `json:"wildcards,omitempty"`
 	// Errors are validation errors (Applied false) or per-project apply
 	// errors (Applied true), one message each.
 	Errors []string `json:"errors,omitempty"`
+}
+
+// ReloadDiff classifies names (sorted) by how a reload treated them.
+type ReloadDiff struct {
+	Added     []string `json:"added"`
+	Removed   []string `json:"removed"`
+	Changed   []string `json:"changed"`
+	Unchanged []string `json:"unchanged"`
 }
 
 // LogsResponse is the body of GET /v1/projects/{name}/logs: recent combined

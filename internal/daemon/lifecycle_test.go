@@ -44,6 +44,7 @@ func helperConfig(t *testing.T) *config.Config {
 			Command:                command,
 			ReadinessStrategy:      config.ReadinessTCP,
 			StartupTimeoutSeconds:  10,
+			IdleTimeoutMinutes:     60, // a zero timeout would let the idle monitor race every start
 			ShutdownSignal:         "SIGTERM",
 			ShutdownTimeoutSeconds: 5,
 			LogRetentionDays:       7,

@@ -209,9 +209,19 @@ func printSync(w io.Writer, out syncOutput) {
 		fmt.Fprintln(w, "Dry run: nothing was written and Herd was not changed.")
 	}
 	for _, e := range out.Entries {
-		fmt.Fprintf(w, "Discovery %q (%s) → %s\n", e.Name, e.Directory, e.File)
+		switch {
+		case e.Retired:
+			fmt.Fprintf(w, "Discovery %q (removed from the config) → wildcard %s\n", e.Name, e.URLPattern)
+		case e.Mode == config.ModeWildcard:
+			fmt.Fprintf(w, "Discovery %q (%s) → wildcard: %s → %s/<label>\n", e.Name, e.Directory, e.URLPattern, e.Directory)
+		default:
+			fmt.Fprintf(w, "Discovery %q (%s) → %s\n", e.Name, e.Directory, e.File)
+		}
 		for _, err := range e.Errors {
 			fmt.Fprintf(w, "  error:     %s\n", err)
+		}
+		for _, notice := range e.Notices {
+			fmt.Fprintf(w, "  notice:    %s\n", notice)
 		}
 		printSummaries(w, "added", e.Added)
 		printSummaries(w, "updated", e.Updated)
@@ -224,7 +234,7 @@ func printSync(w io.Writer, out syncOutput) {
 			fmt.Fprintf(w, "  %-10s %s\n", labelFor("herd", i), describeHerdAction(a))
 		}
 		switch {
-		case len(e.Errors) > 0:
+		case len(e.Errors) > 0 || e.Mode == config.ModeWildcard:
 		case out.DryRun && e.Changed:
 			fmt.Fprintf(w, "  file:      would be rewritten\n")
 		case out.DryRun:
@@ -287,6 +297,8 @@ func describeHerdAction(a discovery.HerdAction) string {
 		s += " (would run: " + a.Command
 	case discovery.HerdSkipped:
 		s += " (skipped"
+	case discovery.HerdRefused:
+		s += " (refused"
 	case discovery.HerdManual:
 		s += " (run by hand: " + a.Command
 	default:

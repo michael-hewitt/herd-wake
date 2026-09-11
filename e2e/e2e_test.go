@@ -11,11 +11,15 @@
 //	§18.8  TestProjectIsolation
 //	§18.9  TestFailedStartupDiagnostic
 //	§18.10 TestDaemonRestartLeavesProjectsStopped
+//	#14    TestWildcardWorktreesServedByHost
 package e2e
 
 import (
 	"fmt"
+	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -317,4 +321,83 @@ func TestDaemonRestartLeavesProjectsStopped(t *testing.T) {
 	if code, body := get(t, ports[0], "/"); code != http.StatusOK || !strings.Contains(body, fixtureMarker) {
 		t.Fatalf("GET after daemon restart: status %d", code)
 	}
+}
+
+// Wildcard discovery (issue #14): one listener for a folder of worktrees,
+// each served at <label>.<base_domain> on demand and told apart by Host;
+// a label that names no servable worktree is a 404 diagnostic.
+func TestWildcardWorktreesServedByHost(t *testing.T) {
+	requireE2E(t)
+	ports := freePorts(t, 3)
+	workspace := t.TempDir()
+	server := `const http = require('http');
+const port = Number(require('fs').readFileSync('port', 'utf8'));
+http.createServer((req, res) => { res.end('hello from ' + require('path').basename(process.cwd()) + ' host=' + req.headers.host); })
+  .listen(port, '127.0.0.1');
+`
+	for label, port := range map[string]int{"alpha": ports[1], "beta": ports[2]} {
+		dir := filepath.Join(workspace, label)
+		if err := os.MkdirAll(filepath.Join(dir, ".git"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "server.js"), []byte(server), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "port"), []byte(fmt.Sprint(port)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	d := startDaemon(t, fmt.Sprintf(`discovery:
+  - name: e2e
+    mode: wildcard
+    base_domain: e2e.test
+    supervisor_port: %d
+    directory: %s
+    require_files: [server.js]
+    port_command: cat port
+    command: node server.js
+    startup_timeout_seconds: 60
+`, ports[0], workspace))
+
+	for _, label := range []string{"alpha", "beta"} {
+		code, body := getHost(t, ports[0], label+".e2e.test", "/")
+		if code != http.StatusOK || !strings.Contains(body, "hello from "+label) || !strings.Contains(body, "host="+label+".e2e.test") {
+			t.Fatalf("GET %s.e2e.test: status %d body %q", label, code, body)
+		}
+		if st := d.projectStatus(label); st.State != "running" || !st.Dynamic || st.Source != "discovery:e2e" {
+			t.Fatalf("%s status = %+v, want a running dynamic project", label, st)
+		}
+	}
+	if code, body := getHost(t, ports[0], "nope.e2e.test", "/"); code != http.StatusNotFound || !strings.Contains(body, `no worktree named "nope"`) {
+		t.Fatalf("GET nope.e2e.test: status %d body %q", code, body)
+	}
+	out, err := d.cli("project:stop", "alpha")
+	if err != nil {
+		t.Fatalf("herd-wake project:stop alpha: %v\n%s", err, out)
+	}
+	d.waitForState("alpha", "stopped", 15*time.Second)
+	if code, _ := getHost(t, ports[0], "beta.e2e.test", "/"); code != http.StatusOK {
+		t.Fatalf("beta after stopping alpha: status %d", code)
+	}
+}
+
+// getHost performs GET http://127.0.0.1:port/path with an explicit Host
+// header, as Herd would send it for a wildcard site.
+func getHost(t *testing.T, port int, host, path string) (int, string) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d%s", port, path), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = host
+	resp, err := supervisorClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", host, err)
+	}
+	defer resp.Body.Close() //nolint:errcheck // body fully read below
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp.StatusCode, string(body)
 }

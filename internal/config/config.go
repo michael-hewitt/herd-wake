@@ -123,6 +123,15 @@ type Project struct {
 	HoldMaxRequests        int    `yaml:"hold_max_requests,omitempty"`
 
 	// Optional fields without defaults.
+	//
+	// Host, when set, is the exact hostname (e.g. feat-huddle.preview.example.com,
+	// compared case-insensitively) this project answers to. Projects with a
+	// host may share one supervisor_port: the daemon routes each request on
+	// that port by its Host header, and a hostname no project claims gets a
+	// 404 diagnostic. Without host, the project owns its supervisor_port
+	// outright and every request on it is the project's. public_url
+	// defaults to https://<host> when host is set.
+	Host     string            `yaml:"host,omitempty"`
 	Env      map[string]string `yaml:"env,omitempty"`
 	NodePath string            `yaml:"node_path,omitempty"`
 	AlwaysOn bool              `yaml:"always_on,omitempty"`
@@ -352,6 +361,10 @@ func (p *Project) Equivalent(o *Project) bool {
 // applyDefaults fills unset optional fields with their documented defaults.
 func (p *Project) applyDefaults() {
 	p.WorkingDirectory = expandHome(p.WorkingDirectory)
+	p.Host = strings.ToLower(strings.TrimSpace(p.Host))
+	if p.PublicURL == "" && p.Host != "" {
+		p.PublicURL = "https://" + p.Host
+	}
 	if p.ListenHost == "" {
 		p.ListenHost = DefaultListenHost
 	}
@@ -408,11 +421,18 @@ func (c *Config) Validate() error {
 func (c *Config) validate(opts LoadOptions) error {
 	var errs []error
 
+	// Every application_port is exclusive. A supervisor_port is exclusive
+	// too, except that projects which all set host may share one (the
+	// daemon routes by Host on it); a wildcard discovery entry's
+	// supervisor_port is its own and never shared with a project.
 	type portClaim struct {
-		project string
-		field   string
+		project    string
+		field      string
+		host       string
+		listenHost string
 	}
 	claimed := map[int]portClaim{}
+	hosts := map[string]string{}
 
 	for _, name := range c.ProjectNames() {
 		p := c.Projects[name]
@@ -422,6 +442,15 @@ func (c *Config) validate(opts LoadOptions) error {
 		}
 
 		errs = append(errs, p.validate(opts)...)
+
+		if p.Host != "" {
+			if prev, ok := hosts[p.Host]; ok {
+				errs = append(errs, &FieldError{Project: name, Field: "host", Message: fmt.Sprintf(
+					"host %q is already used by project %q; every host must be unique across the config", p.Host, prev)})
+			} else {
+				hosts[p.Host] = name
+			}
+		}
 
 		for _, port := range []struct {
 			field string
@@ -433,19 +462,53 @@ func (c *Config) validate(opts LoadOptions) error {
 			if !isValidPort(port.value) {
 				continue // already reported by p.validate
 			}
-			if prev, ok := claimed[port.value]; ok {
+			prev, ok := claimed[port.value]
+			if !ok {
+				claimed[port.value] = portClaim{project: name, field: port.field, host: p.Host, listenHost: p.ListenHost}
+				continue
+			}
+			switch {
+			case port.field != "supervisor_port" || prev.field != "supervisor_port":
 				errs = append(errs, &FieldError{Project: name, Field: port.field, Message: fmt.Sprintf(
 					"port %d is already used by project %q (%s); every port must be unique across the config",
 					port.value, prev.project, prev.field)})
-				continue
+			case p.Host == "" || prev.host == "":
+				errs = append(errs, &FieldError{Project: name, Field: port.field, Message: fmt.Sprintf(
+					"port %d is already used by project %q; a supervisor_port may only be shared by projects that all set host (so requests can be routed by hostname)",
+					port.value, prev.project)})
+			case p.ListenHost != prev.listenHost:
+				errs = append(errs, &FieldError{Project: name, Field: "listen_host", Message: fmt.Sprintf(
+					"%q differs from project %q's %q; projects sharing supervisor_port %d must bind the same listen_host",
+					p.ListenHost, prev.project, prev.listenHost, port.value)})
 			}
-			claimed[port.value] = portClaim{project: name, field: port.field}
 		}
 	}
 
 	errs = append(errs, c.validateDiscovery()...)
 
+	for _, d := range c.Discovery {
+		if d == nil || !d.Wildcard() || !isValidPort(d.SupervisorPort()) {
+			continue
+		}
+		port := d.SupervisorPort()
+		if prev, ok := claimed[port]; ok {
+			errs = append(errs, &FieldError{Scope: ScopeDiscovery, Project: d.Name, Field: "supervisor_port", Message: fmt.Sprintf(
+				"port %d is already used by %s; a wildcard entry's shared listener is its own and cannot be shared with projects or other entries",
+				port, describeClaim(prev.project, prev.field))})
+			continue
+		}
+		claimed[port] = portClaim{project: "discovery:" + d.Name, field: "supervisor_port"}
+	}
+
 	return errors.Join(errs...)
+}
+
+// describeClaim renders who holds a port for a conflict message.
+func describeClaim(project, field string) string {
+	if entry, ok := strings.CutPrefix(project, "discovery:"); ok {
+		return fmt.Sprintf("wildcard discovery entry %q", entry)
+	}
+	return fmt.Sprintf("project %q (%s)", project, field)
 }
 
 // validate checks a single project's fields, returning one FieldError per
@@ -457,9 +520,12 @@ func (p *Project) validate(opts LoadOptions) []error {
 	}
 
 	if p.PublicURL == "" {
-		fail("public_url", "required: the Herd URL that fronts this project, e.g. https://dashboard.test")
+		fail("public_url", "required: the Herd URL that fronts this project, e.g. https://dashboard.test (or set host, from which it is derived)")
 	} else if err := checkHTTPURL(p.PublicURL); err != nil {
 		fail("public_url", "invalid URL %q: %v", p.PublicURL, err)
+	}
+	if p.Host != "" && !IsHostname(p.Host) {
+		fail("host", "invalid hostname %q: expected dot-separated DNS labels (lowercase letters, digits, hyphens) with no scheme, port, or path", p.Host)
 	}
 
 	for _, port := range []struct {

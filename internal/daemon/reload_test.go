@@ -59,8 +59,11 @@ type projectSpec struct {
 	commandPrefix string
 	// supervisorPort overrides the port allocated for the name.
 	supervisorPort int
-	alwaysOn       bool
-	shutdownSecs   int
+	// host makes the project a host project (routed by Host on a
+	// supervisor_port it may share).
+	host         string
+	alwaysOn     bool
+	shutdownSecs int
 }
 
 // yaml renders the project block, allocating ports on first use of the
@@ -88,8 +91,12 @@ func (f *reloadFixture) yaml(spec projectSpec) string {
 	if spec.commandPrefix != "" {
 		command = spec.commandPrefix + "; " + command
 	}
+	host := ""
+	if spec.host != "" {
+		host = "    host: " + spec.host + "\n"
+	}
 	return fmt.Sprintf(`  %s:
-    public_url: https://%s.test
+%s    public_url: https://%s.test
     supervisor_port: %d
     application_port: %d
     working_directory: %s
@@ -103,7 +110,7 @@ func (f *reloadFixture) yaml(spec projectSpec) string {
     env:
       %s: %s
       %s: "%d"
-`, spec.name, spec.name, supervisorPort, ports[1], f.dir, command, shutdown, spec.alwaysOn,
+`, spec.name, host, spec.name, supervisorPort, ports[1], f.dir, command, shutdown, spec.alwaysOn,
 		testproc.EnvMode, mode, testproc.EnvPort, ports[1])
 }
 

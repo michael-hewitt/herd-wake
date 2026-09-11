@@ -258,45 +258,98 @@ func isUpgrade(r *http.Request) bool {
 }
 
 // deny answers 503 with a diagnostic: the reason, the project's lifecycle
-// state, its exit summary and last error, and recent process output. Browsers
-// (Accept preferring text/html) get a small HTML page; everything else gets
-// plain text.
+// state, its exit summary and last error, and recent process output.
 func (h *onDemand) deny(w http.ResponseWriter, r *http.Request, reason string) {
 	snap := h.upstream.Snapshot()
-	logs := h.upstream.Logs(diagnosticLogLines)
 	h.logger.Printf("project %q: 503 for %s %s: %s", h.project.Name, r.Method, r.URL.Path, reason)
+	WriteDiagnostic(w, r, Diagnostic{
+		Status:  http.StatusServiceUnavailable,
+		Project: h.project.Name,
+		Reason:  reason,
+		State:   snap.State,
+		Exit:    snap.LastExit,
+		Err:     snap.LastError,
+		Logs:    h.upstream.Logs(diagnosticLogLines),
+	})
+}
+
+// Diagnostic is a local error answer herd-wake gives instead of proxying:
+// a project that cannot start (503), or a hostname no project claims on a
+// shared listener (404). Browsers (Accept preferring text/html) get a small
+// HTML page; everything else gets plain text.
+type Diagnostic struct {
+	// Status is the HTTP status code (503 or 404).
+	Status int
+	// Project names the project, when there is one: it is used in the
+	// default title and the retry hints. Empty for a host nobody claims.
+	Project string
+	// Title is the heading, without the "herd-wake:" prefix. Default:
+	// `project "<Project>" is unavailable` (or "no project for this
+	// request" without a project).
+	Title string
+	// Reason says what went wrong, in one or two sentences.
+	Reason string
+	// State, Exit, and Err are the project's lifecycle details (omitted
+	// when empty).
+	State string
+	Exit  string
+	Err   string
+	// Logs are recent process-output lines to quote (omitted when empty).
+	Logs []string
+	// Hint is the closing advice. Default (with a project): reload to retry
+	// or run project:start.
+	Hint string
+}
+
+// WriteDiagnostic renders d as the response, HTML or plain text by the
+// request's Accept header, with Cache-Control: no-store.
+func WriteDiagnostic(w http.ResponseWriter, r *http.Request, d Diagnostic) {
+	if d.Status == 0 {
+		d.Status = http.StatusServiceUnavailable
+	}
+	if d.Title == "" {
+		if d.Project != "" {
+			d.Title = fmt.Sprintf("project %q is unavailable", d.Project)
+		} else {
+			d.Title = "no project for this request"
+		}
+	}
+	if d.Hint == "" && d.Project != "" {
+		d.Hint = fmt.Sprintf("Reload to retry, or run `herd-wake project:start %s` to retry immediately.", d.Project)
+	}
 
 	w.Header().Set("Cache-Control", "no-store")
 	if prefersHTML(r) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		if err := diagnosticPage.Execute(w, diagnosticData{
-			Project: h.project.Name,
-			Reason:  reason,
-			State:   snap.State,
-			Exit:    snap.LastExit,
-			Err:     snap.LastError,
-			Logs:    strings.Join(logs, "\n"),
-		}); err != nil {
-			h.logger.Printf("project %q: render diagnostic page: %v", h.project.Name, err)
-		}
+		w.WriteHeader(d.Status)
+		_ = diagnosticPage.Execute(w, diagnosticData{
+			Diagnostic: d,
+			LogText:    strings.Join(d.Logs, "\n"),
+			HintHTML:   hintHTML(d.Hint),
+		}) // headers are written; nothing useful is left to do on a render error
 		return
 	}
 
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(http.StatusServiceUnavailable)
-	fmt.Fprintf(w, "herd-wake: project %q is unavailable.\n\n%s\n\nState: %s\n", h.project.Name, reason, snap.State)
-	if snap.LastExit != "" {
-		fmt.Fprintf(w, "Last exit: %s\n", snap.LastExit)
+	w.WriteHeader(d.Status)
+	fmt.Fprintf(w, "herd-wake: %s.\n\n%s\n", d.Title, d.Reason)
+	if d.State != "" {
+		fmt.Fprintf(w, "\nState: %s\n", d.State)
 	}
-	if snap.LastError != "" {
-		fmt.Fprintf(w, "Last error: %s\n", snap.LastError)
+	if d.Exit != "" {
+		fmt.Fprintf(w, "Last exit: %s\n", d.Exit)
 	}
-	if len(logs) > 0 {
-		fmt.Fprintf(w, "\nRecent output (herd-wake logs %s):\n", h.project.Name)
-		for _, line := range logs {
+	if d.Err != "" {
+		fmt.Fprintf(w, "Last error: %s\n", d.Err)
+	}
+	if len(d.Logs) > 0 {
+		fmt.Fprintf(w, "\nRecent output (herd-wake logs %s):\n", d.Project)
+		for _, line := range d.Logs {
 			fmt.Fprintf(w, "  %s\n", line)
 		}
+	}
+	if d.Hint != "" {
+		fmt.Fprintf(w, "\n%s\n", d.Hint)
 	}
 }
 
@@ -306,15 +359,28 @@ func prefersHTML(r *http.Request) bool {
 	return strings.Contains(r.Header.Get("Accept"), "text/html")
 }
 
+// hintHTML renders a hint with its backtick-quoted commands as <code>;
+// everything else is escaped.
+func hintHTML(hint string) template.HTML {
+	var b strings.Builder
+	for i, part := range strings.Split(hint, "`") {
+		if i%2 == 1 {
+			b.WriteString("<code>")
+			b.WriteString(template.HTMLEscapeString(part))
+			b.WriteString("</code>")
+		} else {
+			b.WriteString(template.HTMLEscapeString(part))
+		}
+	}
+	return template.HTML(b.String()) //nolint:gosec // every segment was escaped above
+}
+
 // diagnosticData feeds diagnosticPage; every field is escaped by
-// html/template.
+// html/template except HintHTML, built by hintHTML.
 type diagnosticData struct {
-	Project string
-	Reason  string
-	State   string
-	Exit    string
-	Err     string
-	Logs    string
+	Diagnostic
+	LogText  string
+	HintHTML template.HTML
 }
 
 var diagnosticPage = template.Must(template.New("diagnostic").Parse(`<!DOCTYPE html>
@@ -322,7 +388,7 @@ var diagnosticPage = template.Must(template.New("diagnostic").Parse(`<!DOCTYPE h
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>herd-wake: {{.Project}} is unavailable</title>
+<title>herd-wake: {{.Title}}</title>
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem auto; max-width: 44rem; padding: 0 1rem; color: #1a1a1a; }
   h1 { font-size: 1.25rem; }
@@ -333,16 +399,16 @@ var diagnosticPage = template.Must(template.New("diagnostic").Parse(`<!DOCTYPE h
 </style>
 </head>
 <body>
-<h1>herd-wake: project &ldquo;{{.Project}}&rdquo; is unavailable</h1>
+<h1>herd-wake: {{.Title}}</h1>
 <p>{{.Reason}}</p>
-<dl>
+{{if .State}}<dl>
 <dt>State</dt><dd>{{.State}}</dd>
 {{if .Exit}}<dt>Last exit</dt><dd>{{.Exit}}</dd>{{end}}
 {{if .Err}}<dt>Last error</dt><dd>{{.Err}}</dd>{{end}}
-</dl>
-{{if .Logs}}<p>Recent output (<code>herd-wake logs {{.Project}}</code>):</p>
-<pre>{{.Logs}}</pre>{{end}}
-<p>Reload to retry, or run <code>herd-wake project:start {{.Project}}</code> to retry immediately.</p>
+</dl>{{end}}
+{{if .LogText}}<p>Recent output (<code>herd-wake logs {{.Project}}</code>):</p>
+<pre>{{.LogText}}</pre>{{end}}
+{{if .HintHTML}}<p>{{.HintHTML}}</p>{{end}}
 </body>
 </html>
 `))

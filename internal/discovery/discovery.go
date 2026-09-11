@@ -1,8 +1,14 @@
 // Package discovery implements `herd-wake sync` and `herd-wake
-// project:remove`: it scans the directories named by the config's
-// discovery: entries for git worktrees, keeps one generated project per
-// worktree in a managed projects.d file, allocates stable ports, and
-// creates or removes the matching Herd proxy entries.
+// project:remove`, plus the candidate rules the daemon applies when it
+// resolves a worktree on demand (Check).
+//
+// For a proxy-mode discovery entry, sync scans the entry's directory for
+// git worktrees, keeps one generated project per worktree in a managed
+// projects.d file, allocates stable ports, and creates or removes the
+// matching Herd proxy entries. For a wildcard entry it does exactly one
+// thing: ensure the single Herd proxy for the entry's base domain exists
+// (recording it in a small state file so a removed entry is unproxied
+// later); worktrees are resolved by the daemon from the request's Host.
 //
 // The user's hand-written config.yaml is never rewritten; every generated
 // project lives in projects.d/<discovery name>.yaml, which carries a
@@ -15,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
@@ -56,6 +63,9 @@ const (
 	// HerdManual: the command could not be run (Herd unavailable or
 	// disabled, or it failed); the user should run Command by hand.
 	HerdManual = "manual"
+	// HerdRefused: the name would shadow an existing Herd site (a parked
+	// or linked PHP site, or a non-proxy site file), so nothing was done.
+	HerdRefused = "refused"
 )
 
 // HerdAction is one Herd proxy change sync wanted to make.
@@ -92,10 +102,25 @@ type Skip struct {
 
 // EntryResult is the outcome of syncing one discovery entry.
 type EntryResult struct {
-	Name      string `json:"name"`
-	Directory string `json:"directory"`
-	// File is the managed projects.d file.
-	File string `json:"file"`
+	Name string `json:"name"`
+	// Mode is the entry's discovery mode (config.ModeProxy or
+	// config.ModeWildcard).
+	Mode      string `json:"mode"`
+	Directory string `json:"directory,omitempty"`
+	// File is the managed projects.d file (proxy mode).
+	File string `json:"file,omitempty"`
+	// BaseDomain, SupervisorPort, and URLPattern describe a wildcard entry:
+	// its worktrees answer at URLPattern (https://<label>.<base_domain>)
+	// through the one listener on SupervisorPort.
+	BaseDomain     string `json:"base_domain,omitempty"`
+	SupervisorPort int    `json:"supervisor_port,omitempty"`
+	URLPattern     string `json:"url_pattern,omitempty"`
+	// Retired marks a wildcard registration whose entry is no longer in the
+	// config: sync unproxied it (see Herd) and forgot it.
+	Retired bool `json:"retired,omitempty"`
+	// Notices are things the user should know that are not errors (a stale
+	// managed file left over from proxy mode, say).
+	Notices []string `json:"notices,omitempty"`
 	// Changed reports whether the file's content differs from what sync
 	// computed; Written whether sync actually rewrote it (false on a dry
 	// run).
@@ -189,15 +214,26 @@ func Sync(ctx context.Context, cfg *config.Config, opts Options) (*Result, error
 	if opts.PortCommandTimeout <= 0 {
 		opts.PortCommandTimeout = DefaultPortCommandTimeout
 	}
+	statePath := StatePath(cfg.Path)
+	state, err := loadState(statePath)
+	if err != nil {
+		return nil, err
+	}
 	s := &syncer{
-		ctx:  ctx,
-		cfg:  cfg,
-		opts: opts,
-		used: map[int]string{},
+		ctx:   ctx,
+		cfg:   cfg,
+		opts:  opts,
+		used:  map[int]string{},
+		state: state,
 	}
 	for _, p := range cfg.Projects {
 		s.used[p.SupervisorPort] = p.Name
 		s.used[p.ApplicationPort] = p.Name
+	}
+	for _, d := range cfg.Discovery {
+		if d.Wildcard() {
+			s.used[d.SupervisorPort()] = config.DynamicSourcePrefix + d.Name
+		}
 	}
 	res := &Result{
 		ConfigPath:    cfg.Path,
@@ -206,8 +242,19 @@ func Sync(ctx context.Context, cfg *config.Config, opts Options) (*Result, error
 		HerdNote:      opts.HerdNote,
 		Entries:       []*EntryResult{},
 	}
+	previous := maps.Clone(state.Wildcards)
 	for _, d := range cfg.Discovery {
-		res.Entries = append(res.Entries, s.syncEntry(d))
+		if d.Wildcard() {
+			res.Entries = append(res.Entries, s.syncWildcard(d))
+		} else {
+			res.Entries = append(res.Entries, s.syncEntry(d))
+		}
+	}
+	res.Entries = append(res.Entries, s.retireWildcards(previous)...)
+	if !opts.DryRun {
+		if err := saveState(statePath, s.state); err != nil {
+			return nil, fmt.Errorf("write sync state: %w", err)
+		}
 	}
 	return res, nil
 }
@@ -220,12 +267,16 @@ type syncer struct {
 	// used maps every port claimed anywhere in the config (and allocated
 	// during this sync) to the project holding it.
 	used map[int]string
+	// state is the wildcard registrations recorded so far; syncWildcard
+	// and retireWildcards update it and Sync writes it back.
+	state *syncState
 }
 
 // syncEntry reconciles one discovery entry.
 func (s *syncer) syncEntry(d *config.Discovery) *EntryResult {
 	res := &EntryResult{
 		Name:      d.Name,
+		Mode:      config.ModeProxy,
 		Directory: d.Directory,
 		File:      d.ManagedPath(s.cfg.Path),
 		Added:     []ProjectSummary{},
@@ -371,7 +422,7 @@ func (s *syncer) build(d *config.Discovery, c candidate, prev *config.Project) (
 
 	switch {
 	case d.PortCommand != "":
-		port, err := runPortCommand(s.ctx, c.dir, d.PortCommand, &d.Template, s.opts.PortCommandTimeout)
+		port, err := RunPortCommand(s.ctx, c.dir, d.PortCommand, &d.Template, s.opts.PortCommandTimeout)
 		if err != nil {
 			return skipWith(true, "port_command failed: %v", err)
 		}

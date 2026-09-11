@@ -30,20 +30,30 @@ const (
 
 // projectState is the daemon's runtime record for one registered project:
 // its configuration, the supervisor owning its process lifecycle, the
-// activity tracker driving its idle shutdown, and the listener it is served
-// on. A reload that changes a project builds a fresh record (new supervisor
-// for the new config) but keeps the tracker — leases and activity history
-// survive — and keeps the listener when the address did not change.
+// activity tracker driving its idle shutdown, its slot in a listener's
+// router, and the listener itself. A reload that changes a project builds
+// a fresh record (new supervisor for the new config) but keeps the tracker
+// — leases and activity history survive — and keeps the route when the
+// address and host did not change.
 type projectState struct {
 	project *config.Project
 	proc    *process.Supervisor
 	tracker *idle.Tracker
-	// bind is the listener the project is served on; nil until Run (or the
-	// reload that added the project) binds it.
+	// sw is the project's handler slot in its listener's router; nil until
+	// Run (or the reload that added the project) routes it.
+	sw *handlerSwitch
+	// bind is the listener the project is served on; nil until attached.
 	bind *binding
 	// deactivate ends the project's idle monitor (or always_on starter);
 	// nil until activate.
 	deactivate context.CancelFunc
+	// dynamic marks a project a wildcard entry materialised at runtime;
+	// entry is that entry.
+	dynamic bool
+	entry   *entryState
+	// retireOnce guards retire: a dynamic project may be retired by a
+	// reload and by a drop (vanished directory) at the same time.
+	retireOnce sync.Once
 }
 
 // newProjectState builds the runtime record for p with the given activity
@@ -103,8 +113,12 @@ func (d *Daemon) projectStatus(st *projectState) control.ProjectStatus {
 	status := control.ProjectStatus{
 		Name:             st.project.Name,
 		PublicURL:        st.project.PublicURL,
+		Host:             st.project.Host,
 		SupervisorPort:   st.project.SupervisorPort,
 		ApplicationPort:  st.project.ApplicationPort,
+		WorkingDirectory: st.project.WorkingDirectory,
+		Source:           st.project.Source,
+		Dynamic:          st.dynamic,
 		State:            snap.State,
 		PID:              snap.PID,
 		LastExit:         snap.LastExit,
@@ -142,6 +156,9 @@ func (d *Daemon) Status() control.StatusResponse {
 	for _, st := range d.sortedStatesLocked() {
 		resp.Projects = append(resp.Projects, d.projectStatus(st))
 	}
+	for _, es := range d.sortedEntriesLocked() {
+		resp.Wildcards = append(resp.Wildcards, d.wildcardStatusLocked(es))
+	}
 	return resp
 }
 
@@ -165,6 +182,8 @@ func (d *Daemon) StartProject(ctx context.Context, name string) (control.Project
 
 // StopProject implements control.Provider: it gracefully stops the named
 // project's process group (force-killing only after its shutdown timeout).
+// A dynamic project whose worktree directory has vanished is dropped from
+// the table once stopped.
 func (d *Daemon) StopProject(ctx context.Context, name string) (control.ProjectStatus, error) {
 	st, err := d.findProject(name)
 	if err != nil {
@@ -173,14 +192,22 @@ func (d *Daemon) StopProject(ctx context.Context, name string) (control.ProjectS
 	if err := st.proc.Stop(ctx); err != nil {
 		return control.ProjectStatus{}, err
 	}
-	return d.projectStatus(st), nil
+	status := d.projectStatus(st)
+	if st.dynamic {
+		d.dropIfVanished(st)
+	}
+	return status, nil
 }
 
 // RestartProject implements control.Provider: stop (if needed), then start.
+// A dynamic project re-runs port_command first (see restartDynamic).
 func (d *Daemon) RestartProject(ctx context.Context, name string) (control.ProjectStatus, error) {
 	st, err := d.findProject(name)
 	if err != nil {
 		return control.ProjectStatus{}, err
+	}
+	if st.dynamic {
+		return d.restartDynamic(ctx, st)
 	}
 	if err := st.proc.Restart(ctx); err != nil {
 		return control.ProjectStatus{}, err
@@ -227,33 +254,54 @@ func (d *Daemon) ProjectLogs(name string, maxLines int) (control.LogsResponse, e
 	}, nil
 }
 
-// retiring is one project being taken out of service by a reload (or by
-// daemon shutdown), and whether its listener is kept for a replacement on
-// the same address.
+// retiring is one project being taken out of service by a reload, a drop,
+// or daemon shutdown, and whether its route is kept for a replacement on
+// the same address and host.
 type retiring struct {
 	st          *projectState
 	keepBinding bool
 }
 
-// retireAll takes the given projects out of service, in parallel: each
-// project's monitor is stopped, its listener closed (unless kept for a
-// replacement), its supervisor retired so nothing can respawn it, and its
-// process group stopped gracefully — each bounded by its own shutdown
-// timeout plus the force-kill drain. Closing the listener first means a
-// removed port stops accepting before its process goes away; retiring
-// before stopping means a request that slipped past the closing listener
-// cannot restart what the stop is ending. retireAll returns once every
-// process group is gone (or the bound elapsed). It is idempotent:
-// supervisors that never started anything are no-ops, and only tracked
-// PGIDs are ever signaled.
-func (d *Daemon) retireAll(items []retiring) {
+// retireBound is how long retiring the given projects may take: the
+// longest shutdown timeout plus the force-kill drain.
+func retireBound(items []retiring) time.Duration {
 	maxWait := 15 * time.Second
 	for _, item := range items {
 		if wait := time.Duration(item.st.project.ShutdownTimeoutSeconds)*time.Second + 15*time.Second; wait > maxWait {
 			maxWait = wait
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), maxWait)
+	return maxWait
+}
+
+// retire takes one project out of service: its monitor is stopped, its
+// route removed (unless kept for a replacement) — closing its listener
+// when nothing else is on it — its supervisor retired so nothing can
+// respawn it, and its process group stopped gracefully. Removing the route
+// first means a removed port (or host) stops answering before its process
+// goes away; retiring before stopping means a request that slipped past
+// the closing route cannot restart what the stop is ending. It runs at
+// most once per project.
+func (d *Daemon) retire(ctx context.Context, item retiring) {
+	st := item.st
+	st.retireOnce.Do(func() {
+		if st.deactivate != nil {
+			st.deactivate()
+		}
+		d.detach(st, item.keepBinding)
+		st.proc.Retire()
+		if err := st.proc.Stop(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			d.logger.Printf("project %q: stop while retiring: %v", st.project.Name, err)
+		}
+	})
+}
+
+// retireAll retires the given projects in parallel and returns once every
+// process group is gone (or the bound elapsed). It is idempotent:
+// supervisors that never started anything are no-ops, and only tracked
+// PGIDs are ever signaled.
+func (d *Daemon) retireAll(items []retiring) {
+	ctx, cancel := context.WithTimeout(context.Background(), retireBound(items))
 	defer cancel()
 
 	var wg sync.WaitGroup
@@ -261,27 +309,18 @@ func (d *Daemon) retireAll(items []retiring) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			st := item.st
-			if st.deactivate != nil {
-				st.deactivate()
-			}
-			if !item.keepBinding && st.bind != nil {
-				d.unbind(st.bind)
-			}
-			st.proc.Retire()
-			if err := st.proc.Stop(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				d.logger.Printf("project %q: stop while retiring: %v", st.project.Name, err)
-			}
+			d.retire(ctx, item)
 		}()
 	}
 	wg.Wait()
 }
 
-// stopAllProjects closes every project listener and gracefully stops every
-// supervised process group. It runs on every daemon exit — including the
-// panic path via defer — and waits for any reload in progress to finish
-// first, so a project a reload is just adding is stopped too.
-func (d *Daemon) stopAllProjects() {
+// stopAll closes every project listener and gracefully stops every
+// supervised process group, dynamic projects included. It runs on every
+// daemon exit — including the panic path via defer — and waits for any
+// reload in progress to finish first, so a project a reload is just adding
+// is stopped too.
+func (d *Daemon) stopAll() {
 	d.reloadMu.Lock()
 	defer d.reloadMu.Unlock()
 	states := d.sortedStates()
@@ -290,4 +329,9 @@ func (d *Daemon) stopAllProjects() {
 		items = append(items, retiring{st: st})
 	}
 	d.retireAll(items)
+	for _, es := range d.sortedEntries() {
+		if es.bind != nil {
+			d.unbindEntry(es)
+		}
+	}
 }

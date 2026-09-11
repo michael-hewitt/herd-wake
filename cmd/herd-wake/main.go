@@ -20,6 +20,7 @@ import (
 	"github.com/michael-hewitt/herd-wake/internal/config"
 	"github.com/michael-hewitt/herd-wake/internal/control"
 	"github.com/michael-hewitt/herd-wake/internal/daemon"
+	"github.com/michael-hewitt/herd-wake/internal/herd"
 	"github.com/michael-hewitt/herd-wake/internal/version"
 )
 
@@ -49,6 +50,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runReload(args[1:], stdout, stderr)
 	case "sync":
 		return runSync(args[1:], stdout, stderr)
+	case "url":
+		return runURL(args[1:], stdout, stderr)
 	case "project:remove":
 		return runProjectRemove(args[1:], stdout, stderr)
 	case "project:start", "project:stop", "project:restart", "project:release":
@@ -79,7 +82,13 @@ func runProjects(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	if len(cfg.Projects) == 0 {
+	wildcards := 0
+	for _, d := range cfg.Discovery {
+		if d.Wildcard() {
+			wildcards++
+		}
+	}
+	if len(cfg.Projects) == 0 && wildcards == 0 {
 		fmt.Fprintf(stdout, "No projects configured in %s (or %s)\n", path, config.ProjectsDir(path))
 		return 0
 	}
@@ -90,7 +99,31 @@ func runProjects(args []string, stdout, stderr io.Writer) int {
 		}
 		printProject(stdout, cfg.Projects[name])
 	}
+	for _, d := range cfg.Discovery {
+		if !d.Wildcard() {
+			continue
+		}
+		fmt.Fprintln(stdout)
+		printWildcard(stdout, d)
+	}
 	return 0
+}
+
+// printWildcard writes one wildcard discovery entry in a human-readable
+// block: its worktrees become projects on demand, so there is nothing to
+// list per worktree here.
+func printWildcard(w io.Writer, d *config.Discovery) {
+	fmt.Fprintf(w, "%s  (wildcard discovery: worktrees served on demand)\n", d.Name)
+	fmt.Fprintf(w, "  URL pattern:       %s\n", d.URLPattern())
+	fmt.Fprintf(w, "  Worktrees:         %s/<label>\n", d.Directory)
+	site, _ := herd.SiteName(d.BaseDomain)
+	fmt.Fprintf(w, "  Supervisor port:   %d  (%s)\n", d.SupervisorPort(), herd.ProxyCommand(site, d.SupervisorPort()))
+	fmt.Fprintf(w, "  Command:           %s\n", d.Template.Command)
+	if d.PortCommand != "" {
+		fmt.Fprintf(w, "  Port command:      %s\n", d.PortCommand)
+	} else {
+		fmt.Fprintf(w, "  Application ports: %v\n", d.ApplicationPortRange)
+	}
 }
 
 // runStart implements `herd-wake start`: it runs the supervisor daemon in
@@ -165,14 +198,22 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 		}
 		fmt.Fprintf(stdout, "config: %s (%s)\n", status.ConfigPath, reloaded)
 	}
+	for _, wc := range status.Wildcards {
+		fmt.Fprintf(stdout, "wildcard %s: %s -> %s/<label> (supervisor port %d, %d project(s) materialised)\n",
+			wc.Name, wc.URLPattern, wc.Directory, wc.SupervisorPort, wc.Projects)
+	}
 	if len(status.Projects) == 0 {
-		fmt.Fprintln(stdout, "No projects configured.")
+		if len(status.Wildcards) == 0 {
+			fmt.Fprintln(stdout, "No projects configured.")
+		} else {
+			fmt.Fprintln(stdout, "No projects running or registered yet; worktrees are materialised on their first request.")
+		}
 		return 0
 	}
 
 	fmt.Fprintln(stdout)
 	tw := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "PROJECT\tSTATE\tPID\tUPTIME\tLAST ACTIVITY\tIDLE STOP\tLAST EXIT\tURL\tSUPERVISOR PORT\tUPSTREAM")
+	fmt.Fprintln(tw, "PROJECT\tSTATE\tPID\tUPTIME\tLAST ACTIVITY\tIDLE STOP\tLAST EXIT\tURL\tSUPERVISOR PORT\tUPSTREAM\tSOURCE")
 	for _, p := range status.Projects {
 		pid, uptime, lastExit := "-", "-", "-"
 		if p.PID != 0 {
@@ -182,9 +223,20 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 		if p.LastExit != "" {
 			lastExit = p.LastExit
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t127.0.0.1:%d\n",
+		listener := strconv.Itoa(p.SupervisorPort)
+		if p.Host != "" {
+			listener += " (" + p.Host + ")"
+		}
+		source := p.Source
+		if source == "" {
+			source = "-"
+		}
+		if p.Dynamic {
+			source += " (dynamic)"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t127.0.0.1:%d\t%s\n",
 			p.Name, p.State, pid, uptime, describeLastActivity(p), describeIdleStop(p),
-			lastExit, p.PublicURL, p.SupervisorPort, p.ApplicationPort)
+			lastExit, p.PublicURL, listener, p.ApplicationPort, source)
 	}
 	if err := tw.Flush(); err != nil {
 		fmt.Fprintf(stderr, "herd-wake: %v\n", err)
@@ -283,6 +335,10 @@ func runReload(args []string, stdout, stderr io.Writer) int {
 			value = strings.Join(group.names, ", ")
 		}
 		fmt.Fprintf(stdout, "  %-10s %s\n", group.label+":", value)
+	}
+	if w := resp.Wildcards; w != nil {
+		fmt.Fprintf(stdout, "  wildcard entries: added %s, removed %s, changed %s, unchanged %s\n",
+			nameList(w.Added), nameList(w.Removed), nameList(w.Changed), nameList(w.Unchanged))
 	}
 	if len(resp.Errors) > 0 {
 		fmt.Fprintf(stderr, "herd-wake: %d problem(s) applying the reload:\n", len(resp.Errors))
@@ -471,6 +527,9 @@ func printProject(w io.Writer, p *config.Project) {
 	fmt.Fprintln(w, name)
 	fmt.Fprintf(w, "  Source:            %s\n", p.Source)
 	fmt.Fprintf(w, "  URL:               %s\n", p.PublicURL)
+	if p.Host != "" {
+		fmt.Fprintf(w, "  Host:              %s  (routed by Host header on the shared supervisor port)\n", p.Host)
+	}
 	fmt.Fprintf(w, "  Supervisor port:   %d  (herd proxy target %s:%d)\n", p.SupervisorPort, p.ListenHost, p.SupervisorPort)
 	fmt.Fprintf(w, "  Application port:  %d\n", p.ApplicationPort)
 	fmt.Fprintf(w, "  Working directory: %s\n", p.WorkingDirectory)
@@ -517,6 +576,7 @@ Commands:
   status                   Show daemon uptime, config path, and per-project state
   reload                   Re-read the config file and projects.d and apply the changes live
   sync                     Discover worktrees, update projects.d and Herd proxies, reload the daemon
+  url [directory]          Print the public URL a directory is served at (default: the current directory)
   projects                 List registered projects from the config file and projects.d
   project:start <name>     Start a project's dev server and wait until it is ready
   project:stop <name>      Gracefully stop a project's dev server
@@ -528,7 +588,7 @@ Commands:
   version                  Print the herd-wake version
 
 Options:
-  --config <path>   Config file to load (start, projects, sync, project:remove); projects.d/ next to it is merged in
+  --config <path>   Config file to load (start, projects, sync, url, project:remove); projects.d/ next to it is merged in
                     (default: ~/Library/Application Support/herd-wake/config.yaml)
   --socket <path>   Control socket to use (start, status, reload, sync, project:*, logs)
                     (default: ~/Library/Application Support/herd-wake/herd-wake.sock)
