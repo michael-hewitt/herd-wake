@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -172,6 +173,7 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("status", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	socketPath := flags.String("socket", "", "path to the control socket (default: ~/Library/Application Support/herd-wake/herd-wake.sock)")
+	asJSON := flags.Bool("json", false, "print the daemon's status response as JSON (for scripts)")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -187,6 +189,16 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		reportDaemonError(stderr, err)
 		return 1
+	}
+
+	if *asJSON {
+		enc := json.NewEncoder(stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(status); err != nil {
+			fmt.Fprintf(stderr, "herd-wake: encode status: %v\n", err)
+			return 1
+		}
+		return 0
 	}
 
 	fmt.Fprintf(stdout, "herd-wake daemon running: pid %d, uptime %s, version %s\n",
@@ -598,7 +610,7 @@ Options:
   --lines <n>       Maximum lines to print (logs; 0 = everything buffered)
   --dry-run         Compute and print what sync would change without writing or touching Herd (sync)
   --no-herd         Never run the herd CLI; print the Herd commands to run by hand (sync)
-  --json            Print the result as JSON (sync)
+  --json            Print the result as JSON (sync, status)
   --keep-herd       Leave the project's Herd proxy in place (project:remove)
 `)
 }

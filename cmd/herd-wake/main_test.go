@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -11,6 +12,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/michael-hewitt/herd-wake/internal/control"
 )
 
 func TestRunVersion(t *testing.T) {
@@ -364,6 +367,27 @@ func TestRunReloadEndToEnd(t *testing.T) {
 		if !strings.Contains(stdout.String(), want) {
 			t.Errorf("status output missing %q; got:\n%s", want, stdout.String())
 		}
+	}
+
+	// status --json prints the daemon's status response verbatim, for scripts.
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"status", "--socket", socket, "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("status --json exit code = %d (stderr:\n%s)", code, stderr.String())
+	}
+	var st control.StatusResponse
+	if err := json.Unmarshal(stdout.Bytes(), &st); err != nil {
+		t.Fatalf("status --json is not valid JSON: %v\n%s", err, stdout.String())
+	}
+	if st.ConfigPath != configPath || st.LastReloadAt.IsZero() {
+		t.Errorf("status --json = config %q reloaded %v, want %q and a reload time", st.ConfigPath, st.LastReloadAt, configPath)
+	}
+	var names []string
+	for _, p := range st.Projects {
+		names = append(names, p.Name)
+	}
+	if got := strings.Join(names, ","); got != "dashboard,reports" {
+		t.Errorf("status --json projects = %q, want dashboard,reports", got)
 	}
 
 	// An invalid projects.d file rejects the reload with its errors.
