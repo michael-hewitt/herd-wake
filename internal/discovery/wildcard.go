@@ -179,9 +179,11 @@ func (s *syncer) syncWildcard(d *config.Discovery) (res *EntryResult, note strin
 // instead, `herd: false`, or the same note was already shown for this
 // listener. Showing it records it in the state (which a dry run never
 // writes), so the next sync is silent until base_domain or the port
-// changes.
+// changes. A sync that uses Herd (or was told to leave it alone) forgets
+// the record, so the note comes back should Herd go away again.
 func (s *syncer) proxyNote(d *config.Discovery) string {
 	if s.opts.Herd != nil || !s.opts.HerdUnavailable || !d.HerdEnabled() {
+		delete(s.state.ProxyNotes, d.Name)
 		return ""
 	}
 	listener := wildcardState{BaseDomain: d.BaseDomain, SupervisorPort: d.SupervisorPort()}

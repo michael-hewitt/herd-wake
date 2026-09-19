@@ -308,9 +308,10 @@ discovery:
     # Optional; required without port_command.
     application_port_range: [42000, 42999]
 
-    # Optional. Let sync manage the wildcard Herd proxy. Default: true.
-    # With false (or when the herd CLI cannot be found), sync prints the
-    # command for you to run instead.
+    # Optional. Let sync manage the wildcard Herd proxy. Default: true on
+    # macOS; on Linux (no Herd) false, and sync tells you once what to point
+    # your own proxy at. With false (or, on macOS, when the herd CLI cannot
+    # be found), sync prints the command for you to run instead.
     herd: true
 
     # Optional. Glob patterns on the subdirectory name; matches are never
@@ -375,7 +376,9 @@ discovery:
     application_port_range: [44000, 44999]
 
     # Optional. Manage Herd proxy entries for these projects: `herd proxy`
-    # for new ones, `herd unproxy` for removed ones. Default: true.
+    # for new ones, `herd unproxy` for removed ones. Default: true on macOS;
+    # on Linux (no Herd) false, and sync lists each new URL once for your
+    # own proxy.
     herd: true
 
     # Optional. See above.

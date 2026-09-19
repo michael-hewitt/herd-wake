@@ -487,3 +487,90 @@ func TestLoadStateOldFormat(t *testing.T) {
 		}
 	}
 }
+
+// TestSyncWildcardProxyNoteReturnsWhenHerdGoesAway: a sync that uses Herd
+// (or --no-herd, or `herd: false`) forgets the wildcard entry's proxy-note
+// record, so the note is shown again if Herd disappears later, and a
+// state file with nothing left in it is removed.
+func TestSyncWildcardProxyNoteReturnsWhenHerdGoesAway(t *testing.T) {
+	f := newFixture(t)
+	f.writeWildcardConfig("", "")
+	noHerd := Options{HerdUnavailable: true, HerdNote: "herd CLI not found", GOOS: "linux"}
+	stateHas := func(want string) bool {
+		data, _ := os.ReadFile(f.statePath())
+		return strings.Contains(string(data), want)
+	}
+
+	// No Herd: note shown and recorded.
+	if all := f.syncAll(noHerd); len(all.ProxyNotes) != 1 {
+		t.Fatalf("first sync without Herd: ProxyNotes = %q", all.ProxyNotes)
+	}
+	if !stateHas("proxy_notes:") {
+		t.Fatal("state file should record the note")
+	}
+
+	// Herd present: the proxy is registered and the note record cleared.
+	all := f.syncAll(Options{Herd: f.herd(testproc.FakeHerd{}), GOOS: "linux"})
+	if a := all.Entries[0].Herd; len(a) != 1 || a[0].Status != HerdDone || len(all.ProxyNotes) != 0 {
+		t.Fatalf("sync with Herd: herd = %+v, notes %q", a, all.ProxyNotes)
+	}
+	if stateHas("proxy_notes:") || !stateHas("wildcards:") {
+		data, _ := os.ReadFile(f.statePath())
+		t.Errorf("state after a Herd sync should keep the wildcard record and drop the note:\n%s", data)
+	}
+
+	// No Herd again: the note comes back.
+	if all := f.syncAll(noHerd); len(all.ProxyNotes) != 1 {
+		t.Errorf("sync without Herd after a Herd sync: ProxyNotes = %q, want the note again", all.ProxyNotes)
+	}
+
+	// --no-herd and `herd: false` clear the record too; with no wildcard
+	// proxy recorded either, the state file goes away.
+	f.writeWildcardConfig("", "    herd: false\n")
+	if all := f.syncAll(Options{HerdNote: "--no-herd: Herd left untouched", GOOS: "linux"}); len(all.ProxyNotes) != 0 {
+		t.Errorf("--no-herd: notes %q", all.ProxyNotes)
+	}
+	if stateHas("proxy_notes:") {
+		t.Error("--no-herd should clear the note record")
+	}
+	// Retire the Herd proxy so nothing is left to record.
+	if all := f.syncAll(Options{Herd: f.herd(testproc.FakeHerd{}), GOOS: "linux"}); len(all.ProxyNotes) != 0 {
+		t.Errorf("herd: false with Herd: notes %q", all.ProxyNotes)
+	}
+	if err := os.WriteFile(f.configPath, []byte("projects: {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.syncAll(Options{Herd: f.herd(testproc.FakeHerd{}), GOOS: "linux"})
+	if _, err := os.Stat(f.statePath()); !os.IsNotExist(err) {
+		data, _ := os.ReadFile(f.statePath())
+		t.Errorf("state file should be removed once both maps are empty:\n%s", data)
+	}
+}
+
+// TestSyncWildcardWithoutHerdCLIOnDarwinStaysManual: on macOS a missing
+// Herd CLI with `herd:` unset is reported as it always was — the manual
+// `herd proxy` command with the reason, and the proxy note offering the
+// same command — not the quiet Linux default.
+func TestSyncWildcardWithoutHerdCLIOnDarwinStaysManual(t *testing.T) {
+	f := newFixture(t)
+	f.writeWildcardConfig("", "")
+	mac := Options{HerdUnavailable: true, HerdNote: "herd CLI not found on PATH or at ~/Library/Application Support/Herd/bin/herd", GOOS: "darwin"}
+
+	all := f.syncAll(mac)
+	if a := all.Entries[0].Herd; len(a) != 1 || a[0].Status != HerdManual || a[0].Detail != mac.HerdNote {
+		t.Errorf("darwin without the CLI = %+v, want manual with the reason", a)
+	}
+	if got := all.ManualCommands(); len(got) != 1 || got[0] != "herd proxy webapp http://127.0.0.1:41000 --secure" {
+		t.Errorf("ManualCommands = %v", got)
+	}
+	if len(all.ProxyNotes) != 1 || !strings.HasSuffix(all.ProxyNotes[0], "; or install Laravel Herd and run: herd proxy webapp http://127.0.0.1:41000 --secure") {
+		t.Errorf("darwin ProxyNotes = %q", all.ProxyNotes)
+	}
+
+	// Removing the entry still wants the unproxy, by hand: nothing was
+	// registered, so nothing is retired, but the manual proxy action was
+	// reported every sync, so the user knows.
+	if all = f.syncAll(mac); len(all.ManualCommands()) != 1 {
+		t.Errorf("second darwin sync ManualCommands = %v, want the command again", all.ManualCommands())
+	}
+}

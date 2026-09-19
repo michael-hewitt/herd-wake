@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"strings"
 	"time"
 
@@ -16,6 +17,11 @@ import (
 	"github.com/michael-hewitt/herd-wake/internal/discovery"
 	"github.com/michael-hewitt/herd-wake/internal/herd"
 )
+
+// hostGOOS is the operating system sync and project:remove assume when
+// looking for Herd and deciding how to report its absence (Laravel Herd
+// is macOS-only). Tests override it to exercise both platforms.
+var hostGOOS = runtime.GOOS
 
 // reloadOutcome records the daemon reload sync/project:remove trigger
 // after changing the configuration.
@@ -82,7 +88,7 @@ func runSync(args []string, stdout, stderr io.Writer) int {
 	}
 
 	ctx := context.Background()
-	opts := discovery.Options{DryRun: *dryRun}
+	opts := discovery.Options{DryRun: *dryRun, GOOS: hostGOOS}
 	opts.Herd, opts.HerdNote, opts.HerdUnavailable = detectHerd(*noHerd)
 	result, err := discovery.Sync(ctx, cfg, opts)
 	if err != nil {
@@ -138,9 +144,9 @@ func runProjectRemove(args []string, stdout, stderr io.Writer) int {
 	}
 
 	ctx := context.Background()
-	opts := discovery.RemoveOptions{KeepHerd: *keepHerd}
+	opts := discovery.RemoveOptions{KeepHerd: *keepHerd, GOOS: hostGOOS}
 	if !*keepHerd {
-		opts.Herd, opts.HerdNote, _ = detectHerd(false)
+		opts.Herd, opts.HerdNote, opts.HerdUnavailable = detectHerd(false)
 	}
 	res, err := discovery.Remove(ctx, cfg, name, opts)
 	var mainErr *discovery.MainConfigError
@@ -179,7 +185,7 @@ func detectHerd(disabled bool) (cli *herd.CLI, note string, unavailable bool) {
 	if disabled {
 		return nil, "--no-herd: Herd left untouched", false
 	}
-	cli, err := herd.Detect(herd.Options{})
+	cli, err := herd.Detect(herd.Options{GOOS: hostGOOS})
 	if err != nil {
 		return nil, err.Error(), true
 	}

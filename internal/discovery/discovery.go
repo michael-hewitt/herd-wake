@@ -46,15 +46,17 @@ type Options struct {
 	Herd     *herd.CLI
 	HerdNote string
 	// HerdUnavailable marks a nil Herd as "no Herd CLI could be found" (as
-	// opposed to disabled with --no-herd). Then an entry whose `herd:` is
-	// unset is synced as `herd: false` — no Herd actions, no commands to
-	// run by hand — and a wildcard entry is told once (see
-	// Result.ProxyNotes) how to front its listener with another proxy.
-	// An explicit `herd: true` still degrades to manual commands.
+	// opposed to disabled with --no-herd). Off darwin (Laravel Herd is
+	// macOS-only) an entry whose `herd:` is unset is then synced as
+	// `herd: false` — no Herd actions, no commands to run by hand — and
+	// the user is told instead (see Result.ProxyNotes) what to front with
+	// their own proxy. On darwin a missing CLI is reported as before: every
+	// Herd action degrades to the command to run by hand. An explicit
+	// `herd: true` degrades to manual commands everywhere.
 	HerdUnavailable bool
-	// GOOS is the operating system the advice in ProxyNotes assumes
-	// (default runtime.GOOS): on darwin the note also offers the `herd
-	// proxy` command.
+	// GOOS is the operating system sync assumes (default runtime.GOOS):
+	// it selects the quiet Herd-less default above and, on darwin, makes
+	// the wildcard proxy note also offer the `herd proxy` command.
 	GOOS string
 	// DryRun computes everything but writes no file and runs no Herd
 	// command that changes anything (`herd paths`/`herd links` still run).
@@ -154,10 +156,13 @@ type Result struct {
 	DryRun        bool   `json:"dry_run"`
 	HerdAvailable bool   `json:"herd_available"`
 	HerdNote      string `json:"herd_note,omitempty"`
-	// ProxyNotes tells the user, once per wildcard entry, how to front the
-	// entry's listener with their own proxy because no Herd CLI was found.
-	// A note is recorded in the state file when shown and repeated only
-	// when the entry's base_domain or supervisor_port changes.
+	// ProxyNotes tells the user what to front with their own proxy because
+	// no Herd CLI was found (off darwin, `herd:` unset). A wildcard entry
+	// gets one note for its listener, recorded in the state file when
+	// shown and repeated only when base_domain or supervisor_port changes;
+	// a proxy-mode entry gets one note per sync listing the public URLs of
+	// the projects added or updated by that sync, so each URL is noted
+	// when it appears and never again while it is unchanged.
 	ProxyNotes []string       `json:"proxy_notes,omitempty"`
 	Entries    []*EntryResult `json:"discovery"`
 }
@@ -264,14 +269,16 @@ func Sync(ctx context.Context, cfg *config.Config, opts Options) (*Result, error
 	}
 	previous := maps.Clone(state.Wildcards)
 	for _, d := range cfg.Discovery {
+		var entry *EntryResult
+		var note string
 		if d.Wildcard() {
-			entry, note := s.syncWildcard(d)
-			res.Entries = append(res.Entries, entry)
-			if note != "" {
-				res.ProxyNotes = append(res.ProxyNotes, note)
-			}
+			entry, note = s.syncWildcard(d)
 		} else {
-			res.Entries = append(res.Entries, s.syncEntry(d))
+			entry, note = s.syncEntry(d)
+		}
+		res.Entries = append(res.Entries, entry)
+		if note != "" {
+			res.ProxyNotes = append(res.ProxyNotes, note)
 		}
 	}
 	res.Entries = append(res.Entries, s.retireWildcards(previous)...)
@@ -296,9 +303,12 @@ type syncer struct {
 	state *syncState
 }
 
-// syncEntry reconciles one discovery entry.
-func (s *syncer) syncEntry(d *config.Discovery) *EntryResult {
-	res := &EntryResult{
+// syncEntry reconciles one proxy-mode discovery entry. Without a Herd CLI
+// (off darwin, `herd:` unset) note tells the user which public URLs this
+// sync registered or changed, so they can front them with their own
+// proxy; it is empty when there is nothing new to say.
+func (s *syncer) syncEntry(d *config.Discovery) (res *EntryResult, note string) {
+	res = &EntryResult{
 		Name:      d.Name,
 		Mode:      config.ModeProxy,
 		Directory: d.Directory,
@@ -310,9 +320,9 @@ func (s *syncer) syncEntry(d *config.Discovery) *EntryResult {
 		Skipped:   []Skip{},
 		Herd:      []HerdAction{},
 	}
-	fail := func(format string, args ...any) *EntryResult {
+	fail := func(format string, args ...any) (*EntryResult, string) {
 		res.Errors = append(res.Errors, fmt.Sprintf(format, args...))
-		return res
+		return res, ""
 	}
 
 	managed, err := IsManagedFile(res.File)
@@ -385,7 +395,29 @@ func (s *syncer) syncEntry(d *config.Discovery) *EntryResult {
 	}
 
 	s.herdActions(d, res, final, existing)
-	return res
+	if s.herdOff(d) {
+		note = proxyModeNote(d, res)
+	}
+	return res, note
+}
+
+// proxyModeNote is the bring-your-own-proxy note for a proxy-mode entry
+// synced without a Herd CLI: the public URL → listener mapping of every
+// project this sync added or updated, one per line, or "" when it added
+// or updated none. Unchanged projects are never listed, so a URL is noted
+// once, when it first appears, with no state to keep.
+func proxyModeNote(d *config.Discovery, res *EntryResult) string {
+	var lines []string
+	for _, list := range [][]ProjectSummary{res.Added, res.Updated} {
+		for _, p := range list {
+			lines = append(lines, fmt.Sprintf("  %s → http://127.0.0.1:%d", p.PublicURL, p.SupervisorPort))
+		}
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("no Herd CLI found; point your proxy at herd-wake yourself for the new URLs of discovery %q (see README \"Bring your own proxy\" for the nginx and Caddy blocks):\n%s",
+		d.Name, strings.Join(lines, "\n"))
 }
 
 // build generates the project for one candidate. prev is its previous
@@ -519,11 +551,20 @@ func (s *syncer) allocate(rng []int, name string) (int, bool) {
 }
 
 // herdOff reports whether the entry is synced without any Herd action at
-// all: no Herd CLI could be found and the entry does not ask for Herd
-// explicitly, so it is treated as `herd: false` — the user fronts the
-// listener with their own proxy (Herd is macOS-only).
+// all: see herdQuiet.
 func (s *syncer) herdOff(d *config.Discovery) bool {
-	return s.opts.Herd == nil && s.opts.HerdUnavailable && d.Herd == nil
+	return s.herdQuiet(d.Herd)
+}
+
+// herdQuiet reports whether Herd is left out entirely for an entry whose
+// `herd:` setting is herdSetting (nil when unset): no Herd CLI could be
+// found, the platform is not macOS (Laravel Herd is macOS-only, so there
+// is no Herd to install and no command worth printing), and the entry
+// does not ask for Herd explicitly — so it is treated as `herd: false`
+// and the user fronts the listener with their own proxy. On darwin a
+// missing CLI keeps reporting the manual commands.
+func (s *syncer) herdQuiet(herdSetting *bool) bool {
+	return s.opts.Herd == nil && s.opts.HerdUnavailable && s.opts.GOOS != "darwin" && herdSetting == nil
 }
 
 // herdActions creates the missing proxies for the entry's projects and
