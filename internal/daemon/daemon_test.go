@@ -70,12 +70,18 @@ func startDaemon(t *testing.T, cfg *config.Config) (socket string, stop func(), 
 }
 
 // startDaemonFor is startDaemon returning the daemon itself too, for tests
-// that inspect its internals.
-func startDaemonFor(t *testing.T, cfg *config.Config) (d *Daemon, socket string, stop func(), done <-chan error) {
+// that inspect its internals. The daemon's log output is discarded unless a
+// logger is given, which is how a test that asserts on what the daemon
+// logged reads it.
+func startDaemonFor(t *testing.T, cfg *config.Config, logger ...*log.Logger) (d *Daemon, socket string, stop func(), done <-chan error) {
 	t.Helper()
 	socket = testSocketPath(t)
 	ctx, cancel := context.WithCancel(context.Background())
-	d = New(cfg, socket, t.TempDir(), log.New(io.Discard, "", 0))
+	out := log.New(io.Discard, "", 0)
+	if len(logger) > 0 && logger[0] != nil {
+		out = logger[0]
+	}
+	d = New(cfg, socket, t.TempDir(), out)
 	runDone := make(chan error, 1)
 	go func() {
 		runDone <- d.Run(ctx)

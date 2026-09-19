@@ -127,9 +127,18 @@ type Project struct {
 	ShutdownSignal         string `yaml:"shutdown_signal,omitempty"`
 	ShutdownTimeoutSeconds int    `yaml:"shutdown_timeout_seconds,omitempty"`
 	WebSocketsKeepAlive    *bool  `yaml:"websockets_keep_alive,omitempty"`
-	LogRetentionDays       int    `yaml:"log_retention_days,omitempty"`
-	HoldMaxWaitSeconds     int    `yaml:"hold_max_wait_seconds,omitempty"`
-	HoldMaxRequests        int    `yaml:"hold_max_requests,omitempty"`
+	// DiagnosticLogs controls how much the 404 and 503 diagnostic pages say
+	// about this project: with true (the default) they quote recent process
+	// output and name paths, which is what a developer wants at a local
+	// .test URL; with false they show state, exit status, and a pointer to
+	// `herd-wake logs <name>` only, which is what a preview server behind a
+	// public hostname needs. It is a pointer so a managed file written by
+	// `herd-wake sync` never pins the default (as websockets_keep_alive
+	// does); read it through DiagnosticLogsEnabled.
+	DiagnosticLogs     *bool `yaml:"diagnostic_logs,omitempty"`
+	LogRetentionDays   int   `yaml:"log_retention_days,omitempty"`
+	HoldMaxWaitSeconds int   `yaml:"hold_max_wait_seconds,omitempty"`
+	HoldMaxRequests    int   `yaml:"hold_max_requests,omitempty"`
 
 	// Optional fields without defaults.
 	//
@@ -140,10 +149,21 @@ type Project struct {
 	// 404 diagnostic. Without host, the project owns its supervisor_port
 	// outright and every request on it is the project's. public_url
 	// defaults to https://<host> when host is set.
-	Host     string            `yaml:"host,omitempty"`
-	Env      map[string]string `yaml:"env,omitempty"`
-	NodePath string            `yaml:"node_path,omitempty"`
-	AlwaysOn bool              `yaml:"always_on,omitempty"`
+	Host string            `yaml:"host,omitempty"`
+	Env  map[string]string `yaml:"env,omitempty"`
+	// EnvFile lists files of NAME=value lines the dev server's environment
+	// is read from, so secrets stay out of the config file and out of every
+	// herd-wake output. One path or several may be given; they are read in
+	// order at every process start (and before every port_command run), a
+	// later file beating an earlier one and the inline Env map beating them
+	// all. An absolute path is a shared file and must exist — a missing one
+	// is a validation error here and a failed start later — while a
+	// relative path is resolved against the directory the command runs in
+	// and is optional, which is how a per-worktree file such as
+	// .env.preview is expressed. A leading ~/ is expanded.
+	EnvFile  EnvFiles `yaml:"env_file,omitempty"`
+	NodePath string   `yaml:"node_path,omitempty"`
+	AlwaysOn bool     `yaml:"always_on,omitempty"`
 	// RewriteHost, when true, makes the proxy present the dev server with
 	// Host: 127.0.0.1:<application_port> instead of the public host, for
 	// servers that refuse non-localhost hosts (Vite's server.allowedHosts,
@@ -399,6 +419,22 @@ func (p *Project) applyDefaults() {
 		keepAlive := true
 		p.WebSocketsKeepAlive = &keepAlive
 	}
+	if p.DiagnosticLogs == nil {
+		diagnosticLogs := true
+		p.DiagnosticLogs = &diagnosticLogs
+	}
+	// Normalising an empty list to nil keeps "unset" and "empty" equal for
+	// Equivalent, and building a new slice leaves a discovery template's
+	// own list untouched when a project copied from it is defaulted.
+	if len(p.EnvFile) == 0 {
+		p.EnvFile = nil
+	} else {
+		expanded := make(EnvFiles, len(p.EnvFile))
+		for i, file := range p.EnvFile {
+			expanded[i] = expandHome(file)
+		}
+		p.EnvFile = expanded
+	}
 	if p.LogRetentionDays == 0 {
 		p.LogRetentionDays = DefaultLogRetentionDays
 	}
@@ -586,6 +622,26 @@ func (p *Project) validate(opts LoadOptions) []error {
 		}
 	} else if !info.IsDir() {
 		fail("working_directory", "%q is not a directory", p.WorkingDirectory)
+	}
+
+	// An absolute env file is shared and must be there; a relative one is
+	// resolved against the working directory at start time and is allowed
+	// to be missing, so there is nothing to check for it here. Both checks
+	// stand even under SkipWorkingDirectoryCheck: a repair tool still wants
+	// to hear that the secrets it would run with have gone.
+	for _, file := range p.EnvFile {
+		if strings.TrimSpace(file) == "" {
+			fail("env_file", "entries must not be empty: each is the path of a file of NAME=value lines")
+			continue
+		}
+		if !filepath.IsAbs(file) {
+			continue
+		}
+		if info, err := os.Stat(file); err != nil {
+			fail("env_file", "file %q does not exist", file)
+		} else if !info.Mode().IsRegular() {
+			fail("env_file", "%q is not a regular file", file)
+		}
 	}
 
 	if strings.TrimSpace(p.Command) == "" {

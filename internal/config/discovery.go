@@ -238,7 +238,8 @@ func (d *Discovery) Label(host string) (label string, ok bool) {
 // named label at dir with the given application port: the template's
 // fields plus the generated name, host, public_url, working_directory,
 // ports, and Source (DynamicSource), with defaults applied like a loaded
-// project. The template's env map is copied, never shared.
+// project. The template's env map and env_file list are copied, never
+// shared.
 func (d *Discovery) Project(label, dir string, applicationPort int) *Project {
 	p := d.Template // copy
 	p.Name = label
@@ -249,6 +250,7 @@ func (d *Discovery) Project(label, dir string, applicationPort int) *Project {
 	p.SupervisorPort = d.SupervisorPort()
 	p.ApplicationPort = applicationPort
 	p.Env = copyEnv(p.Env)
+	p.EnvFile = copyEnvFiles(p.EnvFile)
 	p.applyDefaults()
 	return &p
 }

@@ -6,24 +6,35 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/michael-hewitt/herd-wake/internal/config"
+	"github.com/michael-hewitt/herd-wake/internal/envfile"
 )
 
 // RunPortCommand runs a discovery entry's port_command in the worktree at
-// dir (via /bin/sh -c, with the template's env and node_path applied like
-// the project's own command gets them) and parses the port it prints: a
-// bare number, a URL, or a trailing integer (see parsePort). A run is
-// bounded by timeout (DefaultPortCommandTimeout when zero).
+// dir (via /bin/sh -c, with the template's env, env_file and node_path
+// applied like the project's own command gets them) and parses the port it
+// prints: a bare number, a URL, or a trailing integer (see parsePort). A
+// run is bounded by timeout (DefaultPortCommandTimeout when zero).
+//
+// An env_file that cannot be read or parsed fails the run like the command
+// itself failing; the error names the file and the line, never a value.
 func RunPortCommand(ctx context.Context, dir, command string, template *config.Project, timeout time.Duration) (int, error) {
+	// The port_command gets exactly the environment the dev server will get,
+	// env files included, because a probe that cannot see the variables the
+	// server is configured with reports a port for a different server. The
+	// env-file permission warnings are dropped here: this runner has no
+	// logger, and the supervisor logs the same warnings at every start of
+	// the same project, so nothing is lost by staying silent.
+	env, _, err := envfile.ChildEnv(template, dir)
+	if err != nil {
+		return 0, fmt.Errorf("%q: %w", command, err)
+	}
 	if timeout <= 0 {
 		timeout = DefaultPortCommandTimeout
 	}
@@ -32,12 +43,12 @@ func RunPortCommand(ctx context.Context, dir, command string, template *config.P
 
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", command)
 	cmd.Dir = dir
-	cmd.Env = commandEnv(template)
+	cmd.Env = env
 	cmd.WaitDelay = time.Second
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	err := cmd.Run()
+	err = cmd.Run()
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return 0, fmt.Errorf("%q timed out after %s", command, timeout)
 	}
@@ -49,29 +60,6 @@ func RunPortCommand(ctx context.Context, dir, command string, template *config.P
 		return 0, fmt.Errorf("%q: %v", command, err)
 	}
 	return port, nil
-}
-
-// commandEnv mirrors the environment a project's command gets: the
-// current environment, PATH with node_path prepended, and the template's
-// env entries (later entries win).
-func commandEnv(template *config.Project) []string {
-	env := os.Environ()
-	if template.NodePath != "" {
-		dir := template.NodePath
-		if info, err := os.Stat(dir); err != nil || !info.IsDir() {
-			dir = filepath.Dir(dir)
-		}
-		env = append(env, "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	}
-	keys := make([]string, 0, len(template.Env))
-	for k := range template.Env {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		env = append(env, k+"="+template.Env[k])
-	}
-	return env
 }
 
 // outputHint appends the command's output (stderr first) to an error.

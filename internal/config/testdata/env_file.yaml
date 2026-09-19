@@ -1,0 +1,28 @@
+# The two shapes of env_file — one path and a list of paths — plus the
+# diagnostic_logs opt-out. Every path here is relative, so the fixture loads
+# on any machine: a relative env file is resolved against working_directory
+# at start time and is allowed to be missing.
+projects:
+  scalar:
+    public_url: https://scalar.test
+    supervisor_port: 7101
+    application_port: 17101
+    working_directory: /tmp
+    command: npm run dev
+    env_file: .env.preview
+  listed:
+    public_url: https://listed.test
+    supervisor_port: 7102
+    application_port: 17102
+    working_directory: /tmp
+    command: npm run dev
+    env_file:
+      - shared.env
+      - .env.preview
+    diagnostic_logs: false
+  bare:
+    public_url: https://bare.test
+    supervisor_port: 7103
+    application_port: 17103
+    working_directory: /tmp
+    command: npm run dev

@@ -13,13 +13,17 @@
 //	§18.10 TestDaemonRestartLeavesProjectsStopped
 //	#14    TestWildcardWorktreesServedByHost
 //	#11    TestPlainNodeServerCommand
+//	#12    TestPreviewForwardedHeadersBehindNginx
+//	#12    TestPreviewEnvFileAndSafeDiagnostics
 package e2e
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -459,4 +463,274 @@ func getHost(t *testing.T, port int, host, path string) (int, string) {
 		t.Fatal(err)
 	}
 	return resp.StatusCode, string(body)
+}
+
+// getHostHeaders performs GET http://127.0.0.1:port/path with an explicit
+// Host header and any extra request headers, the shape a front proxy puts
+// on the wire when it forwards to a herd-wake listener.
+func getHostHeaders(t *testing.T, port int, host, path string, headers map[string]string) (int, string) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d%s", port, path), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = host
+	for name, value := range headers {
+		req.Header.Set(name, value)
+	}
+	resp, err := supervisorClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", host, err)
+	}
+	defer resp.Body.Close() //nolint:errcheck // body fully read below
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp.StatusCode, string(body)
+}
+
+// writeWorktree creates <workspace>/<label> as a servable worktree: a .git
+// directory so it looks like one, the given server.js, and a port file for
+// the entry's `port_command: cat port`. It returns the worktree's path so
+// callers can drop further files (an env file) into it.
+func writeWorktree(t *testing.T, workspace, label, serverJS string, port int) string {
+	t.Helper()
+	dir := filepath.Join(workspace, label)
+	if err := os.MkdirAll(filepath.Join(dir, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "server.js"), []byte(serverJS), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "port"), []byte(fmt.Sprint(port)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// Forwarded headers behind nginx (issue #12): a branch server reached
+// through a wildcard listener must see what the README's preview-box nginx
+// block sends — the public host, the real client appended to
+// X-Forwarded-For with herd-wake's own hop, and X-Forwarded-Proto: https so
+// the app generates https URLs. The request carries exactly the block's
+// headers for client 203.0.113.9 over TLS, including the unconditional
+// `Connection: upgrade` whose empty $http_upgrade drops the Upgrade header,
+// which must still be handled as an ordinary request.
+func TestPreviewForwardedHeadersBehindNginx(t *testing.T) {
+	requireE2E(t)
+	ports := freePorts(t, 2)
+	workspace := t.TempDir()
+	const host = "alpha.fwd.test"
+	writeWorktree(t, workspace, "alpha", `const http = require('http');
+const port = Number(require('fs').readFileSync('port', 'utf8'));
+http.createServer((req, res) => {
+  res.setHeader('content-type', 'application/json');
+  res.end(JSON.stringify({
+    host: req.headers['host'] || '',
+    forwarded_for: req.headers['x-forwarded-for'] || '',
+    forwarded_proto: req.headers['x-forwarded-proto'] || '',
+    forwarded_host: req.headers['x-forwarded-host'] || '',
+    upgrade: req.headers['upgrade'] || '',
+  }));
+}).listen(port, '127.0.0.1');
+`, ports[1])
+
+	startDaemon(t, fmt.Sprintf(`discovery:
+  - name: fwd
+    mode: wildcard
+    base_domain: fwd.test
+    supervisor_port: %d
+    directory: %s
+    require_files: [server.js]
+    port_command: cat port
+    command: node server.js
+    startup_timeout_seconds: 60
+`, ports[0], workspace))
+
+	code, body := getHostHeaders(t, ports[0], host, "/", map[string]string{
+		"X-Forwarded-For":   "203.0.113.9",
+		"X-Forwarded-Proto": "https",
+		"X-Forwarded-Host":  host,
+		"Connection":        "upgrade", // nginx sets it unconditionally; $http_upgrade was empty
+	})
+	if code != http.StatusOK {
+		t.Fatalf("GET %s: status %d, want 200; body:\n%s", host, code, body)
+	}
+
+	var got map[string]string
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("branch server body is not the header dump: %v\nbody: %q", err, body)
+	}
+	want := map[string]string{
+		"host":            host,
+		"forwarded_for":   "203.0.113.9, 127.0.0.1",
+		"forwarded_proto": "https",
+		"forwarded_host":  host,
+		"upgrade":         "",
+	}
+	for _, key := range []string{"host", "forwarded_for", "forwarded_proto", "forwarded_host", "upgrade"} {
+		if got[key] != want[key] {
+			t.Errorf("branch server saw %s = %q, want %q", key, got[key], want[key])
+		}
+	}
+}
+
+// The preview-box scenario (issue #12): a wildcard entry over a folder of
+// prepped branches, its secrets in env files rather than the config, and
+// `diagnostic_logs: false` so the pages a reviewer can reach over the
+// internet say nothing private. It asserts both halves of that bargain —
+// the branch server really receives the shared and per-worktree variables,
+// and the database password reaches nothing public: not a 503 (plain or
+// HTML), not `status --json`, not `herd-wake projects`, not the daemon's
+// own log — while `herd-wake logs`, the operator's view on the host, stays
+// complete. A world-readable shared env file must also earn a warning.
+func TestPreviewEnvFileAndSafeDiagnostics(t *testing.T) {
+	requireE2E(t)
+	const secret = "hunter2"
+	const dbLogin = "postgres://syp:" + secret + "@localhost/staging"
+	ports := freePorts(t, 3)
+	workspace := t.TempDir()
+
+	// The shared template file, deliberately 0644 so the daemon's
+	// permission warning is exercised; the per-worktree file is 0600 as the
+	// README tells operators to write it.
+	sharedEnv := filepath.Join(t.TempDir(), "preview.env")
+	if err := os.WriteFile(sharedEnv, []byte("DB_LOGIN="+dbLogin+"\nENVIRONMENT=preview\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// WriteFile's mode is masked by the umask, and the warning under test
+	// only fires on a file other users can read: force it.
+	if err := os.Chmod(sharedEnv, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	alpha := writeWorktree(t, workspace, "alpha", `const http = require('http');
+const port = Number(require('fs').readFileSync('port', 'utf8'));
+http.createServer((req, res) => {
+  res.setHeader('content-type', 'application/json');
+  res.end(JSON.stringify({
+    DB_LOGIN: process.env.DB_LOGIN || '',
+    ENVIRONMENT: process.env.ENVIRONMENT || '',
+    SUPPRESS_DB_TESTS: process.env.SUPPRESS_DB_TESTS || '',
+    BRANCH_DB: process.env.BRANCH_DB || '',
+  }));
+}).listen(port, '127.0.0.1');
+`, ports[1])
+	if err := os.WriteFile(filepath.Join(alpha, ".env.preview"),
+		[]byte("SUPPRESS_DB_TESTS=1\nBRANCH_DB=staging_copy_alpha\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// A branch whose server dies at once, having printed the secret it was
+	// given: the worst case for a public diagnostic.
+	writeWorktree(t, workspace, "broken", `process.stderr.write('DB_LOGIN is ' + process.env.DB_LOGIN + '\n');
+process.exit(1);
+`, ports[2])
+
+	d := startDaemon(t, fmt.Sprintf(`discovery:
+  - name: preview
+    mode: wildcard
+    base_domain: preview.test
+    supervisor_port: %d
+    directory: %s
+    require_files: [server.js]
+    port_command: cat port
+    command: node server.js
+    env_file:
+      - %s
+      - .env.preview
+    diagnostic_logs: false
+    startup_timeout_seconds: 60
+`, ports[0], workspace, sharedEnv))
+
+	// The healthy branch receives both files' variables.
+	code, body := getHost(t, ports[0], "alpha.preview.test", "/")
+	if code != http.StatusOK {
+		t.Fatalf("GET alpha.preview.test: status %d, want 200; body:\n%s", code, body)
+	}
+	var got map[string]string
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("alpha body is not the env dump: %v\nbody: %q", err, body)
+	}
+	want := map[string]string{
+		"DB_LOGIN":          dbLogin,
+		"ENVIRONMENT":       "preview",
+		"SUPPRESS_DB_TESTS": "1",
+		"BRANCH_DB":         "staging_copy_alpha",
+	}
+	for _, name := range []string{"DB_LOGIN", "ENVIRONMENT", "SUPPRESS_DB_TESTS", "BRANCH_DB"} {
+		if got[name] != want[name] {
+			t.Errorf("branch server received %s = %q, want %q", name, got[name], want[name])
+		}
+	}
+
+	// Starting it warned about the shared file's mode, without quoting it.
+	if out := d.output.String(); !strings.Contains(out, "readable by other users") {
+		t.Errorf("daemon output has no permission warning for the 0644 shared env file:\n%s", out)
+	}
+
+	// The broken branch's 503, in both renderings, is terse: it names the
+	// branch and where the operator reads its output, and nothing else.
+	for _, tt := range []struct {
+		name    string
+		headers map[string]string
+	}{
+		{name: "plain text"},
+		{name: "html", headers: map[string]string{"Accept": "text/html"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			code, body := getHostHeaders(t, ports[0], "broken.preview.test", "/", tt.headers)
+			if code != http.StatusServiceUnavailable {
+				t.Fatalf("GET broken.preview.test: status %d, want 503; body:\n%s", code, body)
+			}
+			for _, want := range []string{"broken", "diagnostic_logs: false", "herd-wake logs broken"} {
+				if !strings.Contains(body, want) {
+					t.Errorf("503 body does not contain %q:\n%s", want, body)
+				}
+			}
+			for _, unwanted := range []string{secret, "DB_LOGIN is"} {
+				if strings.Contains(body, unwanted) {
+					t.Errorf("503 body leaks %q:\n%s", unwanted, body)
+				}
+			}
+		})
+	}
+
+	// A label with no worktree reveals neither the workspace nor a path.
+	code, body = getHost(t, ports[0], "nope.preview.test", "/")
+	if code != http.StatusNotFound {
+		t.Fatalf("GET nope.preview.test: status %d, want 404; body:\n%s", code, body)
+	}
+	if strings.Contains(body, workspace) {
+		t.Errorf("404 body leaks the workspace path %q:\n%s", workspace, body)
+	}
+
+	// On the host, the operator still sees everything the branch printed.
+	logs, err := d.cli("logs", "broken")
+	if err != nil {
+		t.Fatalf("herd-wake logs broken: %v\n%s", err, logs)
+	}
+	if !strings.Contains(logs, secret) {
+		t.Errorf("herd-wake logs broken does not show the process output:\n%s", logs)
+	}
+
+	// Nothing an operator might paste or share carries the password.
+	statusJSON, err := d.cli("status", "--json")
+	if err != nil {
+		t.Fatalf("herd-wake status --json: %v\n%s", err, statusJSON)
+	}
+	if strings.Contains(statusJSON, secret) {
+		t.Errorf("herd-wake status --json leaks the env-file value:\n%s", statusJSON)
+	}
+	projects, err := exec.Command(binPath, "projects", "--config", d.configPath).CombinedOutput() //nolint:gosec // test binary + fixed args
+	if err != nil {
+		t.Fatalf("herd-wake projects: %v\n%s", err, projects)
+	}
+	if strings.Contains(string(projects), secret) {
+		t.Errorf("herd-wake projects leaks the env-file value:\n%s", projects)
+	}
+	if out := d.output.String(); strings.Contains(out, secret) {
+		t.Errorf("daemon output leaks the env-file value:\n%s", out)
+	}
 }

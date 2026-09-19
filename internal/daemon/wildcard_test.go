@@ -1,9 +1,11 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -43,6 +45,35 @@ type wildcardFixture struct {
 	// holdMaxWait is the template's hold_max_wait_seconds.
 	maxRunning  int
 	holdMaxWait int
+	// logs, when captureLogs was called before start, collects the daemon's
+	// own log output so a test can assert what an operator would read on
+	// the host.
+	logs *logSink
+}
+
+// logSink collects a daemon's log output for a test to read back. The
+// daemon logs from several goroutines at once, so the buffer is guarded.
+type logSink struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *logSink) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *logSink) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+// captureLogs makes start give the daemon a logger writing into f.logs.
+// It must be called before start.
+func (f *wildcardFixture) captureLogs() {
+	f.logs = &logSink{}
 }
 
 func newWildcardFixture(t *testing.T) *wildcardFixture {
@@ -184,7 +215,11 @@ func (f *wildcardFixture) start() {
 	if err != nil {
 		f.t.Fatalf("load fixture config: %v", err)
 	}
-	f.d, f.socket, _, _ = startDaemonFor(f.t, cfg)
+	var logger *log.Logger
+	if f.logs != nil {
+		logger = log.New(f.logs, "", 0)
+	}
+	f.d, f.socket, _, _ = startDaemonFor(f.t, cfg, logger)
 	f.client = control.NewClient(f.socket)
 }
 
@@ -603,6 +638,96 @@ func TestWildcardResolutionFailures(t *testing.T) {
 	}
 	if names := f.statusProjects(); len(names) != 1 || names[0].Name != "a" {
 		t.Errorf("status = %+v, want only a", names)
+	}
+}
+
+// TestWildcardTerseDiagnostics: an entry whose template sets
+// diagnostic_logs: false answers a hostname it cannot serve with the label
+// and nothing else — no workspace path, no port_command text or output —
+// while the daemon log on the host keeps the full reason. The default
+// entry is unchanged and still explains everything on the page.
+func TestWildcardTerseDiagnostics(t *testing.T) {
+	t.Run("terse", func(t *testing.T) {
+		f := newWildcardFixture(t)
+		f.captureLogs()
+		f.worktree("broken")
+		f.setPort("broken", "not-a-port")
+		f.writeConfig("    diagnostic_logs: false\n", "")
+		f.start()
+
+		code, body, _ := f.get(f.host("nope"), "/", nil)
+		if code != http.StatusNotFound || !strings.Contains(body, `no worktree named "nope"`) {
+			t.Fatalf("nope = %d; body:\n%s", code, body)
+		}
+		assertTerse(t, "404 for nope", body, f.workspace)
+
+		code, body, _ = f.get(f.host("broken"), "/", nil)
+		if code != http.StatusServiceUnavailable || !strings.Contains(body, `worktree "broken" cannot be served`) {
+			t.Fatalf("broken = %d; body:\n%s", code, body)
+		}
+		assertTerse(t, "503 for broken", body, f.workspace, "not-a-port", "port_command", "cat port")
+
+		logs := f.logs.String()
+		for _, want := range []string{f.workspace, "not-a-port", "port_command"} {
+			if !strings.Contains(logs, want) {
+				t.Errorf("daemon log missing %q; got:\n%s", want, logs)
+			}
+		}
+	})
+
+	t.Run("terse name conflict", func(t *testing.T) {
+		f := newWildcardFixture(t)
+		f.captureLogs()
+		f.worktree("a")
+		staticPorts := [2]int{freePort(t), freePort(t)}
+		f.writeConfig("    diagnostic_logs: false\n", fmt.Sprintf(`  a:
+    public_url: https://a.test
+    supervisor_port: %d
+    application_port: %d
+    working_directory: %s
+    command: sleep 300
+    readiness_strategy: tcp
+`, staticPorts[0], staticPorts[1], f.dir))
+		f.start()
+
+		code, body, _ := f.get(f.host("a"), "/", nil)
+		if code != http.StatusServiceUnavailable || !strings.Contains(body, `worktree "a" cannot be served`) {
+			t.Fatalf("label a with a static a = %d; body:\n%s", code, body)
+		}
+		if !strings.Contains(body, "A project of this name is already registered") {
+			t.Errorf("503 for a conflicting name is not the terse wording; body:\n%s", body)
+		}
+		assertTerse(t, "503 for the name conflict", body, "config.yaml")
+
+		if logs := f.logs.String(); !strings.Contains(logs, `already registered (from config.yaml)`) {
+			t.Errorf("daemon log does not name the conflicting project's source; got:\n%s", logs)
+		}
+	})
+
+	t.Run("default", func(t *testing.T) {
+		f := newWildcardFixture(t)
+		f.writeConfig("", "")
+		f.start()
+
+		code, body, _ := f.get(f.host("nope"), "/", nil)
+		if code != http.StatusNotFound || !strings.Contains(body, f.workspace) {
+			t.Errorf("nope by default = %d, want a 404 naming %s; body:\n%s", code, f.workspace, body)
+		}
+	})
+}
+
+// assertTerse fails when a diagnostic body quotes anything an operator
+// would not want on a publicly reachable URL, and when it forgets to point
+// at the daemon log instead.
+func assertTerse(t *testing.T, what, body string, secrets ...string) {
+	t.Helper()
+	for _, secret := range secrets {
+		if strings.Contains(body, secret) {
+			t.Errorf("%s leaks %q; body:\n%s", what, secret, body)
+		}
+	}
+	if !strings.Contains(body, "daemon log") {
+		t.Errorf("%s does not point at the daemon log; body:\n%s", what, body)
 	}
 }
 

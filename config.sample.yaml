@@ -122,6 +122,42 @@ projects:
     env:
       APP_ENV: local
 
+    # Optional. Files of NAME=value lines read into the dev server's
+    # environment at every start (and before every port_command run), for
+    # values that should not sit in this file — a database password, an API
+    # token. Give one path (env_file: ~/secrets/dashboard.env) or a list,
+    # read in order: a later file wins over an earlier one, the env: map
+    # above wins over them all, and all of them win over the daemon's own
+    # environment. An absolute path is a shared file and must exist (a
+    # missing one is a config error, and a start fails if it vanishes
+    # later); a relative path is resolved against working_directory and is
+    # optional — a missing one is skipped, which is how a per-worktree file
+    # is expressed. A leading "~/" is expanded.
+    #
+    # The format is a dotenv subset: one NAME=value per line (a shell
+    # identifier, with an optional "export " prefix); blank lines and lines
+    # starting with # ignored, and NO inline comments, so a # inside a value
+    # needs no quoting; single quotes taken literally, double quotes
+    # honouring \n, \" and \\; an unquoted value trimmed of surrounding
+    # whitespace and otherwise verbatim. A bad line fails the start naming
+    # the file and the line number, never the line's content.
+    #
+    # Nothing is cached, so editing a file needs no reload — the next start
+    # picks it up, and it is not a "change" a reload acts on. herd-wake
+    # never prints a value from one of these files, anywhere. Keep the
+    # config directory 0700 and these files 0600; a file other users can
+    # read is a warning in the daemon's log at every start.
+    # env_file: [~/secrets/dashboard.env, .env.local]
+
+    # Optional. Whether the 404 and 503 diagnostic pages may quote this
+    # project's recent process output and filesystem paths. Default: true,
+    # which is what you want at a local .test URL. Set it to false for a
+    # server whose URL is reachable by other people: the page then shows
+    # the state, the exit status, and a pointer to `herd-wake logs <name>`
+    # on the host only — no process output, no last error, no paths — while
+    # the full detail still goes to the daemon log, so you lose nothing.
+    # diagnostic_logs: true
+
     # Optional. Absolute path to the node executable to put first on PATH,
     # for projects pinned to a specific Node version. Default: whatever
     # `node` resolves to.
@@ -326,13 +362,35 @@ discovery:
     max_running: 2
 
     # Any other per-project field is accepted here and copied verbatim to
-    # every worktree project: env, node_path, rewrite_host,
-    # readiness_strategy, startup_timeout_seconds, idle_timeout_minutes,
-    # websockets_keep_alive, shutdown_*, log_retention_days, always_on,
-    # hold_*, listen_host, ... public_url, host, application_port, and
-    # working_directory are generated and therefore rejected in a template.
+    # every worktree project: env, env_file, diagnostic_logs, node_path,
+    # rewrite_host, readiness_strategy, startup_timeout_seconds,
+    # idle_timeout_minutes, websockets_keep_alive, shutdown_*,
+    # log_retention_days, always_on, hold_*, listen_host, ... public_url,
+    # host, application_port, and working_directory are generated and
+    # therefore rejected in a template.
     env:
       ENVIRONMENT: dev
+
+    # Env files for every worktree of this entry, read at each start and
+    # before each port_command run (format, precedence and permissions:
+    # see example 1). A single path may be written on its own
+    # (env_file: /etc/herd-wake/preview.env). The absolute one here is the
+    # shared file all worktrees get and must exist; the relative one is
+    # resolved against each worktree and is optional, so a branch that
+    # dropped a .env.preview next to its checkout gets it and one that did
+    # not still starts. Keep them 0600: herd-wake warns in its log about a
+    # file other users can read.
+    env_file: [/etc/herd-wake/preview.env, .env.preview]
+
+    # Keep the diagnostics terse for worktrees served on a hostname other
+    # people can reach: a 404 for an unknown label and a 503 for a failed
+    # start name the label only, with no paths and no port_command or
+    # process output, pointing at `herd-wake logs <label>` and the daemon
+    # log instead. The full reason still goes to the daemon log, so an
+    # operator on the host loses nothing. See the README's "Preview servers
+    # on a staging box" for the whole setup.
+    diagnostic_logs: false
+
     rewrite_host: true
     readiness_strategy: tcp
     startup_timeout_seconds: 180

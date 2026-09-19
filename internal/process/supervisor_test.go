@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -789,4 +790,227 @@ func TestStopAsyncReturnsOnceStopping(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Error("StopAsync on a stopped project should return a closed channel")
 	}
+}
+
+// writeEnvFile writes an env file with the given mode, creating its parent
+// directories, and fails the test if it cannot.
+func writeEnvFile(t *testing.T, path, content string, mode os.FileMode) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), mode); err != nil {
+		t.Fatal(err)
+	}
+	// WriteFile's mode is masked by the umask; force the mode we asked for,
+	// so a 0600 file really is 0600 and a deliberately loose one really is
+	// readable by other users under any umask the suite runs with.
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// envReportingCommand wraps the project's helper command in a shell line
+// that records the child's view of the named variables, one per line, in
+// "env.txt" inside the working directory before exec'ing the helper. It is
+// how these tests observe an environment that must never be printed
+// anywhere else.
+func envReportingCommand(p *config.Project, names ...string) string {
+	var b strings.Builder
+	for _, name := range names {
+		redirect := ">>"
+		if b.Len() == 0 {
+			redirect = ">"
+		}
+		b.WriteString("printenv " + name + " " + redirect + " env.txt; ")
+	}
+	return b.String() + "exec " + p.Command
+}
+
+// readEnvReport waits for envReportingCommand's file and returns its lines.
+func readEnvReport(t *testing.T, dir string) []string {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(filepath.Join(dir, "env.txt"))
+		if err == nil && len(data) > 0 {
+			return strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("the process never wrote its environment report")
+	return nil
+}
+
+// TestEnvFilesReachProcessInPrecedenceOrder: a shared absolute env file and
+// a per-worktree relative one both reach the child — the helper itself is
+// configured entirely from the shared file — with the later file beating
+// the earlier one and the inline env map beating both.
+func TestEnvFilesReachProcessInPrecedenceOrder(t *testing.T) {
+	p := helperProject(t, testproc.ModeListen)
+	shared := filepath.Join(t.TempDir(), "preview.env")
+	writeEnvFile(t, shared, "# shared by every preview\n"+
+		"export "+testproc.EnvMode+"="+testproc.ModeListen+"\n"+
+		testproc.EnvPort+"="+strconv.Itoa(p.ApplicationPort)+"\n"+
+		"DB_LOGIN='postgres://app:hunter2@db/app'\n"+
+		"ENVIRONMENT=shared\n"+
+		"INLINE_WINS=from-file\n", 0o600)
+	writeEnvFile(t, filepath.Join(p.WorkingDirectory, ".env.preview"),
+		"ENVIRONMENT=per-worktree\n", 0o600)
+	p.EnvFile = config.EnvFiles{shared, ".env.preview"}
+	p.Env = map[string]string{"INLINE_WINS": "from-inline"}
+	p.Command = envReportingCommand(p, "DB_LOGIN", "ENVIRONMENT", "INLINE_WINS")
+	s := newTestSupervisor(t, p)
+
+	if err := awaitStartup(t, s.EnsureStarted()); err != nil {
+		t.Fatalf("EnsureStarted: %v", err)
+	}
+
+	want := []string{"postgres://app:hunter2@db/app", "per-worktree", "from-inline"}
+	got := readEnvReport(t, p.WorkingDirectory)
+	if len(got) != len(want) {
+		t.Fatalf("child environment report = %q, want %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("report line %d = %q, want %q", i+1, got[i], want[i])
+		}
+	}
+}
+
+// TestMissingRelativeEnvFileIsSkipped: a worktree without the per-worktree
+// file is the normal case, so the start must succeed.
+func TestMissingRelativeEnvFileIsSkipped(t *testing.T) {
+	p := helperProject(t, testproc.ModeListen)
+	p.EnvFile = config.EnvFiles{".env.preview"}
+	s := newTestSupervisor(t, p)
+
+	if err := awaitStartup(t, s.EnsureStarted()); err != nil {
+		t.Fatalf("EnsureStarted with a missing optional env file: %v", err)
+	}
+	if got := s.Snapshot().State; got != StateRunning {
+		t.Errorf("state = %q, want %q", got, StateRunning)
+	}
+}
+
+// TestMissingAbsoluteEnvFileFailsTheStart: a shared secrets file that has
+// vanished is loud — the start fails naming the path, nothing is spawned,
+// and the supervisor lands in failed like any other startup failure.
+func TestMissingAbsoluteEnvFileFailsTheStart(t *testing.T) {
+	p := helperProject(t, testproc.ModeListen)
+	missing := filepath.Join(t.TempDir(), "preview.env")
+	p.EnvFile = config.EnvFiles{missing}
+	p.Command = "touch spawned; " + p.Command
+	s := newTestSupervisor(t, p)
+
+	err := awaitStartup(t, s.EnsureStarted())
+
+	if err == nil {
+		t.Fatal("EnsureStarted should fail when a required env file is missing")
+	}
+	if !strings.Contains(err.Error(), missing) {
+		t.Errorf("error = %q, want it to name %q", err, missing)
+	}
+	snap := s.Snapshot()
+	if snap.State != StateFailed {
+		t.Errorf("state = %q, want %q", snap.State, StateFailed)
+	}
+	if snap.LastError == "" {
+		t.Error("LastError should be set after a failed start")
+	}
+	if snap.PID != 0 {
+		t.Errorf("PID = %d, want no process", snap.PID)
+	}
+	if _, err := os.Stat(filepath.Join(p.WorkingDirectory, "spawned")); !os.IsNotExist(err) {
+		t.Error("the command ran although the environment could not be built")
+	}
+}
+
+// TestMalformedEnvFileFailsTheStartWithoutItsContent: a bad line is
+// reported by number only. The line here carries a password, which must
+// appear in neither the error nor the recorded failure.
+func TestMalformedEnvFileFailsTheStartWithoutItsContent(t *testing.T) {
+	p := helperProject(t, testproc.ModeListen)
+	bad := filepath.Join(t.TempDir(), "preview.env")
+	writeEnvFile(t, bad, "ENVIRONMENT=preview\nFOO hunter2\n", 0o600)
+	p.EnvFile = config.EnvFiles{bad}
+	s := newTestSupervisor(t, p)
+
+	err := awaitStartup(t, s.EnsureStarted())
+
+	if err == nil {
+		t.Fatal("EnsureStarted should fail on a malformed env file")
+	}
+	if !strings.Contains(err.Error(), "line 2") {
+		t.Errorf("error = %q, want it to name the bad line", err)
+	}
+	if strings.Contains(err.Error(), "hunter2") {
+		t.Errorf("error = %q; it must not quote the line's content", err)
+	}
+	if got := s.Snapshot().LastError; strings.Contains(got, "hunter2") {
+		t.Errorf("LastError = %q; it must not quote the line's content", got)
+	}
+	if got := s.Snapshot().State; got != StateFailed {
+		t.Errorf("state = %q, want %q", got, StateFailed)
+	}
+}
+
+// TestWorldReadableEnvFileWarnsAtEveryStart: a chmod mistake on a secrets
+// file is visible in the daemon log, every time, with the path and mode but
+// no content — and it never refuses the start.
+func TestWorldReadableEnvFileWarnsAtEveryStart(t *testing.T) {
+	p := helperProject(t, testproc.ModeListen)
+	loose := filepath.Join(t.TempDir(), "preview.env")
+	writeEnvFile(t, loose, "DB_LOGIN=hunter2\n", 0o644)
+	p.EnvFile = config.EnvFiles{loose}
+	logs := &lockedBuffer{}
+	s := NewSupervisor(p, t.TempDir(), log.New(logs, "", 0))
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := s.Stop(ctx); err != nil {
+			t.Errorf("cleanup stop: %v", err)
+		}
+	})
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		if err := awaitStartup(t, s.EnsureStarted()); err != nil {
+			t.Fatalf("EnsureStarted (attempt %d): %v", attempt, err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		err := s.Stop(ctx)
+		cancel()
+		if err != nil {
+			t.Fatalf("stop (attempt %d): %v", attempt, err)
+		}
+	}
+
+	out := logs.String()
+	if got := strings.Count(out, "readable by other users"); got != 2 {
+		t.Errorf("permission warning logged %d times, want once per start; log:\n%s", got, out)
+	}
+	if !strings.Contains(out, loose) {
+		t.Errorf("warning does not name the file; log:\n%s", out)
+	}
+	if strings.Contains(out, "hunter2") {
+		t.Errorf("the log must never contain an env value; log:\n%s", out)
+	}
+}
+
+// lockedBuffer collects log output from the supervisor's goroutines.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }

@@ -275,6 +275,46 @@ func TestSyncWritesManagedFileWithStablePorts(t *testing.T) {
 	}
 }
 
+// TestSyncCopiesTemplateEnvFilesPerProject: a proxy-mode template carrying
+// env_file and diagnostic_logs gives every generated project both fields —
+// each with its own env_file slice, never the template's — and the managed
+// file it writes still loads as part of the whole configuration, which is
+// what a reload does with it.
+func TestSyncCopiesTemplateEnvFilesPerProject(t *testing.T) {
+	f := newFixture(t)
+	for _, name := range []string{"issue-1", "issue-2"} {
+		f.worktree(name)
+	}
+	shared := filepath.Join(t.TempDir(), "shared.env")
+	if err := os.WriteFile(shared, []byte("DB_LOGIN=postgres://app:hunter2@db/app\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.writeConfig("", fmt.Sprintf("    env_file: [%s, .env.preview]\n    diagnostic_logs: false\n", shared))
+
+	res := f.sync(Options{Herd: f.herd(testproc.FakeHerd{})})
+	if len(res.Errors) > 0 {
+		t.Fatalf("errors: %v", res.Errors)
+	}
+
+	projects := f.managed()
+	for _, name := range []string{"issue-1", "issue-2"} {
+		p := projects[name]
+		if p == nil {
+			t.Fatalf("managed file has no project %q", name)
+		}
+		want := config.EnvFiles{shared, ".env.preview"}
+		if len(p.EnvFile) != len(want) || p.EnvFile[0] != want[0] || p.EnvFile[1] != want[1] {
+			t.Errorf("%s env_file = %q, want %q", name, p.EnvFile, want)
+		}
+		if p.DiagnosticLogs == nil || *p.DiagnosticLogs {
+			t.Errorf("%s diagnostic_logs = %v, want false", name, p.DiagnosticLogs)
+		}
+	}
+	if _, err := config.Load(f.configPath); err != nil {
+		t.Errorf("generated config does not load: %v", err)
+	}
+}
+
 func TestSyncRemovesDeletedWorktreeAndUnproxies(t *testing.T) {
 	f := newFixture(t)
 	f.worktree("keep")
@@ -488,6 +528,54 @@ func TestSyncPortCommandTimeout(t *testing.T) {
 	s := findSkip(t, res.Skipped, "slow")
 	if !strings.Contains(s.Reason, "timed out") {
 		t.Errorf("slow skip reason = %q", s.Reason)
+	}
+}
+
+// TestRunPortCommandSeesEnvFile: the probe runs with the same environment
+// the dev server will get, so a port kept in a per-worktree env file is
+// what the port_command can print. The file is relative and therefore
+// resolved against the worktree, which is what a prep script drops in.
+func TestRunPortCommandSeesEnvFile(t *testing.T) {
+	dir := t.TempDir()
+	shared := filepath.Join(t.TempDir(), "preview.env")
+	if err := os.WriteFile(shared, []byte("PREVIEW_PORT=4700\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".env.preview"), []byte("PREVIEW_PORT=4711\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	template := &config.Project{EnvFile: config.EnvFiles{shared, ".env.preview"}}
+
+	port, err := RunPortCommand(context.Background(), dir, `printf '%s' "$PREVIEW_PORT"`, template, time.Second)
+
+	if err != nil {
+		t.Fatalf("RunPortCommand: %v", err)
+	}
+	if port != 4711 {
+		t.Errorf("port = %d, want 4711 (the per-worktree file overriding the shared one)", port)
+	}
+}
+
+// TestRunPortCommandMalformedEnvFileFails: a broken secrets file fails the
+// probe with the file and line, and never the line's content.
+func TestRunPortCommandMalformedEnvFileFails(t *testing.T) {
+	dir := t.TempDir()
+	bad := filepath.Join(dir, ".env.preview")
+	if err := os.WriteFile(bad, []byte("PREVIEW_PORT=4711\nFOO hunter2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	template := &config.Project{EnvFile: config.EnvFiles{".env.preview"}}
+
+	_, err := RunPortCommand(context.Background(), dir, "echo 4711", template, time.Second)
+
+	if err == nil {
+		t.Fatal("RunPortCommand should fail on a malformed env file")
+	}
+	if !strings.Contains(err.Error(), bad) || !strings.Contains(err.Error(), "line 2") {
+		t.Errorf("error = %q, want it to name the file and line 2", err)
+	}
+	if strings.Contains(err.Error(), "hunter2") {
+		t.Errorf("error = %q; it must not quote the line's content", err)
 	}
 }
 

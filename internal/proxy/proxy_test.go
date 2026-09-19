@@ -196,6 +196,93 @@ func TestProxyChainsHerdForwardedHeaders(t *testing.T) {
 	}
 }
 
+// nginxPreviewHost is the public hostname of the preview-box scenario: one
+// branch server behind the README's wildcard nginx block.
+const nginxPreviewHost = "feat-huddle.preview.example.com"
+
+// TestProxyChainsNginxForwardedHeaders sends exactly what the README's
+// "Bring your own proxy" nginx block puts on the wire for a first-hop client
+// over TLS — Host/X-Forwarded-Host $host, X-Forwarded-For
+// $proxy_add_x_forwarded_for (just the client, no prior header),
+// X-Forwarded-Proto $scheme, and the unconditional Connection: upgrade with
+// nginx's empty $http_upgrade dropping the Upgrade header entirely — and
+// asserts the branch server sees the public origin and the real client, and
+// that the request is handled as an ordinary one rather than an upgrade.
+func TestProxyChainsNginxForwardedHeaders(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		rewrite  bool
+		wantHost string
+	}{
+		{name: "host preserved", rewrite: false, wantHost: nginxPreviewHost},
+		{name: "rewrite_host", rewrite: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			type seen struct {
+				host, forwardedFor, forwardedProto, forwardedHost, upgrade string
+			}
+			var got seen
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				got = seen{
+					host:           r.Host,
+					forwardedFor:   r.Header.Get("X-Forwarded-For"),
+					forwardedProto: r.Header.Get("X-Forwarded-Proto"),
+					forwardedHost:  r.Header.Get("X-Forwarded-Host"),
+					upgrade:        r.Header.Get("Upgrade"),
+				}
+				fmt.Fprint(w, "branch server")
+			}))
+			defer upstream.Close()
+			port := serverPort(t, upstream)
+
+			p := testProject(port)
+			p.Host = nginxPreviewHost
+			p.PublicURL = "https://" + nginxPreviewHost
+			p.RewriteHost = tt.rewrite
+			wantHost := tt.wantHost
+			if wantHost == "" {
+				wantHost = fmt.Sprintf("127.0.0.1:%d", port)
+			}
+
+			front := httptest.NewServer(New(p, discardLogger()))
+			defer front.Close()
+
+			req, err := http.NewRequest(http.MethodGet, front.URL+"/", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Host = nginxPreviewHost
+			req.Header.Set("X-Forwarded-For", "203.0.113.9")
+			req.Header.Set("X-Forwarded-Proto", "https")
+			req.Header.Set("X-Forwarded-Host", nginxPreviewHost)
+			req.Header.Set("Connection", "upgrade") // nginx sets it unconditionally; $http_upgrade was empty
+			resp, err := front.Client().Do(req)
+			if err != nil {
+				t.Fatalf("request through proxy: %v", err)
+			}
+			defer resp.Body.Close() //nolint:errcheck // test cleanup
+			body, _ := io.ReadAll(resp.Body)
+
+			if resp.StatusCode != http.StatusOK || string(body) != "branch server" {
+				t.Errorf("response = %d %q, want 200 %q (a plain request, not an upgrade)",
+					resp.StatusCode, body, "branch server")
+			}
+			if got.upgrade != "" {
+				t.Errorf("dev server saw Upgrade = %q, want none", got.upgrade)
+			}
+			want := seen{
+				host:           wantHost,
+				forwardedFor:   "203.0.113.9, 127.0.0.1",
+				forwardedProto: "https",
+				forwardedHost:  nginxPreviewHost,
+			}
+			if got != want {
+				t.Errorf("dev server saw %+v, want %+v", got, want)
+			}
+		})
+	}
+}
+
 func TestProxyUpstreamDownReturns503Diagnostic(t *testing.T) {
 	port := freePort(t) // nothing listens here
 	front := httptest.NewServer(New(testProject(port), discardLogger()))

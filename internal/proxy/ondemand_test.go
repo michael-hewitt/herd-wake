@@ -535,3 +535,152 @@ func BenchmarkOnDemandHotPath(b *testing.B) {
 		}
 	})
 }
+
+// noDiagnosticLogsProject is a project whose 503s must reveal nothing the
+// dev server printed — the shape of a preview entry on a publicly reachable
+// staging box.
+func noDiagnosticLogsProject() *config.Project {
+	p := testProject(0)
+	off := false
+	p.DiagnosticLogs = &off
+	return p
+}
+
+// The startup failure a preview box realistically hits, and the part of it
+// that must never reach a public page: a malformed shared env file names
+// the file by absolute path, and the same text becomes the supervisor's
+// last error.
+const (
+	envFileStartFailure = `project "dashboard": env_file /etc/herd-wake/preview.env: line 4: no '=' in line`
+	envFilePath         = "/etc/herd-wake"
+)
+
+// tersePreviewFake is failingFake whose startup error and last error both
+// carry an absolute path, so a terse 503 is tested against the worst text
+// it could repeat rather than a harmless one.
+func tersePreviewFake() *fakeUpstream {
+	fake := failingFake(errors.New(envFileStartFailure))
+	fake.mu.Lock()
+	fake.snap.LastError = envFileStartFailure
+	fake.mu.Unlock()
+	return fake
+}
+
+// TestOnDemandFailureDiagnosticOmitsLogsPlainText: with diagnostic_logs
+// false the plain-text 503 says the project's state and exit status, that
+// it failed to start, and where on the host to read the rest — and neither
+// the failure's own message nor the path in it reaches the page.
+func TestOnDemandFailureDiagnosticOmitsLogsPlainText(t *testing.T) {
+	fake := tersePreviewFake()
+	h := onDemandHandler(t, noDiagnosticLogsProject(), fake)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://dashboard.test/", nil)
+	req.Header.Set("Accept", "*/*") // curl's default: not a browser
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{`Project "dashboard" failed to start.`, "exit status 3", "diagnostic_logs: false", "herd-wake logs dashboard"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("terse plain diagnostic missing %q; got:\n%s", want, body)
+		}
+	}
+	for _, unwanted := range []string{"boom line one", envFilePath, "no '=' in line", "Last error"} {
+		if strings.Contains(body, unwanted) {
+			t.Errorf("terse plain diagnostic leaked %q; got:\n%s", unwanted, body)
+		}
+	}
+}
+
+// TestOnDemandFailureDiagnosticOmitsLogsBackoff: a 503 served during retry
+// backoff is just as terse, but still tells the visitor when the next
+// attempt runs — the one thing a *process.BackoffError says that names no
+// path.
+func TestOnDemandFailureDiagnosticOmitsLogsBackoff(t *testing.T) {
+	fake := tersePreviewFake()
+	retryAt := time.Now().Add(4 * time.Second)
+	fake.ensure = func() <-chan error {
+		ch := make(chan error, 1)
+		ch <- &process.BackoffError{Project: "dashboard", RetryAt: retryAt, Reason: envFileStartFailure}
+		return ch
+	}
+	h := onDemandHandler(t, noDiagnosticLogsProject(), fake)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://dashboard.test/", nil)
+	req.Header.Set("Accept", "*/*")
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{`Project "dashboard" failed to start.`, "Automatic retry in", "herd-wake project:start dashboard"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("terse backoff diagnostic missing %q; got:\n%s", want, body)
+		}
+	}
+	for _, unwanted := range []string{envFilePath, "no '=' in line", "failed to start recently"} {
+		if strings.Contains(body, unwanted) {
+			t.Errorf("terse backoff diagnostic leaked %q; got:\n%s", unwanted, body)
+		}
+	}
+}
+
+// TestOnDemandFailureDiagnosticOmitsLogsHTML is the browser rendering of the
+// same 503: no process output at all, so nothing from the logs — escaped or
+// not — reaches the page.
+func TestOnDemandFailureDiagnosticOmitsLogsHTML(t *testing.T) {
+	fake := tersePreviewFake()
+	h := onDemandHandler(t, noDiagnosticLogsProject(), fake)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://dashboard.test/", nil)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8")
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Errorf("Content-Type = %q, want text/html", ct)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"<!DOCTYPE html", "dashboard", "failed to start", "exit status 3", "diagnostic_logs: false", "<code>herd-wake logs dashboard</code>"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("terse HTML diagnostic missing %q; got:\n%s", want, body)
+		}
+	}
+	for _, unwanted := range []string{"boom line one", "&lt;script&gt;", "<script>alert", envFilePath, "no &#39;=&#39; in line", "Last error"} {
+		if strings.Contains(body, unwanted) {
+			t.Errorf("terse HTML diagnostic leaked process output (%q); got:\n%s", unwanted, body)
+		}
+	}
+}
+
+// TestWriteDiagnosticLogsOmittedWithoutProject: the pointer line names a
+// project, so a diagnostic with no project (a hostname nobody claims) omits
+// the output silently rather than printing a command with a hole in it.
+func TestWriteDiagnosticLogsOmittedWithoutProject(t *testing.T) {
+	for _, accept := range []string{"*/*", "text/html"} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "http://nobody.test/", nil)
+		req.Header.Set("Accept", accept)
+		WriteDiagnostic(rec, req, Diagnostic{
+			Status:      http.StatusNotFound,
+			Reason:      "No project answers to this hostname.",
+			LogsOmitted: true,
+		})
+
+		body := rec.Body.String()
+		if strings.Contains(body, "diagnostic_logs") || strings.Contains(body, "herd-wake logs") {
+			t.Errorf("Accept %q: diagnostic without a project should print no logs pointer; got:\n%s", accept, body)
+		}
+		if !strings.Contains(body, "No project answers to this hostname.") {
+			t.Errorf("Accept %q: diagnostic lost its reason; got:\n%s", accept, body)
+		}
+	}
+}
