@@ -35,6 +35,10 @@ type wildcardFixture struct {
 	socket     string
 	client     *control.Client
 	d          *Daemon
+	// ports are the loopback ports handed out so far: freePort reserves a
+	// port by binding :0 and releasing it, and the kernel may hand the same
+	// one out again to the next :0 bind, so the fixture never reuses one.
+	ports map[int]bool
 	// maxRunning, when set, is written as the top-level max_running;
 	// holdMaxWait is the template's hold_max_wait_seconds.
 	maxRunning  int
@@ -53,10 +57,11 @@ func newWildcardFixture(t *testing.T) *wildcardFixture {
 		workspace:   t.TempDir(),
 		repo:        t.TempDir(),
 		command:     command,
-		port:        freePort(t),
 		base:        "webapp.test",
 		holdMaxWait: 20,
+		ports:       map[int]bool{},
 	}
+	f.port = f.freePort()
 	f.configPath = filepath.Join(f.dir, "config.yaml")
 	if err := os.MkdirAll(filepath.Join(f.repo, ".git", "worktrees"), 0o755); err != nil {
 		t.Fatal(err)
@@ -79,7 +84,7 @@ func (f *wildcardFixture) worktree(name string, files ...string) (dir string, ap
 	if err := os.WriteFile(filepath.Join(dir, ".git"), []byte("gitdir: "+admin+"\n"), 0o644); err != nil {
 		f.t.Fatal(err)
 	}
-	appPort = freePort(f.t)
+	appPort = f.freePort()
 	f.setPort(name, itoa(appPort))
 	f.setMode(name, testproc.ModeHTTP)
 	for _, file := range files {
@@ -91,6 +96,20 @@ func (f *wildcardFixture) worktree(name string, files ...string) (dir string, ap
 }
 
 func itoa(n int) string { return fmt.Sprint(n) }
+
+// freePort reserves a loopback port the fixture has not handed out before.
+func (f *wildcardFixture) freePort() int {
+	f.t.Helper()
+	for range 100 {
+		port := freePort(f.t)
+		if !f.ports[port] {
+			f.ports[port] = true
+			return port
+		}
+	}
+	f.t.Fatal("could not reserve a fresh loopback port")
+	return 0
+}
 
 // setPort rewrites a worktree's port file.
 func (f *wildcardFixture) setPort(name, port string) {

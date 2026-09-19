@@ -65,7 +65,7 @@ func (f *wildcardFixture) assertSlotHolders(want ...string) {
 // staticProject renders a static testproc project for the fixture's
 // projects: body.
 func (f *wildcardFixture) staticProject(name, mode string, alwaysOn bool) string {
-	sup, app := freePort(f.t), freePort(f.t)
+	sup, app := f.freePort(), f.freePort()
 	return fmt.Sprintf(`  %s:
     public_url: https://%s.test
     supervisor_port: %d
