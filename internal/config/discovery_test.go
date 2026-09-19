@@ -416,3 +416,67 @@ func TestDiscoveryMaxRunning(t *testing.T) {
 		t.Errorf("max_running in proxy mode: err = %v", err)
 	}
 }
+
+// TestDiscoveryTemplateEnvFiles: a template's env_file and diagnostic_logs
+// reach every project the entry materialises, the path list is copied
+// rather than shared, and a template whose shared env file is missing is
+// reported against the entry.
+func TestDiscoveryTemplateEnvFiles(t *testing.T) {
+	workspace := t.TempDir()
+	shared := filepath.Join(t.TempDir(), "preview.env")
+	if err := os.WriteFile(shared, []byte("ENVIRONMENT=preview\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	entry := func(file string) string {
+		return `  - name: preview
+    mode: wildcard
+    supervisor_port: 41000
+    directory: ` + workspace + `
+    command: ./start.sh
+    port_command: cat port
+    env_file: [` + file + `, .env.preview]
+    diagnostic_logs: false
+`
+	}
+
+	cfg, err := Load(writeDiscoveryConfig(t, entry(shared)))
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	d := cfg.Discovery[0]
+	if got := d.Template.EnvFile; len(got) != 2 || got[0] != shared || got[1] != ".env.preview" {
+		t.Fatalf("template EnvFile = %v, want [%s .env.preview]", got, shared)
+	}
+	if d.Template.DiagnosticLogsEnabled() {
+		t.Error("template DiagnosticLogsEnabled() = true, want false")
+	}
+
+	worktree := filepath.Join(workspace, "issue-1")
+	p := d.Project("issue-1", worktree, 45001)
+	if got := p.EnvFile; len(got) != 2 || got[0] != shared || got[1] != ".env.preview" {
+		t.Errorf("materialised EnvFile = %v, want [%s .env.preview]", got, shared)
+	}
+	if p.DiagnosticLogsEnabled() {
+		t.Error("materialised DiagnosticLogsEnabled() = true, want false (from the template)")
+	}
+	refs := p.EnvFileRefs(p.WorkingDirectory)
+	want := []EnvFileRef{{Path: shared}, {Path: filepath.Join(worktree, ".env.preview"), Optional: true}}
+	if len(refs) != len(want) || refs[0] != want[0] || refs[1] != want[1] {
+		t.Errorf("EnvFileRefs() = %+v, want %+v", refs, want)
+	}
+	p.EnvFile[1] = "changed.env"
+	if d.Template.EnvFile[1] != ".env.preview" {
+		t.Errorf("the project shares the template's env_file list: %v", d.Template.EnvFile)
+	}
+
+	// A relative-only template is fine; an absolute one that is missing is
+	// a discovery-scoped env_file error.
+	if _, err := Load(writeDiscoveryConfig(t, entry(".env.shared"))); err != nil {
+		t.Errorf("Load with only relative env files: %v, want success", err)
+	}
+	gone := filepath.Join(t.TempDir(), "gone.env")
+	_, err = Load(writeDiscoveryConfig(t, entry(gone)))
+	if err == nil || !strings.Contains(err.Error(), `discovery "preview": env_file: file "`+gone+`" does not exist`) {
+		t.Errorf("Load error = %v, want the entry's missing env file reported", err)
+	}
+}

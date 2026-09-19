@@ -1,0 +1,15 @@
+# Every way an env_file entry can be wrong: an absolute path that does not
+# exist, an absolute path that is not a regular file, and a blank entry. The
+# relative entry is never checked, so it must not be reported.
+projects:
+  leaky:
+    public_url: https://leaky.test
+    supervisor_port: 7101
+    application_port: 17101
+    working_directory: /tmp
+    command: npm run dev
+    env_file:
+      - /nonexistent/herd-wake/preview.env
+      - /tmp
+      - "   "
+      - .env.preview
