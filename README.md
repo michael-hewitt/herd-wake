@@ -630,4 +630,6 @@ HW_E2E=1 go test -race ./e2e/ -v -count=1    # full E2E acceptance suite
 golangci-lint run
 ```
 
+Changes land through pull requests against `main`. A ruleset requires every CI job (`build-and-test`, `lint`, `e2e`) to pass and blocks force-pushes and deletion, so nothing can be pushed to `main` directly; open a PR from a branch, enable auto-merge, and it squash-merges itself once CI is green (the PR title becomes the commit title, the commit messages its body) and the branch is deleted. Merging to `main` deploys nothing: engineers build and install the binary from their own checkout (see [Install](#install)).
+
 The E2E suite (`e2e/`) builds the real binary, runs the daemon as a subprocess against the Vite fixture in `testdata/vite-fixture`, and exercises the spec's acceptance criteria — cold start, single-flight under 20 concurrent requests, warm-request overhead, HMR-WebSocket keep-alive, idle stop and revival, two-project isolation, failure diagnostics, and no-auto-start after a daemon restart — purely through public surfaces (supervisor ports, CLI, control API). It is guarded by `HW_E2E=1` (and skips under `-short`), needs `node`/`npm` on `PATH`, and installs the fixture's pinned dependencies automatically (`npm ci`) on first run. CI runs it on `macos-latest` today; #11 adds a Linux leg so both platforms run the full suite.
