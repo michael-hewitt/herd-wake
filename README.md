@@ -14,11 +14,13 @@ The full specification lives in [issue #1](https://github.com/michael-hewitt/her
 - [Registering URLs with Herd](#registering-urls-with-herd)
   - [Node-only application](#node-only-application)
   - [Laravel + Vite](#laravel--vite)
+- [Bring your own proxy](#bring-your-own-proxy)
 - [Configuration reference](#configuration-reference)
   - [Running-server budget: max_running](#running-server-budget-max_running)
   - [Sharing a port: routing by Host](#sharing-a-port-routing-by-host)
   - [The projects.d directory](#the-projectsd-directory)
 - [Reloading the configuration](#reloading-the-configuration)
+- [Running as a service](#running-as-a-service)
 - [Worktrees: automatic URLs](#worktrees-automatic-urls)
   - [Wildcard mode (recommended)](#wildcard-mode-recommended)
   - [How a worktree is resolved](#how-a-worktree-is-resolved)
@@ -35,7 +37,7 @@ The full specification lives in [issue #1](https://github.com/michael-hewitt/her
 ## How it works
 
 ```
-browser ──▶ Herd (ports 80/443, TLS, .test DNS)
+browser ──▶ Herd on macOS, nginx/Caddy on Linux (ports 80/443, TLS, DNS)
               ├─ php sites ──▶ PHP-FPM                 (unchanged)
               └─ registered Node URLs
                    └──▶ herd-wake supervisor port (127.0.0.1:71xx)
@@ -71,8 +73,8 @@ Platforms — macOS and Linux carry equal weight; Windows is out of scope:
 
 | | macOS | Linux (Ubuntu) |
 |---|---|---|
-| Front proxy that owns 80/443, DNS and TLS | [Laravel Herd](https://herd.laravel.com); `herd-wake sync` registers the proxy entries for you | nginx or Caddy with a wildcard `server` block ("Behind another proxy" under [Sharing a port: routing by Host](#sharing-a-port-routing-by-host)); you register it once |
-| Runs the daemon at boot | launchd (see the `herd-wake-worktrees` skill in `.claude/skills/`) | systemd (unit file and XDG paths land with [#11](https://github.com/michael-hewitt/herd-wake/issues/11)) |
+| Front proxy that owns 80/443, DNS and TLS | [Laravel Herd](https://herd.laravel.com); `herd-wake sync` registers the proxy entries for you | nginx or Caddy with one wildcard `server` block you register once — [Bring your own proxy](#bring-your-own-proxy) |
+| Runs the daemon at boot | launchd, from the plist in `.claude/skills/herd-wake-worktrees/launchd/` — [Running as a service](#running-as-a-service) | systemd, from the user unit `contrib/herd-wake.service` — [Running as a service](#running-as-a-service) |
 | Config / socket / logs | All under `~/Library/Application Support/herd-wake`: `config.yaml` (+ `projects.d/`), `herd-wake.sock`, `logs/` | XDG: config `~/.config/herd-wake/config.yaml` (+ `projects.d/`), socket `$XDG_RUNTIME_DIR/herd-wake.sock` (fallback `/tmp/herd-wake-<uid>/`), logs `~/.local/state/herd-wake/logs/`; `$XDG_CONFIG_HOME`/`$XDG_STATE_HOME` honoured |
 | CI | unit and e2e suites on `macos-latest` | unit and e2e suites on `ubuntu-latest` |
 
@@ -96,7 +98,7 @@ herd-wake version
 
 From nothing to an on-demand dev server:
 
-**1. Create the config file** at `~/Library/Application Support/herd-wake/config.yaml` (create the directory if needed):
+**1. Create the config file** at `~/Library/Application Support/herd-wake/config.yaml` on macOS or `~/.config/herd-wake/config.yaml` on Linux (create the directory if needed; running `herd-wake` with no command prints this machine's default path):
 
 ```yaml
 projects:
@@ -122,7 +124,7 @@ herd-wake projects
 herd-wake start
 ```
 
-**4. Visit the supervisor port directly** — this works before any Herd setup:
+**4. Visit the supervisor port directly** — this works before any proxy setup:
 
 ```sh
 curl http://127.0.0.1:7101/
@@ -130,7 +132,7 @@ curl http://127.0.0.1:7101/
 
 The first request cold-starts the dev server (a second or two for Vite), then returns the page. Repeat the curl: it is now instant. `herd-wake status` shows the project `running`, its PID, and when the idle stop is scheduled.
 
-**5. Register the URL with Herd** so `https://dashboard.test` reaches it:
+**5. Register the URL with Herd** so `https://dashboard.test` reaches it (on Linux, point nginx or Caddy at the port instead — [Bring your own proxy](#bring-your-own-proxy)):
 
 ```sh
 herd proxy dashboard http://127.0.0.1:7101 --secure
@@ -209,13 +211,76 @@ With that in place: a page load on `https://accounts.test` emits asset URLs on `
 - Verify the `server.origin`-to-hot-file behavior against your `laravel-vite-plugin` version; older versions differ.
 - First-class management of this handshake (an auto-maintained hot file) is deliberately out of scope for the MVP. Automatic Herd proxy registration exists for [discovered worktrees](#worktrees-automatic-urls); hand-written projects still register with `herd proxy` themselves.
 
+## Bring your own proxy
+
+Laravel Herd is macOS-only. On Linux — or anywhere Herd is not in front — the same job is done by nginx or Caddy: own ports 80/443, terminate TLS, and forward every hostname under a base domain to one herd-wake listener, which routes by `Host` from there. This is the Linux equivalent of Herd's wildcard proxy, and it is the shape `herd-wake sync` asks for on a machine without a Herd CLI (`*.webapp.test → http://127.0.0.1:41000`, printed once per wildcard entry). The listener is a [wildcard discovery entry](#wildcard-mode-recommended)'s `supervisor_port` — or, for hand-written projects, a port [shared by `host`](#sharing-a-port-routing-by-host); a single-project port works the same with `server_name dashboard.test`. With a wildcard entry behind this one block, new worktrees and branches never touch the proxy configuration: nginx is neither edited nor reloaded when a worktree appears or goes.
+
+**nginx.** One static `server` block per base domain (`/etc/nginx/conf.d/webapp.conf`; then `nginx -t && systemctl reload nginx`):
+
+```nginx
+# /etc/nginx/conf.d/webapp.conf — every *.webapp.test hostname goes to the
+# wildcard entry's shared listener; herd-wake picks the worktree from Host.
+server {
+    listen 80;
+    server_name *.webapp.test;
+
+    # TLS: swap `listen 80;` for the three lines below (see "TLS is the proxy's job").
+    #listen 443 ssl;
+    #ssl_certificate     /etc/letsencrypt/live/webapp.example.com/fullchain.pem;
+    #ssl_certificate_key /etc/letsencrypt/live/webapp.example.com/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:41000;
+        proxy_http_version 1.1;
+
+        # What herd-wake reads: Host picks the worktree; X-Forwarded-* are passed
+        # through to the dev server so it sees the public origin.
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host  $host;
+
+        # WebSockets (Vite HMR).
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        # A cold start holds the request until the dev server is ready: stay above
+        # hold_max_wait_seconds (default startup_timeout_seconds + 5 = 65s; the
+        # wildcard example sets startup_timeout_seconds: 180, so 185s).
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+
+        # Streamed responses (HMR, SSE) must not be buffered.
+        proxy_buffering off;
+    }
+}
+```
+
+`proxy_http_version 1.1` with the `Upgrade`/`Connection` pair is what lets WebSocket upgrades through; herd-wake strips those hop-by-hop headers again before the dev server sees an ordinary request, so setting `Connection "upgrade"` unconditionally is harmless. `proxy_read_timeout` must outlive a held cold start or nginx answers `504` while herd-wake is still waiting for the server; `proxy_buffering off` keeps HMR and server-sent events flowing.
+
+**Caddy.** The same block is three lines; Caddy sets `X-Forwarded-For`/`X-Forwarded-Proto`/`X-Forwarded-Host`, passes `Host` through, and proxies WebSockets without being told:
+
+```caddyfile
+*.webapp.test {
+    tls internal                       # .test cannot get a public cert; Caddy's local CA instead
+    reverse_proxy 127.0.0.1:41000
+}
+```
+
+Drop `tls internal` for a public domain with a DNS provider module (below), or write the site as `http://*.webapp.test` for plain HTTP.
+
+**TLS is the proxy's job.** herd-wake only ever speaks plain HTTP on loopback. A wildcard certificate needs the ACME DNS-01 challenge — HTTP-01 cannot issue wildcards — so use certbot with a DNS plugin for your DNS host (`certbot certonly --dns-<provider> -d '*.webapp.example.com'`) and the commented `ssl_*` lines above, or Caddy's DNS provider modules (`tls { dns <provider> … }` in the site block) which renew on their own. A local `.test` domain cannot be issued a public certificate at all: use plain HTTP, a self-signed wildcard cert you trust on the client, or Caddy's `tls internal`. `.test` DNS is yours to provide too (`/etc/hosts` entries, or a `dnsmasq` rule `address=/.webapp.test/127.0.0.1`).
+
+**How herd-wake treats the forwarded headers** (`internal/proxy/proxy.go`): `X-Forwarded-For` is *appended to* — the chain your proxy started gains herd-wake's view of the client (the proxy's loopback address) rather than being replaced; an inbound `X-Forwarded-Proto` and `X-Forwarded-Host` are preserved verbatim and only filled in when absent (`X-Forwarded-Proto` from the project's `public_url` scheme, `X-Forwarded-Host` from the inbound `Host`); `Host` is forwarded to the dev server unchanged unless the project sets [`rewrite_host: true`](#optional-fields), in which case the dev server sees `Host: 127.0.0.1:<application_port>` and the public host rides in `X-Forwarded-Host`. Your proxy therefore has the last word on what the application believes its public origin is — send the headers above and nothing downstream needs to know the proxy exists.
+
 ## Configuration reference
 
 Projects are registered in a user-level YAML file — nothing is stored in your project repositories:
 
 ```
-~/Library/Application Support/herd-wake/config.yaml     (override: --config)
-~/Library/Application Support/herd-wake/projects.d/     (optional, see below)
+macOS   ~/Library/Application Support/herd-wake/config.yaml   (override: --config)
+Linux   ~/.config/herd-wake/config.yaml                       ($XDG_CONFIG_HOME/herd-wake; override: --config)
+        projects.d/ next to it                                (optional, see below)
 ```
 
 The file is a `projects:` map of project names to settings, plus an optional `discovery:` list of [worktree templates](#discovery-entries) and an optional top-level [`max_running`](#running-server-budget-max_running) cap. Unknown fields are rejected (typos fail loudly), validation reports every problem with its project (or discovery entry) and field, and every `application_port` must be unique across the whole configuration (main file and `projects.d` together). A `supervisor_port` is unique too, except that projects which all set [`host`](#sharing-a-port-routing-by-host) may share one. [config.sample.yaml](config.sample.yaml) is a fully commented example kept in sync with these tables. A running daemon picks up edits with [`herd-wake reload`](#reloading-the-configuration).
@@ -312,7 +377,7 @@ On port 7103 the daemon reads each request's `Host` (port stripped, lowercased) 
 
 Reloads treat a `host` project like any other: it joins or leaves the shared listener without disturbing its neighbours, and the listener closes with its last member.
 
-**Behind another proxy.** A shared listener is what you want when herd-wake runs behind something other than Herd — nginx on a Linux box fronting `*.preview.example.com`, say. One static `server` block forwards every hostname to the one supervisor port (`proxy_pass http://127.0.0.1:7103; proxy_set_header Host $host;` plus the usual `X-Forwarded-*` and WebSocket upgrade headers), and adding or removing a branch is a herd-wake config change only — nginx never needs a rewrite or a reload. herd-wake forwards the inbound `Host` unchanged (or rewrites it with `rewrite_host`), so the app sees the public origin.
+**Behind another proxy.** A shared listener is what you want when herd-wake runs behind something other than Herd — nginx on a Linux box fronting `*.preview.example.com`, say: one static `server` block forwards every hostname to port 7103, and adding or removing a branch is a herd-wake config change only. The block, the Caddy equivalent, TLS, and how the forwarded headers are treated are all under [Bring your own proxy](#bring-your-own-proxy).
 
 ### Discovery entries
 
@@ -342,7 +407,7 @@ Each entry of the top-level `discovery:` list is a template for one family of gi
 Next to the main config file, an optional `projects.d/` directory holds additional project files:
 
 ```
-~/Library/Application Support/herd-wake/
+<config directory>/             # ~/Library/Application Support/herd-wake on macOS, ~/.config/herd-wake on Linux
 ├── config.yaml                 # hand-written, never touched by tooling
 └── projects.d/
     ├── webapp.yaml             # managed by `herd-wake sync` (discovery "webapp"), one project per worktree
@@ -384,6 +449,25 @@ Rules and guarantees:
 - The response (and the CLI output) lists the added / removed / changed / unchanged names and any errors; `herd-wake reload` exits non-zero when the reload was rejected or reported errors. `herd-wake status` shows the config path and when it was last reloaded successfully.
 
 `herd-wake start` runs in the foreground; because SIGHUP now means "reload", closing the terminal that runs it no longer terminates the daemon (it only loses its log output). Stop it with Ctrl-C or SIGTERM.
+
+## Running as a service
+
+`herd-wake start` is a foreground process by design; the platform's service manager keeps it up across logouts and reboots. Either way the daemon runs as *your* user (never root), a config change is applied with [`herd-wake reload`](#reloading-the-configuration) or SIGHUP — no restart — and the one thing both managers lack is a login shell's `PATH`: a Node installed by nvm/fnm/volta is not found unless the service sets `PATH` or the project (or discovery entry) sets `node_path`.
+
+**macOS — launchd.** The `herd-wake-worktrees` skill ships a LaunchAgent template at `.claude/skills/herd-wake-worktrees/launchd/us.hewitts.herd-wake.plist` (`RunAtLoad` + `KeepAlive`, `PATH` set to your Node, daemon log in `~/Library/Logs/herd-wake/daemon.log`); fill in `__HOME__`/`__NODE_BIN__`, copy it to `~/Library/LaunchAgents/`, and `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/us.hewitts.herd-wake.plist`. The skill's step 3 has the exact commands.
+
+**Linux — systemd.** [`contrib/herd-wake.service`](contrib/herd-wake.service) is a user unit: `ExecStart=%h/.local/bin/herd-wake start` with no flags, so the daemon uses the XDG defaults (config `~/.config/herd-wake/config.yaml`, logs `~/.local/state/herd-wake/logs/`, socket `$XDG_RUNTIME_DIR/herd-wake.sock` — the user manager sets `XDG_RUNTIME_DIR`, so that is `/run/user/<uid>/herd-wake.sock`, where the CLI looks too). Edit the binary path if yours is `/usr/local/bin`; the commented `--config`/`--socket`/`--log-dir` line shows explicit paths.
+
+```sh
+mkdir -p ~/.config/systemd/user
+cp contrib/herd-wake.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now herd-wake
+loginctl enable-linger $USER          # run without an open login session (a headless staging box needs this)
+journalctl --user -u herd-wake -f     # the daemon's own log; dev-server output is in the logs dir / `herd-wake logs`
+```
+
+The unit stops with SIGTERM under `KillMode=mixed`, so systemd signals only herd-wake and lets it stop every dev-server process group itself (`shutdown_signal`, then SIGKILL after `shutdown_timeout_seconds`); stragglers are killed at `TimeoutStopSec=90`. `Restart=on-failure` restarts a crashed daemon after 5 s — a clean `systemctl --user stop` stays stopped. After editing the unit: `systemctl --user daemon-reload && systemctl --user restart herd-wake`; after editing `config.yaml`: `herd-wake reload`, which never restarts anything. Nginx or Caddy in front of the listener is the [Bring your own proxy](#bring-your-own-proxy) setup.
 
 ## Worktrees: automatic URLs
 
@@ -538,15 +622,17 @@ Flags (place them before positional arguments):
 
 | Flag | Applies to | Default | Meaning |
 | --- | --- | --- | --- |
-| `--config <path>` | `start`, `projects`, `sync`, `url`, `project:remove` | `~/Library/Application Support/herd-wake/config.yaml` | Config file to load; `projects.d/` next to it is merged in. |
-| `--socket <path>` | `start`, `status`, `reload`, `sync`, `project:*`, `logs` | `~/Library/Application Support/herd-wake/herd-wake.sock` | Control socket the daemon serves / clients query. |
-| `--log-dir <path>` | `start` | `~/Library/Application Support/herd-wake/logs` | Directory for per-project process logs (`<name>.log`). |
+| `--config <path>` | `start`, `projects`, `sync`, `url`, `project:remove` | `<config dir>/config.yaml` | Config file to load; `projects.d/` next to it is merged in. |
+| `--socket <path>` | `start`, `status`, `reload`, `sync`, `project:*`, `logs` | `<config dir>/herd-wake.sock` (macOS), `$XDG_RUNTIME_DIR/herd-wake.sock` (Linux) | Control socket the daemon serves / clients query. |
+| `--log-dir <path>` | `start` | `<config dir>/logs` (macOS), `~/.local/state/herd-wake/logs` (Linux) | Directory for per-project process logs (`<name>.log`). |
 | `--ttl <duration>` | `project:lease` | `30m` | How long the lease lasts, e.g. `45m`, `2h`. |
 | `--lines <n>` | `logs` | `0` | Maximum lines to print (0 = everything buffered, up to 200). |
 | `--dry-run` | `sync` | off | Compute and print the changes without writing files or touching Herd (`herd paths`/`herd links` are still read). |
 | `--no-herd` | `sync` | off | Never run the `herd` CLI; print the Herd commands to run by hand. |
 | `--json` | `sync` | off | Print the result as JSON. |
 | `--keep-herd` | `project:remove` | off | Leave the project's Herd proxy in place. |
+
+`<config dir>` is `~/Library/Application Support/herd-wake` on macOS and `~/.config/herd-wake` on Linux (see [Install](#install)); the usage text (`herd-wake` with no command) prints this machine's resolved defaults.
 
 The control API behind the CLI is plain HTTP+JSON over the unix socket, versioned under `/v1/`: `GET /v1/status` (includes `config_path`, `last_reload_at`, per-project `host`/`source`/`dynamic`, `wildcards` with each entry's `running`/`max_running`/`next_eviction`, and `budget`), `POST /v1/reload` (returns `{applied, added, removed, changed, unchanged, wildcards, errors}`; `applied` is false when the config was rejected), `POST /v1/projects/{name}/start|stop|restart`, `POST /v1/projects/{name}/lease?ttl=45m`, `DELETE /v1/projects/{name}/lease`, `GET /v1/projects/{name}/logs?lines=N`. Wildcard worktrees are addressed by their label like any project.
 
@@ -570,7 +656,7 @@ WebSocket upgrades are proxied like any other traffic, including through a cold 
 
 ## Troubleshooting
 
-**Where everything lives.** Config `~/Library/Application Support/herd-wake/config.yaml` plus `projects.d/*.yaml` next to it; control socket `~/Library/Application Support/herd-wake/herd-wake.sock`; process logs `~/Library/Application Support/herd-wake/logs/<name>.log` (also surfaced by `herd-wake logs <name>`, and quoted in 503 diagnostics). All overridable with `--config` / `--socket` / `--log-dir`.
+**Where everything lives.** Config `config.yaml` plus `projects.d/*.yaml` next to it in the platform's config directory (`~/Library/Application Support/herd-wake` on macOS, `~/.config/herd-wake` on Linux); control socket next to the config on macOS, `$XDG_RUNTIME_DIR/herd-wake.sock` on Linux; process logs `logs/<name>.log` next to the config on macOS, under `~/.local/state/herd-wake` on Linux (also surfaced by `herd-wake logs <name>`, and quoted in 503 diagnostics). The [Install](#install) table has the full list; all overridable with `--config` / `--socket` / `--log-dir`, and under systemd the daemon's own output is `journalctl --user -u herd-wake`.
 
 **Cold start returns 503 "readiness … timeout".** The command started but never answered the readiness probe within `startup_timeout_seconds`. In rough order of likelihood:
 
