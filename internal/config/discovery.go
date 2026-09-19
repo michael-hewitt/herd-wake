@@ -111,6 +111,12 @@ type Discovery struct {
 	// Exclude holds glob patterns (path.Match) on the directory name; a
 	// matching subdirectory is never a candidate. Default: DefaultExclude.
 	Exclude []string `yaml:"exclude,omitempty"`
+	// MaxRunning (wildcard mode) caps how many of this entry's worktree
+	// projects may be starting or running at once; the top-level
+	// max_running still applies across entries. 0 (unset) means no
+	// per-entry cap. A reload applies a change without rebuilding the
+	// entry (see Equivalent).
+	MaxRunning int `yaml:"max_running,omitempty"`
 
 	// Template holds every per-project field. command is required; the
 	// generated fields (public_url, host, application_port,
@@ -260,10 +266,13 @@ func copyEnv(env map[string]string) map[string]string {
 }
 
 // Equivalent reports whether d and o describe the same entry: every field
-// is equal. The daemon uses it on reload to tell changed wildcard entries
+// is equal except MaxRunning, a live-adjustable limit the daemon applies in
+// place. The daemon uses it on reload to tell changed wildcard entries
 // (whose listener and dynamic projects are rebuilt) from unchanged ones.
 func (d *Discovery) Equivalent(o *Discovery) bool {
-	return reflect.DeepEqual(*d, *o)
+	a, b := *d, *o
+	a.MaxRunning, b.MaxRunning = 0, 0
+	return reflect.DeepEqual(a, b)
 }
 
 // HerdEnabled reports whether sync manages Herd proxies for this entry.
@@ -399,6 +408,9 @@ func (d *Discovery) validate(label string) []error {
 		if d.BaseDomain != "" {
 			fail("base_domain", "only used in wildcard mode (mode: wildcard); proxy mode builds each URL from url_template")
 		}
+		if d.MaxRunning != 0 {
+			fail("max_running", "only used in wildcard mode (mode: wildcard); proxy-mode worktrees are ordinary projects, capped by the top-level max_running")
+		}
 		if !strings.Contains(d.URLTemplate, URLTemplateName) {
 			fail("url_template", "%q must contain %s (replaced by the worktree's directory name)", d.URLTemplate, URLTemplateName)
 		} else if err := checkHTTPURL(d.PublicURL("example")); err != nil {
@@ -410,6 +422,9 @@ func (d *Discovery) validate(label string) []error {
 		}
 	}
 	errs = append(errs, d.validateRange(label, "application_port_range", d.ApplicationPortRange, d.PortCommand == "")...)
+	if d.MaxRunning < 0 {
+		fail("max_running", "must not be negative (got %d); 0 or unset means no per-entry cap", d.MaxRunning)
+	}
 
 	for _, pattern := range d.Exclude {
 		if _, err := path.Match(pattern, ""); err != nil {

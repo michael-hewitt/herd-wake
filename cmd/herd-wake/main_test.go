@@ -616,3 +616,20 @@ func TestRunUnknownCommand(t *testing.T) {
 		t.Errorf("run(bogus) stderr = %q, want unknown-command diagnostic", stderr.String())
 	}
 }
+
+func TestDescribeBudget(t *testing.T) {
+	for _, tc := range []struct {
+		running, max int
+		next         string
+		want         string
+	}{
+		{3, 0, "", "3 (no max_running)"},
+		{1, 2, "a", "1/2 (max_running); next eviction: a"},
+		{2, 2, "", "2/2 (max_running); nothing evictable"},
+		{1, 2, "", "1/2 (max_running)"},
+	} {
+		if got := describeBudget(tc.running, tc.max, tc.next); got != tc.want {
+			t.Errorf("describeBudget(%d, %d, %q) = %q, want %q", tc.running, tc.max, tc.next, got, tc.want)
+		}
+	}
+}

@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -349,5 +350,56 @@ func TestBaseDirSharedWithDefaultPath(t *testing.T) {
 	}
 	if filepath.Dir(path) != base {
 		t.Errorf("DefaultPath() = %q, want it inside BaseDir() %q", path, base)
+	}
+}
+
+// writeConfigFile writes body as a config file in a fresh directory.
+func writeConfigFile(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestLoadMaxRunning: the top-level max_running loads, defaults to 0
+// (unlimited), rejects negatives, and must cover the always_on projects,
+// which each hold a slot for good.
+func TestLoadMaxRunning(t *testing.T) {
+	dir := t.TempDir()
+	project := func(name string, alwaysOn bool, port int) string {
+		return fmt.Sprintf(`  %s:
+    public_url: https://%s.test
+    supervisor_port: %d
+    application_port: %d
+    working_directory: %s
+    command: npm run dev
+    always_on: %t
+`, name, name, port, port+10000, dir, alwaysOn)
+	}
+
+	cfg, err := Load(writeConfigFile(t, "max_running: 2\nprojects:\n"+project("a", true, 7101)+project("b", true, 7102)))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.MaxRunning != 2 {
+		t.Errorf("MaxRunning = %d, want 2", cfg.MaxRunning)
+	}
+	cfg, err = Load(writeConfigFile(t, "projects:\n"+project("a", false, 7101)))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.MaxRunning != 0 {
+		t.Errorf("MaxRunning unset = %d, want 0 (unlimited)", cfg.MaxRunning)
+	}
+
+	_, err = Load(writeConfigFile(t, "max_running: -1\nprojects:\n"+project("a", false, 7101)))
+	if err == nil || !strings.Contains(err.Error(), "max_running: must not be negative") {
+		t.Errorf("negative max_running: err = %v, want a max_running error", err)
+	}
+	_, err = Load(writeConfigFile(t, "max_running: 1\nprojects:\n"+project("a", true, 7101)+project("b", true, 7102)+project("c", false, 7103)))
+	if err == nil || !strings.Contains(err.Error(), "max_running: 1 is below the 2 always_on projects (a, b)") {
+		t.Errorf("max_running under the always_on count: err = %v, want an error naming them", err)
 	}
 }

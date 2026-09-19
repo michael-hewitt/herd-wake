@@ -81,6 +81,13 @@ type Daemon struct {
 	// reloadMu serializes reloads with each other, with dynamic-project
 	// swaps, and with daemon shutdown.
 	reloadMu sync.Mutex
+	// budgetMu serializes slot reservations: the count of starting/running
+	// projects, the eviction that makes room, and the start that claims the
+	// room (see budget.go). Cold starts only; the hot path never takes it.
+	budgetMu sync.Mutex
+	// maxRunning is the top-level max_running cap (0 = unlimited), updated
+	// in place by reloads.
+	maxRunning atomic.Int64
 	// draining is set the moment Run begins shutting down, so a request
 	// racing shutdown cannot trigger a fresh startup of a project the
 	// daemon is about to stop for good.
@@ -91,20 +98,22 @@ type Daemon struct {
 }
 
 // onDemandUpstream adapts a project's supervisor for the on-demand proxy:
-// once the daemon is draining, request-triggered starts are refused instead
-// of respawning a project that daemon shutdown is (or will be) stopping.
+// request-triggered starts go through the running-server budget, and once
+// the daemon is draining they are refused instead of respawning a project
+// that daemon shutdown is (or will be) stopping.
 type onDemandUpstream struct {
 	*process.Supervisor
-	draining *atomic.Bool
+	d  *Daemon
+	st *projectState
 }
 
 func (u onDemandUpstream) EnsureStartedOnDemand() <-chan error {
-	if u.draining.Load() {
+	if u.d.draining.Load() {
 		done := make(chan error, 1)
 		done <- errors.New("the herd-wake daemon is shutting down")
 		return done
 	}
-	return u.Supervisor.EnsureStartedOnDemand()
+	return u.d.startOnDemand(u.st)
 }
 
 // New builds a daemon for the given configuration. The control API listens
@@ -123,6 +132,7 @@ func New(cfg *config.Config, socketPath, logDir string, logger *log.Logger) *Dae
 		bindings:   map[string]*binding{},
 		serveErr:   make(chan error, 1),
 	}
+	d.maxRunning.Store(int64(cfg.MaxRunning))
 	for _, name := range cfg.ProjectNames() {
 		d.states[name] = d.newProjectState(cfg.Projects[name], idle.NewTracker())
 	}
@@ -449,14 +459,12 @@ func (d *Daemon) activate(st *projectState, runCtx context.Context) {
 		// always_on: start with the daemon (or the reload that added it),
 		// never idle-stop. A failed start must not abort the daemon — the
 		// project is marked failed and the usual retry paths (requests with
-		// backoff, manual project:start) still apply.
+		// backoff, manual project:start) still apply. The start goes through
+		// the budget like any other (always_on projects hold their slot for
+		// good, so validation keeps their number under max_running).
 		go func() {
-			select {
-			case err := <-st.proc.EnsureStarted():
-				if err != nil {
-					d.logger.Printf("project %q: always_on start failed: %v", st.project.Name, err)
-				}
-			case <-ctx.Done():
+			if err := d.startManual(ctx, st); err != nil && !errors.Is(err, context.Canceled) {
+				d.logger.Printf("project %q: always_on start failed: %v", st.project.Name, err)
 			}
 		}()
 		return

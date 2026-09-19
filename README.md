@@ -15,6 +15,7 @@ The full specification lives in [issue #1](https://github.com/michael-hewitt/her
   - [Node-only application](#node-only-application)
   - [Laravel + Vite](#laravel--vite)
 - [Configuration reference](#configuration-reference)
+  - [Running-server budget: max_running](#running-server-budget-max_running)
   - [Sharing a port: routing by Host](#sharing-a-port-routing-by-host)
   - [The projects.d directory](#the-projectsd-directory)
 - [Reloading the configuration](#reloading-the-configuration)
@@ -217,7 +218,7 @@ Projects are registered in a user-level YAML file — nothing is stored in your 
 ~/Library/Application Support/herd-wake/projects.d/     (optional, see below)
 ```
 
-The file is a `projects:` map of project names to settings, plus an optional `discovery:` list of [worktree templates](#discovery-entries). Unknown fields are rejected (typos fail loudly), validation reports every problem with its project (or discovery entry) and field, and every `application_port` must be unique across the whole configuration (main file and `projects.d` together). A `supervisor_port` is unique too, except that projects which all set [`host`](#sharing-a-port-routing-by-host) may share one. [config.sample.yaml](config.sample.yaml) is a fully commented example kept in sync with these tables. A running daemon picks up edits with [`herd-wake reload`](#reloading-the-configuration).
+The file is a `projects:` map of project names to settings, plus an optional `discovery:` list of [worktree templates](#discovery-entries) and an optional top-level [`max_running`](#running-server-budget-max_running) cap. Unknown fields are rejected (typos fail loudly), validation reports every problem with its project (or discovery entry) and field, and every `application_port` must be unique across the whole configuration (main file and `projects.d` together). A `supervisor_port` is unique too, except that projects which all set [`host`](#sharing-a-port-routing-by-host) may share one. [config.sample.yaml](config.sample.yaml) is a fully commented example kept in sync with these tables. A running daemon picks up edits with [`herd-wake reload`](#reloading-the-configuration).
 
 ### Required fields
 
@@ -251,6 +252,37 @@ The file is a `projects:` map of project names to settings, plus an optional `di
 | `log_retention_days` | int | `7` | Log rotation/retention: on each project start, a log over 10 MiB is rotated to `<name>.log.old` (at most one rotation kept), and logs untouched for this many days are deleted. |
 | `listen_host` | string | `127.0.0.1` | Address the supervisor listener binds for this project. Non-loopback values are rejected unless `allow_non_loopback: true`. |
 | `allow_non_loopback` | bool | `false` | Explicit opt-in required to bind a non-loopback `listen_host`. |
+
+### Running-server budget: max_running
+
+A laptop full of worktrees should never have every dev server alive at once. The top-level `max_running` caps how many projects herd-wake keeps running on this machine; a wildcard discovery entry may add its own cap on its worktrees:
+
+```yaml
+max_running: 2          # top-level: total running projects on this machine (static + dynamic)
+
+discovery:
+  - name: webapp
+    mode: wildcard
+    max_running: 2      # optional per-entry cap; the global cap still applies across entries
+    …
+```
+
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `max_running` (top level) | int | unset (unlimited) | How many projects may be `starting` or `running` at once, static or dynamic, `always_on` included. Must be at least the number of `always_on` projects, which hold a slot permanently. |
+| `max_running` (wildcard entry) | int | unset (no per-entry cap) | The same cap on one entry's worktrees only; the top-level cap still applies across everything. Rejected in proxy mode. |
+
+Both live in the per-machine `config.yaml` — never in a project repository, because different engineers want different numbers — and [`herd-wake reload`](#reloading-the-configuration) (or SIGHUP) applies a change live without restarting or rebuilding anything.
+
+How the budget behaves:
+
+- **Eviction.** When a cold start (a request, or `project:start`) would exceed a cap, the **least-recently-active** running project is stopped first — the same graceful whole-group stop an idle stop does — and the new one starts. "Least recently active" is the oldest completed request (or closed WebSocket), or the start time for a project that has served nothing yet. If the count is above the cap (it was lowered by a reload), as many are evicted as it takes.
+- **Never evicted:** a project that is `always_on`, has requests in flight, has open WebSockets (with `websockets_keep_alive`), or holds a lease. If those fill the budget, the triggering request is held — bounded by its project's `hold_max_wait_seconds`, retrying as projects free up — and then answered `503` with a *capacity* diagnostic naming the projects holding the slots and why each cannot be evicted (`"keep" is always_on, "issue-7" has 1 request(s) in flight, …`). `project:start` gets the same rule and the same error.
+- **Serialized.** Eviction and the start it makes room for happen under one lock, so two simultaneous wake-ups can never both conclude there is room. Only cold starts take that lock; requests to running projects never wait on it.
+- **An evicted project is just `stopped`.** It stays registered and its next request cold-starts it normally. With `max_running: 2`, the third worktree you open evicts the one you used least recently, and that one's next visit takes a few seconds while its server comes back.
+- **Lowering the cap below the current count stops nothing** until the next wake-up, which evicts down to the cap.
+
+`herd-wake status` shows `running servers: 2/2 (max_running); next eviction: issue-7` (and, per wildcard entry, its own count and cap when set); `status --json` carries the same under `budget` and each entry's `running`/`max_running`/`next_eviction`.
 
 ### Sharing a port: routing by Host
 
@@ -302,6 +334,7 @@ Each entry of the top-level `discovery:` list is a template for one family of gi
 | `supervisor_port_range` | `[low, high]` | required in proxy mode | Proxy mode only: where new projects get their `supervisor_port`: the lowest port not used anywhere in the configuration (main file and every `projects.d` file). Allocated ports are written to the managed file and never change afterwards, so URLs and Herd proxies stay stable across syncs. (Rejected in wildcard mode.) |
 | `herd` | bool | `true` | Create/remove Herd proxy entries for this entry (one per worktree in proxy mode; one wildcard proxy for `base_domain` in wildcard mode). With `false` (or when the `herd` CLI is not found) sync prints the commands for you to run instead. |
 | `exclude` | list | `[".*"]` | `path.Match` glob patterns on the subdirectory name; matches are never candidates. Setting it replaces the default. |
+| `max_running` | int | — | Wildcard mode only: how many of this entry's worktrees may run at once — see [Running-server budget](#running-server-budget-max_running). The top-level `max_running` still applies across entries. Changing it is applied live by a reload, not treated as a change to the entry. |
 | *any per-project field* | | | `env`, `node_path`, `rewrite_host`, `readiness_strategy`, `startup_timeout_seconds`, `idle_timeout_minutes`, `websockets_keep_alive`, `shutdown_signal`, `shutdown_timeout_seconds`, `log_retention_days`, `always_on`, `hold_*`, `listen_host`, … are accepted in the template and copied verbatim to every generated project. `public_url`, `host`, `application_port`, and `working_directory` are generated and therefore rejected in a template (`supervisor_port` too, in proxy mode). |
 
 ### The projects.d directory
@@ -339,6 +372,8 @@ A reload re-loads and re-validates the main file plus `projects.d`, then diffs t
 | **unchanged** | Untouched: the running process keeps running, its idle countdown and lease are not reset, in-flight requests and open WebSockets are unaffected. |
 
 Wildcard discovery entries are diffed the same way, by name: an **unchanged** entry keeps its listener and every worktree project it has materialised (running ones keep running); a **changed** or **removed** entry has those projects stopped and dropped — they are listed under `removed` — and its listener closed, then rebuilt if the entry still exists (its worktrees come back on demand); an **added** entry binds its listener. A static project that shares a live worktree project's name takes it over as a change.
+
+The [running-server budget](#running-server-budget-max_running) is applied in place: a new top-level `max_running`, or a new per-entry one, takes effect at once without counting as a change to the entry. Lowering a cap below the current count stops nothing — the next wake-up that needs a slot evicts down to the cap.
 
 Rules and guarantees:
 
@@ -402,6 +437,8 @@ From then on the project is ordinary: single-flight cold start, request holding,
 When a worktree directory disappears, the next request for its label is a `404`, a running dev server is stopped gracefully, and the project is dropped from the table once stopped (the idle monitor and `project:stop` check for the missing directory too). [Reloading](#reloading-the-configuration) keeps an unchanged entry's projects; a changed or removed entry stops and drops them.
 
 Per-request cost on the shared listener is one map lookup on the lowercased `Host` plus, for a worktree project, one `stat` of its directory (that is how a vanished worktree is noticed); only the first request for a label pays for resolution.
+
+**Keeping the server count down.** Every worktree you visit leaves a dev server running until it idles out, so on a laptop with many worktrees set a [running-server budget](#running-server-budget-max_running): with `max_running: 2` (top-level, or `max_running` on the entry for its worktrees alone), the third worktree you open evicts the one you used least recently, and that one's next visit takes a few seconds while its server comes back. Busy worktrees — a request in flight, an open HMR socket, a lease — are never the ones evicted.
 
 ### Per-worktree mode (the alternative)
 
@@ -483,12 +520,12 @@ herd-wake <command> [flags] [args]
 | Command | What it does |
 | --- | --- |
 | `herd-wake start` | Run the supervisor daemon in the foreground: binds the project listeners (one per port; shared ports route by `Host`) and each wildcard entry's listener, serves the control API on the unix socket, starts `always_on` projects. Ctrl-C (or SIGTERM) stops the daemon *and* every dev server it started; SIGHUP reloads the configuration. |
-| `herd-wake status` | Daemon PID/uptime/version, the config path and last reload time, each wildcard entry (URL pattern, directory, port, worktrees materialised), plus a per-project table: state, PID, uptime, last activity, scheduled idle stop (and what is holding it off), last exit, URL, ports (with the `host` on a shared port), and source (`config.yaml`, `projects.d/<file>`, or `discovery:<entry> (dynamic)`). |
+| `herd-wake status` | Daemon PID/uptime/version, the config path and last reload time, the running-server count against `max_running` and which project is next in line for eviction, each wildcard entry (URL pattern, directory, port, worktrees materialised, its own running count and cap), plus a per-project table: state, PID, uptime, last activity, scheduled idle stop (and what is holding it off), last exit, URL, ports (with the `host` on a shared port), and source (`config.yaml`, `projects.d/<file>`, or `discovery:<entry> (dynamic)`). |
 | `herd-wake reload` | Re-read the config file and `projects.d` and apply the difference to the running daemon (see [Reloading the configuration](#reloading-the-configuration)). Prints added / removed / changed / unchanged projects; exits 1 if the config is invalid (nothing changes) or a project could not be applied. |
 | `herd-wake sync` | Reconcile every `discovery:` entry with Herd: one wildcard proxy per wildcard entry; for proxy-mode entries, discover worktrees, rewrite the managed `projects.d/<name>.yaml` files, and create/remove per-worktree proxies. Then reload the daemon if it is running (see [Worktrees: automatic URLs](#worktrees-automatic-urls)). `--dry-run` prints without writing or touching Herd; `--no-herd` skips the Herd CLI and prints the commands; `--json` for scripting. Exits 1 when an entry failed or the reload was rejected. |
 | `herd-wake url [directory]` | Print the public URL a directory (default: the current one) is served at: a registered project's `public_url` for its `working_directory`, or `https://<label>.<base_domain>` for a servable worktree under a wildcard entry. Exits 1 with the reason otherwise (not a candidate, or a per-worktree-mode worktree that has not been synced). Works without the daemon running. |
 | `herd-wake projects` | List every registered project from the config file and `projects.d` (with each project's source file) and every wildcard entry (works without the daemon running). |
-| `herd-wake project:start <name>` | Start a project's dev server and wait until it is ready. Bypasses and resets the failure backoff. Worktrees of a wildcard entry are addressed by their label once they have been served. |
+| `herd-wake project:start <name>` | Start a project's dev server and wait until it is ready. Bypasses and resets the failure backoff. Under a full [`max_running`](#running-server-budget-max_running) it evicts the least-recently-active project first, or fails naming the projects that cannot be evicted. Worktrees of a wildcard entry are addressed by their label once they have been served. |
 | `herd-wake project:stop <name>` | Gracefully stop a project's dev server (signal, then force-kill after its shutdown timeout). A wildcard worktree whose directory is gone is dropped once stopped. |
 | `herd-wake project:restart <name>` | Stop (if needed) and start a project's dev server. For a wildcard worktree, re-runs `port_command` first and moves the project to the new port if it changed. |
 | `herd-wake project:lease <name>` | Mark a project active for `--ttl` (default 30m) so it is not idle-stopped — for tools that generate no HTTP traffic. Does not start a stopped project; a new lease replaces the old one. |
@@ -511,7 +548,7 @@ Flags (place them before positional arguments):
 | `--json` | `sync` | off | Print the result as JSON. |
 | `--keep-herd` | `project:remove` | off | Leave the project's Herd proxy in place. |
 
-The control API behind the CLI is plain HTTP+JSON over the unix socket, versioned under `/v1/`: `GET /v1/status` (includes `config_path`, `last_reload_at`, per-project `host`/`source`/`dynamic`, and `wildcards`), `POST /v1/reload` (returns `{applied, added, removed, changed, unchanged, wildcards, errors}`; `applied` is false when the config was rejected), `POST /v1/projects/{name}/start|stop|restart`, `POST /v1/projects/{name}/lease?ttl=45m`, `DELETE /v1/projects/{name}/lease`, `GET /v1/projects/{name}/logs?lines=N`. Wildcard worktrees are addressed by their label like any project.
+The control API behind the CLI is plain HTTP+JSON over the unix socket, versioned under `/v1/`: `GET /v1/status` (includes `config_path`, `last_reload_at`, per-project `host`/`source`/`dynamic`, `wildcards` with each entry's `running`/`max_running`/`next_eviction`, and `budget`), `POST /v1/reload` (returns `{applied, added, removed, changed, unchanged, wildcards, errors}`; `applied` is false when the config was rejected), `POST /v1/projects/{name}/start|stop|restart`, `POST /v1/projects/{name}/lease?ttl=45m`, `DELETE /v1/projects/{name}/lease`, `GET /v1/projects/{name}/logs?lines=N`. Wildcard worktrees are addressed by their label like any project.
 
 ## Idle shutdown, leases, and WebSockets
 
@@ -524,6 +561,8 @@ A running project is stopped gracefully (the configured `shutdown_signal`, then 
 - A request that arrives exactly while an idle stop is in progress is never forwarded to the dying process and never dropped: it waits for the stop to finish, then cold-starts the project and is served by the fresh process.
 
 After an idle stop the project is `stopped`; the next request cold-starts it again. Nothing auto-restarts just because the daemon or the machine restarted — projects wake only on demand (`always_on` projects being the deliberate exception).
+
+The same graceful stop is what the [running-server budget](#running-server-budget-max_running) uses to evict the least-recently-active project when a wake-up would exceed `max_running` — and the same things that park an idle stop (in-flight requests, open WebSockets, a lease) make a project ineligible for eviction.
 
 WebSocket upgrades are proxied like any other traffic, including through a cold start: the upgrade is held while the server starts, so the first HMR connection can itself be the thing that wakes Vite. With `websockets_keep_alive: false`, a project idles out on HTTP traffic alone and any still-open sockets are closed as the process exits — auto-reconnecting clients (Vite HMR is one) cold-start the project again with their next attempt.
 

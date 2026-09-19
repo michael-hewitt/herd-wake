@@ -68,7 +68,7 @@ func (d *Daemon) newProjectState(p *config.Project, tracker *idle.Tracker) *proj
 
 // handler builds the project's on-demand proxy handler.
 func (d *Daemon) handler(st *projectState) http.Handler {
-	upstream := onDemandUpstream{Supervisor: st.proc, draining: &d.draining}
+	upstream := onDemandUpstream{Supervisor: st.proc, d: d, st: st}
 	return proxy.NewOnDemand(st.project, upstream, st.tracker, d.logger)
 }
 
@@ -152,6 +152,7 @@ func (d *Daemon) Status() control.StatusResponse {
 		ConfigPath:    d.configPath,
 		LastReloadAt:  d.lastReloadAt,
 		Projects:      make([]control.ProjectStatus, 0, len(d.states)),
+		Budget:        d.budgetStatusLocked(),
 	}
 	for _, st := range d.sortedStatesLocked() {
 		resp.Projects = append(resp.Projects, d.projectStatus(st))
@@ -162,22 +163,18 @@ func (d *Daemon) Status() control.StatusResponse {
 	return resp
 }
 
-// StartProject implements control.Provider: it starts the named project and
-// returns once it is running or its startup failed.
+// StartProject implements control.Provider: it starts the named project —
+// reserving a running-server slot first, evicting or waiting as the budget
+// requires — and returns once it is running or its startup failed.
 func (d *Daemon) StartProject(ctx context.Context, name string) (control.ProjectStatus, error) {
 	st, err := d.findProject(name)
 	if err != nil {
 		return control.ProjectStatus{}, err
 	}
-	select {
-	case err := <-st.proc.EnsureStarted():
-		if err != nil {
-			return control.ProjectStatus{}, err
-		}
-		return d.projectStatus(st), nil
-	case <-ctx.Done():
-		return control.ProjectStatus{}, ctx.Err()
+	if err := d.startManual(ctx, st); err != nil {
+		return control.ProjectStatus{}, err
 	}
+	return d.projectStatus(st), nil
 }
 
 // StopProject implements control.Provider: it gracefully stops the named
@@ -209,7 +206,7 @@ func (d *Daemon) RestartProject(ctx context.Context, name string) (control.Proje
 	if st.dynamic {
 		return d.restartDynamic(ctx, st)
 	}
-	if err := st.proc.Restart(ctx); err != nil {
+	if err := d.restart(ctx, st); err != nil {
 		return control.ProjectStatus{}, err
 	}
 	return d.projectStatus(st), nil

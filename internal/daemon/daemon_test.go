@@ -65,9 +65,17 @@ func testConfig(supervisorPort, applicationPort int) *config.Config {
 // yielding Run's error after cancellation.
 func startDaemon(t *testing.T, cfg *config.Config) (socket string, stop func(), done <-chan error) {
 	t.Helper()
+	_, socket, stop, done = startDaemonFor(t, cfg)
+	return socket, stop, done
+}
+
+// startDaemonFor is startDaemon returning the daemon itself too, for tests
+// that inspect its internals.
+func startDaemonFor(t *testing.T, cfg *config.Config) (d *Daemon, socket string, stop func(), done <-chan error) {
+	t.Helper()
 	socket = testSocketPath(t)
 	ctx, cancel := context.WithCancel(context.Background())
-	d := New(cfg, socket, t.TempDir(), log.New(io.Discard, "", 0))
+	d = New(cfg, socket, t.TempDir(), log.New(io.Discard, "", 0))
 	runDone := make(chan error, 1)
 	go func() {
 		runDone <- d.Run(ctx)
@@ -82,7 +90,7 @@ func startDaemon(t *testing.T, cfg *config.Config) (socket string, stop func(), 
 		}
 	})
 	waitForDaemon(t, socket, runDone)
-	return socket, cancel, runDone
+	return d, socket, cancel, runDone
 }
 
 // waitForDaemon polls the control socket until the daemon answers.

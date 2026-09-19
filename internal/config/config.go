@@ -72,6 +72,13 @@ var validShutdownSignals = map[string]bool{
 // Config is the root of the herd-wake configuration file.
 type Config struct {
 	Projects map[string]*Project `yaml:"projects"`
+	// MaxRunning caps how many projects — static or dynamic, always_on
+	// included — may be starting or running at once on this machine. When a
+	// cold start would exceed it, the daemon stops the least-recently-active
+	// evictable project first (see the daemon's budget). 0 (unset) means
+	// unlimited. A per-entry cap may be set on a wildcard discovery entry
+	// too; this one still applies across entries.
+	MaxRunning int `yaml:"max_running,omitempty"`
 	// Discovery lists worktree-discovery templates (see Discovery). Only
 	// the main file may define them; `herd-wake sync` turns each into a
 	// managed projects.d file.
@@ -484,6 +491,7 @@ func (c *Config) validate(opts LoadOptions) error {
 		}
 	}
 
+	errs = append(errs, c.validateBudget()...)
 	errs = append(errs, c.validateDiscovery()...)
 
 	for _, d := range c.Discovery {
@@ -501,6 +509,28 @@ func (c *Config) validate(opts LoadOptions) error {
 	}
 
 	return errors.Join(errs...)
+}
+
+// validateBudget checks the top-level max_running against the projects that
+// always hold a slot.
+func (c *Config) validateBudget() []error {
+	if c.MaxRunning < 0 {
+		return []error{fmt.Errorf("max_running: must not be negative (got %d); 0 or unset means unlimited", c.MaxRunning)}
+	}
+	if c.MaxRunning == 0 {
+		return nil
+	}
+	var alwaysOn []string
+	for _, name := range c.ProjectNames() {
+		if c.Projects[name].AlwaysOn {
+			alwaysOn = append(alwaysOn, name)
+		}
+	}
+	if len(alwaysOn) > c.MaxRunning {
+		return []error{fmt.Errorf("max_running: %d is below the %d always_on projects (%s), which each hold a running-server slot permanently",
+			c.MaxRunning, len(alwaysOn), strings.Join(alwaysOn, ", "))}
+	}
+	return nil
 }
 
 // describeClaim renders who holds a port for a conflict message.

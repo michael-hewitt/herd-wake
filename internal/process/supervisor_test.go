@@ -747,3 +747,46 @@ func TestRetireRefusesFurtherStartsButStillStops(t *testing.T) {
 		t.Errorf("state after refused starts = %q, want %q (nothing spawned)", got, StateStopped)
 	}
 }
+
+// TestStopAsyncReturnsOnceStopping: StopAsync hands back control the moment
+// the project is stopping — a stubborn process that ignores SIGTERM keeps
+// the stop in progress for the full shutdown timeout — and its channel
+// closes only once the process group is really gone.
+func TestStopAsyncReturnsOnceStopping(t *testing.T) {
+	p := helperProject(t, testproc.ModeStubborn)
+	p.ShutdownTimeoutSeconds = 1
+	s := newTestSupervisor(t, p)
+	if err := awaitStartup(t, s.EnsureStarted()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	pid := s.Snapshot().PID
+
+	began := time.Now()
+	done := s.StopAsync()
+	if took := time.Since(began); took > 500*time.Millisecond {
+		t.Errorf("StopAsync took %s, want an immediate return", took)
+	}
+	if got := s.State(); got != StateStopping {
+		t.Errorf("state right after StopAsync = %q, want %q", got, StateStopping)
+	}
+	select {
+	case <-done:
+		t.Fatal("stop reported finished while the stubborn process still had its graceful window")
+	default:
+	}
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("stop never finished")
+	}
+	if got := s.State(); got != StateStopped {
+		t.Errorf("state after the stop finished = %q, want %q", got, StateStopped)
+	}
+	waitProcessGone(t, pid)
+	// A second StopAsync on a stopped project is a closed channel.
+	select {
+	case <-s.StopAsync():
+	case <-time.After(time.Second):
+		t.Error("StopAsync on a stopped project should return a closed channel")
+	}
+}

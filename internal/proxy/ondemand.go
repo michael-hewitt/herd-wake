@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"errors"
 	"fmt"
 	"html/template"
 	"log"
@@ -90,13 +91,21 @@ type onDemand struct {
 	held    atomic.Int64
 }
 
-// NewOnDemand returns the request-triggered-start proxy handler for one
-// project. Every request is reported to activity, which drives the
-// project's idle shutdown. Hold bounds come from the project's
-// hold_max_wait_seconds and hold_max_requests (already defaulted by
-// config.Load; unset values fall back to the documented defaults here so
-// hand-built configs stay safe).
-func NewOnDemand(p *config.Project, upstream Upstream, activity Activity, logger *log.Logger) http.Handler {
+// Explained is an error that supplies its own diagnostic title and hint.
+// The daemon's capacity error implements it, so a 503 for a full
+// running-server budget names the projects holding the slots and says how
+// to free one.
+type Explained interface {
+	error
+	DiagnosticTitle() string
+	DiagnosticHint() string
+}
+
+// HoldMaxWait returns how long one request may be held while p starts: its
+// hold_max_wait_seconds (already defaulted by config.Load; unset values
+// fall back to the documented defaults here so hand-built configs stay
+// safe).
+func HoldMaxWait(p *config.Project) time.Duration {
 	maxWait := time.Duration(p.HoldMaxWaitSeconds) * time.Second
 	if maxWait <= 0 {
 		maxWait = time.Duration(p.StartupTimeoutSeconds+config.DefaultHoldWaitBufferSeconds) * time.Second
@@ -104,6 +113,15 @@ func NewOnDemand(p *config.Project, upstream Upstream, activity Activity, logger
 	if maxWait <= 0 {
 		maxWait = time.Duration(config.DefaultStartupTimeoutSeconds+config.DefaultHoldWaitBufferSeconds) * time.Second
 	}
+	return maxWait
+}
+
+// NewOnDemand returns the request-triggered-start proxy handler for one
+// project. Every request is reported to activity, which drives the
+// project's idle shutdown. Hold bounds come from the project's
+// hold_max_wait_seconds and hold_max_requests (see HoldMaxWait).
+func NewOnDemand(p *config.Project, upstream Upstream, activity Activity, logger *log.Logger) http.Handler {
+	maxWait := HoldMaxWait(p)
 	maxHeld := int64(p.HoldMaxRequests)
 	if maxHeld <= 0 {
 		maxHeld = config.DefaultHoldMaxRequests
@@ -223,7 +241,7 @@ func (h *onDemand) holdAndForward(w http.ResponseWriter, r *http.Request, before
 	select {
 	case err := <-h.upstream.EnsureStartedOnDemand():
 		if err != nil {
-			h.deny(w, r, err.Error())
+			h.denyErr(w, r, err)
 			return
 		}
 		if beforeForward != nil {
@@ -260,17 +278,28 @@ func isUpgrade(r *http.Request) bool {
 // deny answers 503 with a diagnostic: the reason, the project's lifecycle
 // state, its exit summary and last error, and recent process output.
 func (h *onDemand) deny(w http.ResponseWriter, r *http.Request, reason string) {
+	h.denyWith(w, r, Diagnostic{Reason: reason})
+}
+
+// denyErr is deny for a startup error; an Explained error supplies the
+// diagnostic's title and hint.
+func (h *onDemand) denyErr(w http.ResponseWriter, r *http.Request, err error) {
+	d := Diagnostic{Reason: err.Error()}
+	var explained Explained
+	if errors.As(err, &explained) {
+		d.Title, d.Hint = explained.DiagnosticTitle(), explained.DiagnosticHint()
+	}
+	h.denyWith(w, r, d)
+}
+
+func (h *onDemand) denyWith(w http.ResponseWriter, r *http.Request, d Diagnostic) {
 	snap := h.upstream.Snapshot()
-	h.logger.Printf("project %q: 503 for %s %s: %s", h.project.Name, r.Method, r.URL.Path, reason)
-	WriteDiagnostic(w, r, Diagnostic{
-		Status:  http.StatusServiceUnavailable,
-		Project: h.project.Name,
-		Reason:  reason,
-		State:   snap.State,
-		Exit:    snap.LastExit,
-		Err:     snap.LastError,
-		Logs:    h.upstream.Logs(diagnosticLogLines),
-	})
+	h.logger.Printf("project %q: 503 for %s %s: %s", h.project.Name, r.Method, r.URL.Path, d.Reason)
+	d.Status = http.StatusServiceUnavailable
+	d.Project = h.project.Name
+	d.State, d.Exit, d.Err = snap.State, snap.LastExit, snap.LastError
+	d.Logs = h.upstream.Logs(diagnosticLogLines)
+	WriteDiagnostic(w, r, d)
 }
 
 // Diagnostic is a local error answer herd-wake gives instead of proxying:

@@ -47,6 +47,11 @@ import (
 // or removed entry has its dynamic projects stopped and dropped (they are
 // listed under Removed) and its listener closed, then — if it still
 // exists — rebuilt; an added entry binds its listener.
+//
+// The running-server budget (max_running, top-level and per entry) is
+// applied in place: a changed cap never counts as a change to an entry,
+// and lowering one below the current count stops nothing — the next start
+// that needs a slot evicts down to the cap.
 func (d *Daemon) Reload(_ context.Context) (control.ReloadResponse, error) {
 	d.reloadMu.Lock()
 	defer d.reloadMu.Unlock()
@@ -169,6 +174,14 @@ func (d *Daemon) Reload(_ context.Context) (control.ReloadResponse, error) {
 	}
 	d.mu.Unlock()
 	sort.Strings(resp.Removed)
+
+	// The caps take effect now, on the entries that survive the reload;
+	// rebuilt entries carry theirs from their new state.
+	kept := map[string]*entryState{}
+	for _, name := range entriesUnchanged {
+		kept[name] = currentEntries[name]
+	}
+	d.applyBudget(cfg, kept)
 
 	// Tear down (outside the table lock: unaffected projects keep serving
 	// and answering the control API meanwhile). This waits for every
