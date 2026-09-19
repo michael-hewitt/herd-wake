@@ -1,8 +1,8 @@
 # herd-wake
 
-**herd-wake starts your Node.js dev servers when their [Laravel Herd](https://herd.laravel.com) URL is visited and stops them again when you stop using them** — so a machine full of Vite, Next.js, and Express projects costs nothing while you are not looking at them.
+**herd-wake starts your Node.js dev servers when their URL is visited and stops them again when you stop using them** — so a machine full of Vite, Next.js, and Express projects costs nothing while you are not looking at them. On a Mac the URL comes from [Laravel Herd](https://herd.laravel.com); on a Linux box it comes from nginx or Caddy in front of the same daemon.
 
-It is a single-binary lifecycle supervisor that sits behind Herd. Visiting a registered URL starts the right dev server, holds the request until the server is ready, then forwards it; HTTP and WebSocket traffic (including Vite HMR) is proxied transparently; after a configurable idle period the server is stopped gracefully. Herd's normal PHP behavior is never touched: only URLs registered with `herd proxy` — by you, or by `herd-wake sync` for git worktrees it discovers — reach herd-wake at all. For a folder of git worktrees, one wildcard proxy (`*.webapp.test`) is enough: every worktree gets `https://<worktree>.webapp.test` the moment it exists, with nothing to register per branch.
+It is a single-binary lifecycle supervisor that sits behind your local proxy (Herd on macOS, nginx/Caddy on Linux). Visiting a registered URL starts the right dev server, holds the request until the server is ready, then forwards it; HTTP and WebSocket traffic (including Vite HMR) is proxied transparently; after a configurable idle period the server is stopped gracefully. Herd's normal PHP behavior is never touched: only URLs registered with `herd proxy` — by you, or by `herd-wake sync` for git worktrees it discovers — reach herd-wake at all. For a folder of git worktrees, one wildcard proxy (`*.webapp.test`) is enough: every worktree gets `https://<worktree>.webapp.test` the moment it exists, with nothing to register per branch.
 
 The full specification lives in [issue #1](https://github.com/michael-hewitt/herd-wake/issues/1).
 
@@ -66,11 +66,20 @@ Idle shutdown, WebSocket keep-alive, and manual controls are covered [below](#id
 
 ## Install
 
+Platforms — macOS and Linux carry equal weight; Windows is out of scope:
+
+| | macOS | Linux (Ubuntu) |
+|---|---|---|
+| Front proxy that owns 80/443, DNS and TLS | [Laravel Herd](https://herd.laravel.com); `herd-wake sync` registers the proxy entries for you | nginx or Caddy with a wildcard `server` block ([Behind another proxy](#behind-another-proxy)); you register it once |
+| Runs the daemon at boot | launchd (see the `herd-wake-worktrees` skill in `.claude/skills/`) | systemd (unit file and XDG paths land with [#11](https://github.com/michael-hewitt/herd-wake/issues/11)) |
+| Config / socket / logs | `~/Library/Application Support/herd-wake`, `~/Library/Logs/herd-wake` | XDG paths after #11; until then pass `--config`, `--socket`, `--log-dir` |
+| CI | e2e suite on `macos-latest` | unit tests on `ubuntu-latest` (e2e on Linux lands with #11) |
+
 Requirements:
 
-- macOS with [Laravel Herd](https://herd.laravel.com) (for the `.test` URLs; herd-wake itself also works standalone against plain `127.0.0.1` ports)
 - Go 1.27+ to build
 - Node.js/npm (whatever your projects need) on `PATH` or via `node_path`
+- A front proxy per the table above — herd-wake itself also works standalone against plain `127.0.0.1` ports
 
 Build and install the binary:
 
@@ -373,7 +382,7 @@ Then, once:
 
 ```sh
 herd-wake sync        # runs: herd proxy webapp http://127.0.0.1:41000 --secure
-herd-wake start       # or your launchd job
+herd-wake start       # or your launchd / systemd job
 ```
 
 Herd's proxy site file and certificate for `webapp.test` both cover `*.webapp.test`, so that single `herd proxy` is the last Herd command you need for this repository. From now on:
@@ -582,4 +591,4 @@ HW_E2E=1 go test -race ./e2e/ -v -count=1    # full E2E acceptance suite
 golangci-lint run
 ```
 
-The E2E suite (`e2e/`) builds the real binary, runs the daemon as a subprocess against the Vite fixture in `testdata/vite-fixture`, and exercises the spec's acceptance criteria — cold start, single-flight under 20 concurrent requests, warm-request overhead, HMR-WebSocket keep-alive, idle stop and revival, two-project isolation, failure diagnostics, and no-auto-start after a daemon restart — purely through public surfaces (supervisor ports, CLI, control API). It is guarded by `HW_E2E=1` (and skips under `-short`), needs `node`/`npm` on `PATH`, and installs the fixture's pinned dependencies automatically (`npm ci`) on first run. CI runs it on `macos-latest`; the unit jobs stay on Linux.
+The E2E suite (`e2e/`) builds the real binary, runs the daemon as a subprocess against the Vite fixture in `testdata/vite-fixture`, and exercises the spec's acceptance criteria — cold start, single-flight under 20 concurrent requests, warm-request overhead, HMR-WebSocket keep-alive, idle stop and revival, two-project isolation, failure diagnostics, and no-auto-start after a daemon restart — purely through public surfaces (supervisor ports, CLI, control API). It is guarded by `HW_E2E=1` (and skips under `-short`), needs `node`/`npm` on `PATH`, and installs the fixture's pinned dependencies automatically (`npm ci`) on first run. CI runs it on `macos-latest` today; #11 adds a Linux leg so both platforms run the full suite.
