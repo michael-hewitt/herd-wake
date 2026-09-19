@@ -8,6 +8,14 @@ projects:
     application_port: 17101
     working_directory: /tmp
     command: npm run dev -- --port 17101 --strictPort
+    # A preview-shaped project: secrets in a file next to the working
+    # directory, one sensitive and one harmless inline variable, and terse
+    # public diagnostics.
+    env_file: .env.preview
+    env:
+      DB_LOGIN: postgres://u:hunter2@db
+      ENVIRONMENT: preview
+    diagnostic_logs: false
   accounts-vite:
     public_url: https://vite.accounts.test
     supervisor_port: 7102

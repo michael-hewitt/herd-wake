@@ -80,6 +80,77 @@ func TestRunProjectsListsConfiguredProjects(t *testing.T) {
 	}
 }
 
+// TestRunProjectsShowsEnvironmentSafely: the listing names a project's env
+// files and its inline env map, masks the value of a sensitive-looking
+// name, and says when the public diagnostics are terse — and never prints
+// the secret itself, so a pasted listing is safe to share.
+func TestRunProjectsShowsEnvironmentSafely(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	code := run([]string{"projects", "--config", "testdata/config.yaml"}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("run(projects) exit code = %d, want 0 (stderr: %q)", code, stderr.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{
+		"Env files:         .env.preview",
+		"the working directory",
+		"DB_LOGIN=[redacted]",
+		"ENVIRONMENT=preview",
+		"diagnostic_logs: false",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("run(projects) stdout missing %q; got:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "hunter2") {
+		t.Errorf("run(projects) printed the DB_LOGIN password; got:\n%s", out)
+	}
+	// A project with no environment gets no environment lines at all.
+	accounts, _, _ := strings.Cut(out[strings.Index(out, "accounts-vite"):], "\n\n")
+	if strings.Contains(accounts, "Env") || strings.Contains(accounts, "Diagnostics:") {
+		t.Errorf("accounts-vite has no env_file, env, or diagnostic_logs, but its block says otherwise:\n%s", accounts)
+	}
+}
+
+// TestPrintWildcardShowsEnvironmentSafely: a wildcard entry's template
+// carries the same environment block, worded for the worktrees it is
+// applied to.
+func TestPrintWildcardShowsEnvironmentSafely(t *testing.T) {
+	var out bytes.Buffer
+	d := &config.Discovery{
+		Name:       "preview",
+		Mode:       config.ModeWildcard,
+		BaseDomain: "preview.example.test",
+		Directory:  "/srv/previews",
+	}
+	d.Template.Command = "npm run dev"
+	d.Template.SupervisorPort = 7200
+	d.Template.EnvFile = config.EnvFiles{"/etc/herd-wake/preview.env", ".env.preview"}
+	d.Template.Env = map[string]string{"DB_LOGIN": "postgres://u:hunter2@db", "ENVIRONMENT": "preview"}
+	off := false
+	d.Template.DiagnosticLogs = &off
+
+	printWildcard(&out, d)
+
+	got := out.String()
+	for _, want := range []string{
+		"Env files:         /etc/herd-wake/preview.env, .env.preview",
+		"the worktree it is read for",
+		"DB_LOGIN=[redacted]",
+		"ENVIRONMENT=preview",
+		"diagnostic_logs: false",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("printWildcard output missing %q; got:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "hunter2") {
+		t.Errorf("printWildcard printed the DB_LOGIN password; got:\n%s", got)
+	}
+}
+
 func TestRunProjectsMissingConfigFile(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	missing := filepath.Join(t.TempDir(), "config.yaml")

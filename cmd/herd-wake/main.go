@@ -12,6 +12,8 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -21,6 +23,7 @@ import (
 	"github.com/michael-hewitt/herd-wake/internal/config"
 	"github.com/michael-hewitt/herd-wake/internal/control"
 	"github.com/michael-hewitt/herd-wake/internal/daemon"
+	"github.com/michael-hewitt/herd-wake/internal/envfile"
 	"github.com/michael-hewitt/herd-wake/internal/herd"
 	"github.com/michael-hewitt/herd-wake/internal/version"
 )
@@ -132,6 +135,7 @@ func printWildcard(w io.Writer, d *config.Discovery) {
 	if d.MaxRunning > 0 {
 		fmt.Fprintf(w, "  Max running:       %d  (worktrees of this entry at once)\n", d.MaxRunning)
 	}
+	printEnvironment(w, &d.Template, "the worktree it is read for")
 }
 
 // runStart implements `herd-wake start`: it runs the supervisor daemon in
@@ -586,6 +590,46 @@ func printProject(w io.Writer, p *config.Project) {
 	fmt.Fprintf(w, "  Timeouts:          startup %ds, idle %dm\n", p.StartupTimeoutSeconds, p.IdleTimeoutMinutes)
 	if p.RewriteHost {
 		fmt.Fprintf(w, "  Upstream Host:     127.0.0.1:%d (rewrite_host)\n", p.ApplicationPort)
+	}
+	printEnvironment(w, p, "the working directory")
+}
+
+// printEnvironment writes the environment lines a project (or a wildcard
+// entry's template, whose fields every materialised worktree inherits)
+// contributes, and nothing at all when it has none of them.
+//
+// It names the env files without ever opening one: their contents are the
+// secrets the feature exists to keep out of herd-wake's output, and the
+// listing is meant to be safe to paste into a bug report. relativeTo names
+// the directory a relative entry is read from, which differs between a
+// project and a template. The inline env map is shown because the user
+// wrote it in the config themselves, with sensitive-looking values masked
+// so a shoulder or a screenshot learns nothing.
+func printEnvironment(w io.Writer, p *config.Project, relativeTo string) {
+	if len(p.EnvFile) > 0 {
+		line := strings.Join(p.EnvFile, ", ")
+		for _, file := range p.EnvFile {
+			if !filepath.IsAbs(file) {
+				line += fmt.Sprintf("  (a relative path is read from %s, and may be absent)", relativeTo)
+				break
+			}
+		}
+		fmt.Fprintf(w, "  %-19s%s\n", "Env files:", line)
+	}
+	if len(p.Env) > 0 {
+		names := make([]string, 0, len(p.Env))
+		for name := range p.Env {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		shown := make([]string, 0, len(names))
+		for _, name := range names {
+			shown = append(shown, name+"="+envfile.Display(name, p.Env[name]))
+		}
+		fmt.Fprintf(w, "  %-19s%s\n", "Env:", strings.Join(shown, ", "))
+	}
+	if !p.DiagnosticLogsEnabled() {
+		fmt.Fprintf(w, "  %-19s%s\n", "Diagnostics:", "process output hidden on the public 503/404 pages (diagnostic_logs: false)")
 	}
 }
 

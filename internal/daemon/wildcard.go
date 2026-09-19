@@ -143,6 +143,12 @@ type resolver struct {
 	maxWait time.Duration
 	maxHeld int64
 	held    atomic.Int64
+	// terse is the entry template's diagnostic_logs: false. The resolver's
+	// own 404 and 503 then name the label and nothing else — no worktree
+	// paths, no port_command output, no other project's port — because a
+	// wildcard listener behind nginx answers hostnames anyone on the
+	// internet can guess. The full reason still reaches the daemon log.
+	terse bool
 
 	mu sync.Mutex
 	// calls are the resolutions in flight, by label.
@@ -158,10 +164,19 @@ type resolveCall struct {
 	done    chan struct{}
 	handler http.Handler
 	diag    *proxy.Diagnostic
+	// detail is the untersed reason for the daemon log, set only when the
+	// diagnostic the client gets had detail removed from it (see
+	// resolver.terse). Empty means the diagnostic's own reason is the whole
+	// story and the log line reads exactly as it always has.
+	detail string
 }
 
 type resolveFailure struct {
-	diag    proxy.Diagnostic
+	diag proxy.Diagnostic
+	// detail is resolveCall.detail for the failure being remembered, so a
+	// request served from the backoff window logs as loudly as the one that
+	// discovered the failure.
+	detail  string
 	count   int
 	retryAt time.Time
 }
@@ -173,6 +188,7 @@ func newResolver(d *Daemon, es *entryState) *resolver {
 	return &resolver{
 		d:        d,
 		es:       es,
+		terse:    !p.DiagnosticLogsEnabled(),
 		maxWait:  time.Duration(p.HoldMaxWaitSeconds) * time.Second,
 		maxHeld:  int64(p.HoldMaxRequests),
 		calls:    map[string]*resolveCall{},
@@ -188,22 +204,26 @@ func (rs *resolver) serve(w http.ResponseWriter, r *http.Request, host string) {
 	label, ok := e.Label(host)
 	if !ok {
 		rs.d.logger.Printf("discovery %q: 404 for %s %s: host %q is not <label>.%s", e.Name, r.Method, r.URL.Path, host, e.BaseDomain)
-		proxy.WriteDiagnostic(w, r, proxy.Diagnostic{
+		diag, _ := rs.public(&proxy.Diagnostic{
 			Status: http.StatusNotFound,
 			Title:  fmt.Sprintf("no project for host %q", host),
 			Reason: fmt.Sprintf("The herd-wake listener on %s serves the git worktrees under %s at %s — exactly one label, directly under %s — and %q is not such a hostname.",
 				rs.es.bind.addr, e.Directory, e.URLPattern(), e.BaseDomain, host),
 			Hint: fmt.Sprintf("Open https://<worktree>.%s, where <worktree> is a directory name under %s.", e.BaseDomain, e.Directory),
-		})
+		}, "", noWorktreeReason, noWorktreeHint)
+		proxy.WriteDiagnostic(w, r, *diag)
 		return
 	}
 	if rs.d.draining.Load() {
 		proxy.WriteDiagnostic(w, r, proxy.Diagnostic{Status: http.StatusServiceUnavailable, Project: label, Reason: "The herd-wake daemon is shutting down.", Hint: " "})
 		return
 	}
-	h, diag := rs.resolve(r.Context(), label)
+	h, diag, detail := rs.resolve(r.Context(), label)
 	if diag != nil {
-		rs.d.logger.Printf("discovery %q: %d for %s %s (%s): %s", e.Name, diag.Status, r.Method, r.URL.Path, host, diag.Reason)
+		if detail == "" {
+			detail = diag.Reason
+		}
+		rs.d.logger.Printf("discovery %q: %d for %s %s (%s): %s", e.Name, diag.Status, r.Method, r.URL.Path, host, detail)
 		proxy.WriteDiagnostic(w, r, *diag)
 		return
 	}
@@ -221,13 +241,13 @@ func (rs *resolver) serve(w http.ResponseWriter, r *http.Request, host string) {
 // not retried before its backoff elapses; a worktree that is not a
 // candidate is a 404 and is re-checked on every request, so a re-created
 // worktree materialises fresh.
-func (rs *resolver) resolve(ctx context.Context, label string) (http.Handler, *proxy.Diagnostic) {
+func (rs *resolver) resolve(ctx context.Context, label string) (http.Handler, *proxy.Diagnostic, string) {
 	if held := rs.held.Add(1); held > rs.maxHeld {
 		rs.held.Add(-1)
 		return nil, &proxy.Diagnostic{
 			Status: http.StatusServiceUnavailable, Project: label, Hint: " ",
 			Reason: fmt.Sprintf("Too many requests are already waiting for this worktree to be resolved (limit %d, hold_max_requests). Retry shortly.", rs.maxHeld),
-		}
+		}, ""
 	}
 	defer rs.held.Add(-1)
 
@@ -240,13 +260,13 @@ func (rs *resolver) resolve(ctx context.Context, label string) (http.Handler, *p
 		rs.mu.Unlock()
 		diag := f.diag
 		diag.Hint = fmt.Sprintf("Automatic retry in %s (the next request after that resolves the worktree again).", time.Until(f.retryAt).Round(100*time.Millisecond))
-		return nil, &diag
+		return nil, &diag, f.detail
 	}
 	c := &resolveCall{done: make(chan struct{})}
 	rs.calls[label] = c
 	rs.mu.Unlock()
 
-	c.handler, c.diag = rs.materialise(label)
+	c.handler, c.diag, c.detail = rs.materialise(label)
 
 	rs.mu.Lock()
 	delete(rs.calls, label)
@@ -260,27 +280,27 @@ func (rs *resolver) resolve(ctx context.Context, label string) (http.Handler, *p
 		}
 		f.count++
 		f.retryAt = time.Now().Add(resolveBackoff(f.count))
-		f.diag = *c.diag
+		f.diag, f.detail = *c.diag, c.detail
 	}
 	rs.mu.Unlock()
 	close(c.done)
-	return c.handler, c.diag
+	return c.handler, c.diag, c.detail
 }
 
 // await waits for a resolution another request started.
-func (rs *resolver) await(ctx context.Context, c *resolveCall) (http.Handler, *proxy.Diagnostic) {
+func (rs *resolver) await(ctx context.Context, c *resolveCall) (http.Handler, *proxy.Diagnostic, string) {
 	wait := time.NewTimer(rs.maxWait)
 	defer wait.Stop()
 	select {
 	case <-c.done:
-		return c.handler, c.diag
+		return c.handler, c.diag, c.detail
 	case <-wait.C:
 		return nil, &proxy.Diagnostic{
 			Status: http.StatusServiceUnavailable, Hint: " ",
 			Reason: fmt.Sprintf("Gave up waiting after %s (hold_max_wait_seconds) for the worktree to be resolved.", rs.maxWait),
-		}
+		}, ""
 	case <-ctx.Done():
-		return nil, nil
+		return nil, nil, ""
 	}
 }
 
@@ -296,11 +316,12 @@ func resolveBackoff(n int) time.Duration {
 // materialise builds and registers the project for label, or explains why
 // it cannot: a 404 when <directory>/<label> is not a servable worktree, a
 // 503 when its port cannot be determined or is taken.
-func (rs *resolver) materialise(label string) (http.Handler, *proxy.Diagnostic) {
+func (rs *resolver) materialise(label string) (http.Handler, *proxy.Diagnostic, string) {
 	d, e := rs.d, rs.es.entry
 	dir, reason := discovery.Check(e, label)
 	if reason != "" {
-		return nil, rs.noWorktree(label, dir, reason)
+		diag, detail := rs.noWorktree(label, dir, reason)
+		return nil, diag, detail
 	}
 
 	d.mu.RLock()
@@ -308,25 +329,27 @@ func (rs *resolver) materialise(label string) (http.Handler, *proxy.Diagnostic) 
 	runCtx := d.runCtx
 	d.mu.RUnlock()
 	if existing != nil {
-		return nil, rs.nameTaken(label, existing)
+		return nil, rs.nameTaken(label, existing), ""
 	}
 
 	port, err := rs.discoverPort(runCtx, label, dir)
 	if err != nil {
-		return nil, &proxy.Diagnostic{
+		diag, detail := rs.public(&proxy.Diagnostic{
 			Status: http.StatusServiceUnavailable, Project: label,
 			Title:  fmt.Sprintf("worktree %q cannot be served", label),
 			Reason: fmt.Sprintf("herd-wake could not determine the dev server port for %s: %v.", dir, err),
 			Hint:   "Fix the worktree (or the discovery entry's port_command) and retry.",
-		}
+		}, "", noPortReason, noPortHint)
+		return nil, diag, detail
 	}
 	if owner := d.portOwner(port, label); owner != "" {
-		return nil, &proxy.Diagnostic{
+		diag, detail := rs.public(&proxy.Diagnostic{
 			Status: http.StatusServiceUnavailable, Project: label,
 			Title:  fmt.Sprintf("worktree %q cannot be served", label),
 			Reason: fmt.Sprintf("The dev server port for %s is %d, which %s already uses; two servers cannot share it.", dir, port, owner),
 			Hint:   "Give the worktree a port of its own (see the discovery entry's port_command / application_port_range) and retry.",
-		}
+		}, "", noPortReason, noPortHint)
+		return nil, diag, detail
 	}
 
 	p := e.Project(label, dir, port)
@@ -338,14 +361,15 @@ func (rs *resolver) materialise(label string) (http.Handler, *proxy.Diagnostic) 
 		go d.dropDynamicByName(label, rs.es, "its worktree directory vanished")
 	}, missing: func(w http.ResponseWriter, r *http.Request) {
 		_, reason := discovery.Check(e, label)
-		proxy.WriteDiagnostic(w, r, *rs.noWorktree(label, dir, reason))
+		diag, _ := rs.noWorktree(label, dir, reason)
+		proxy.WriteDiagnostic(w, r, *diag)
 	}}
 
 	d.mu.Lock()
 	if d.states[label] != nil {
 		other := d.states[label]
 		d.mu.Unlock()
-		return nil, rs.nameTaken(label, other)
+		return nil, rs.nameTaken(label, other), ""
 	}
 	d.states[label] = st
 	st.bind = rs.es.bind
@@ -355,19 +379,48 @@ func (rs *resolver) materialise(label string) (http.Handler, *proxy.Diagnostic) 
 	d.activate(st, runCtx)
 	d.logger.Printf("discovery %q: materialised project %q for %s (%s)", e.Name, label, dir, p.PublicURL)
 	d.logProxying(p)
-	return route, nil
+	return route, nil, ""
+}
+
+// The wording a terse diagnostic says instead of the real reason: what
+// went wrong, in terms a stranger on the internet learns nothing from, and
+// where the operator reads the rest.
+const (
+	noWorktreeReason = "There is no servable worktree for this hostname."
+	noWorktreeHint   = "Check the daemon log on the host for the rule that rejected it."
+	noPortReason     = "herd-wake could not determine a usable dev server port for this worktree."
+	noPortHint       = "See the daemon log on the host."
+)
+
+// public returns the diagnostic to send to the client and the reason to
+// log. In the default mode full is sent as it stands and there is no
+// separate detail, so the daemon log reads exactly as it always has. Under
+// terse mode the client gets title (when given), reason, and hint in place
+// of full's — the status, and the label in Project, are all that survive —
+// and full's reason becomes the log's detail, so turning the public pages
+// terse costs the operator nothing.
+func (rs *resolver) public(full *proxy.Diagnostic, title, reason, hint string) (*proxy.Diagnostic, string) {
+	if !rs.terse {
+		return full, ""
+	}
+	terse := *full
+	if title != "" {
+		terse.Title = title
+	}
+	terse.Reason, terse.Hint = reason, hint
+	return &terse, full.Reason
 }
 
 // noWorktree is the 404 for a label whose directory fails the candidate
-// rules.
-func (rs *resolver) noWorktree(label, dir, reason string) *proxy.Diagnostic {
+// rules, with the reason to log alongside it (see public).
+func (rs *resolver) noWorktree(label, dir, reason string) (*proxy.Diagnostic, string) {
 	e := rs.es.entry
-	return &proxy.Diagnostic{
+	return rs.public(&proxy.Diagnostic{
 		Status: http.StatusNotFound,
 		Title:  fmt.Sprintf("no worktree named %q under %s", label, e.Directory),
 		Reason: fmt.Sprintf("%s resolves to %s, which is not a worktree herd-wake can serve: %s.", e.PublicURL(label), dir, reason),
 		Hint:   "Create the worktree (it is served on the next request), or check the discovery entry's rules: repository, require_files, exclude.",
-	}
+	}, fmt.Sprintf("no worktree named %q", label), noWorktreeReason, noWorktreeHint)
 }
 
 // nameTaken is the 503 for a label whose name is already a registered
