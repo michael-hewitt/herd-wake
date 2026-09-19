@@ -75,7 +75,7 @@ Platforms — macOS and Linux carry equal weight; Windows is out of scope:
 |---|---|---|
 | Front proxy that owns 80/443, DNS and TLS | [Laravel Herd](https://herd.laravel.com); `herd-wake sync` registers the proxy entries for you | nginx or Caddy with one wildcard `server` block you register once — [Bring your own proxy](#bring-your-own-proxy) |
 | Runs the daemon at boot | launchd, from the plist in `.claude/skills/herd-wake-worktrees/launchd/` — [Running as a service](#running-as-a-service) | systemd, from the user unit `contrib/herd-wake.service` — [Running as a service](#running-as-a-service) |
-| Config / socket / logs | All under `~/Library/Application Support/herd-wake`: `config.yaml` (+ `projects.d/`), `herd-wake.sock`, `logs/` | XDG: config `~/.config/herd-wake/config.yaml` (+ `projects.d/`), socket `$XDG_RUNTIME_DIR/herd-wake.sock` (fallback `/tmp/herd-wake-<uid>/`), logs `~/.local/state/herd-wake/logs/`; `$XDG_CONFIG_HOME`/`$XDG_STATE_HOME` honoured |
+| Config / socket / logs | All under `~/Library/Application Support/herd-wake`: `config.yaml` (+ `projects.d/`), `herd-wake.sock`, `logs/` | XDG: config `~/.config/herd-wake/config.yaml` (+ `projects.d/`), socket `$XDG_RUNTIME_DIR/herd-wake.sock` (fallback `/run/user/<uid>/` when it exists, else `/tmp/herd-wake-<uid>/`), logs `~/.local/state/herd-wake/logs/`; `$XDG_CONFIG_HOME`/`$XDG_STATE_HOME` honoured |
 | CI | unit and e2e suites on `macos-latest` | unit and e2e suites on `ubuntu-latest` |
 
 Requirements:
@@ -456,7 +456,7 @@ Rules and guarantees:
 
 **macOS — launchd.** The `herd-wake-worktrees` skill ships a LaunchAgent template at `.claude/skills/herd-wake-worktrees/launchd/us.hewitts.herd-wake.plist` (`RunAtLoad` + `KeepAlive`, `PATH` set to your Node, daemon log in `~/Library/Logs/herd-wake/daemon.log`); fill in `__HOME__`/`__NODE_BIN__`, copy it to `~/Library/LaunchAgents/`, and `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/us.hewitts.herd-wake.plist`. The skill's step 3 has the exact commands.
 
-**Linux — systemd.** [`contrib/herd-wake.service`](contrib/herd-wake.service) is a user unit: `ExecStart=%h/.local/bin/herd-wake start` with no flags, so the daemon uses the XDG defaults (config `~/.config/herd-wake/config.yaml`, logs `~/.local/state/herd-wake/logs/`, socket `$XDG_RUNTIME_DIR/herd-wake.sock` — the user manager sets `XDG_RUNTIME_DIR`, so that is `/run/user/<uid>/herd-wake.sock`, where the CLI looks too). Edit the binary path if yours is `/usr/local/bin`; the commented `--config`/`--socket`/`--log-dir` line shows explicit paths.
+**Linux — systemd.** [`contrib/herd-wake.service`](contrib/herd-wake.service) is a user unit: `ExecStart=%h/.local/bin/herd-wake start` with no flags, so the daemon uses the XDG defaults (config `~/.config/herd-wake/config.yaml`, logs `~/.local/state/herd-wake/logs/`, socket `$XDG_RUNTIME_DIR/herd-wake.sock` — the user manager sets `XDG_RUNTIME_DIR`, so that is `/run/user/<uid>/herd-wake.sock`, where the CLI looks too — even from a shell without `XDG_RUNTIME_DIR` such as cron or `su`, since it falls back to `/run/user/<uid>` when that directory exists before `/tmp/herd-wake-<uid>`). Edit the binary path if yours is `/usr/local/bin`; the commented `--config`/`--socket`/`--log-dir` line shows explicit paths.
 
 ```sh
 mkdir -p ~/.config/systemd/user
@@ -623,7 +623,7 @@ Flags (place them before positional arguments):
 | Flag | Applies to | Default | Meaning |
 | --- | --- | --- | --- |
 | `--config <path>` | `start`, `projects`, `sync`, `url`, `project:remove` | `<config dir>/config.yaml` | Config file to load; `projects.d/` next to it is merged in. |
-| `--socket <path>` | `start`, `status`, `reload`, `sync`, `project:*`, `logs` | `<config dir>/herd-wake.sock` (macOS), `$XDG_RUNTIME_DIR/herd-wake.sock` (Linux) | Control socket the daemon serves / clients query. |
+| `--socket <path>` | `start`, `status`, `reload`, `sync`, `project:*`, `logs` | `<config dir>/herd-wake.sock` (macOS), `$XDG_RUNTIME_DIR/herd-wake.sock` (Linux; fallback `/run/user/<uid>/` when it exists, else `/tmp/herd-wake-<uid>/`) | Control socket the daemon serves / clients query. |
 | `--log-dir <path>` | `start` | `<config dir>/logs` (macOS), `~/.local/state/herd-wake/logs` (Linux) | Directory for per-project process logs (`<name>.log`). |
 | `--ttl <duration>` | `project:lease` | `30m` | How long the lease lasts, e.g. `45m`, `2h`. |
 | `--lines <n>` | `logs` | `0` | Maximum lines to print (0 = everything buffered, up to 200). |
@@ -656,7 +656,7 @@ WebSocket upgrades are proxied like any other traffic, including through a cold 
 
 ## Troubleshooting
 
-**Where everything lives.** Config `config.yaml` plus `projects.d/*.yaml` next to it in the platform's config directory (`~/Library/Application Support/herd-wake` on macOS, `~/.config/herd-wake` on Linux); control socket next to the config on macOS, `$XDG_RUNTIME_DIR/herd-wake.sock` on Linux; process logs `logs/<name>.log` next to the config on macOS, under `~/.local/state/herd-wake` on Linux (also surfaced by `herd-wake logs <name>`, and quoted in 503 diagnostics). The [Install](#install) table has the full list; all overridable with `--config` / `--socket` / `--log-dir`, and under systemd the daemon's own output is `journalctl --user -u herd-wake`.
+**Where everything lives.** Config `config.yaml` plus `projects.d/*.yaml` next to it in the platform's config directory (`~/Library/Application Support/herd-wake` on macOS, `~/.config/herd-wake` on Linux); control socket next to the config on macOS, `$XDG_RUNTIME_DIR/herd-wake.sock` on Linux (fallback `/run/user/<uid>/` when it exists, else `/tmp/herd-wake-<uid>/`; the daemon refuses a socket directory it does not own); process logs `logs/<name>.log` next to the config on macOS, under `~/.local/state/herd-wake` on Linux (also surfaced by `herd-wake logs <name>`, and quoted in 503 diagnostics). The [Install](#install) table has the full list; all overridable with `--config` / `--socket` / `--log-dir`, and under systemd the daemon's own output is `journalctl --user -u herd-wake`.
 
 **Cold start returns 503 "readiness … timeout".** The command started but never answered the readiness probe within `startup_timeout_seconds`. In rough order of likelihood:
 

@@ -140,6 +140,12 @@ func TestUsageMentionsProjects(t *testing.T) {
 // The usage text and the per-command flag help show the running platform's
 // default paths (macOS: Application Support; Linux: XDG), abbreviated with ~.
 func TestUsageShowsPlatformDefaultPaths(t *testing.T) {
+	// The XDG variables on this machine may point outside $HOME; the test
+	// wants the home-relative defaults.
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("XDG_STATE_HOME", "")
+	t.Setenv("XDG_RUNTIME_DIR", "")
+
 	defaults := config.DisplayDefaults()
 	if !strings.HasPrefix(defaults.ConfigFile, "~/") {
 		t.Fatalf("DisplayDefaults().ConfigFile = %q, want a ~-abbreviated path", defaults.ConfigFile)

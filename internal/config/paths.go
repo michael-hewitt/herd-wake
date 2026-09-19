@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 )
 
@@ -29,22 +30,27 @@ type Paths struct {
 //   - Linux (and any other OS): XDG conventions. Config in
 //     $XDG_CONFIG_HOME/herd-wake (fallback ~/.config/herd-wake), logs in
 //     $XDG_STATE_HOME/herd-wake/logs (fallback ~/.local/state/herd-wake/logs),
-//     socket $XDG_RUNTIME_DIR/herd-wake.sock (fallback
-//     /tmp/herd-wake-<uid>/herd-wake.sock). An XDG variable is honoured only
-//     when it holds an absolute path, as the XDG base directory spec requires.
+//     socket $XDG_RUNTIME_DIR/herd-wake.sock, falling back to
+//     /run/user/<uid>/herd-wake.sock when that directory exists (so a shell
+//     without XDG_RUNTIME_DIR — cron, su, docker exec — still finds the
+//     socket of a daemon running under the systemd user manager) and
+//     otherwise to /tmp/herd-wake-<uid>/herd-wake.sock. An XDG variable is
+//     honoured only when it holds an absolute path, as the XDG base
+//     directory spec requires.
 func DefaultPaths() (Paths, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return Paths{}, fmt.Errorf("resolve home directory: %w", err)
 	}
-	return defaultPaths(runtime.GOOS, os.Getenv, home, os.Getuid()), nil
+	return defaultPaths(runtime.GOOS, os.Getenv, home, os.Getuid(), dirExists), nil
 }
 
 // defaultPaths is DefaultPaths with the platform inputs injected: goos is the
 // runtime.GOOS value, getenv looks up environment variables, home is the
-// user's home directory and uid the numeric user id (used for the per-user
-// /tmp socket fallback on Linux).
-func defaultPaths(goos string, getenv func(string) string, home string, uid int) Paths {
+// user's home directory, uid the numeric user id (used for the per-user
+// socket fallbacks on Linux) and dirExists reports whether a directory
+// exists (used to detect /run/user/<uid>).
+func defaultPaths(goos string, getenv func(string) string, home string, uid int, dirExists func(string) bool) Paths {
 	if goos == "darwin" {
 		base := filepath.Join(home, "Library", "Application Support", "herd-wake")
 		return Paths{
@@ -57,7 +63,7 @@ func defaultPaths(goos string, getenv func(string) string, home string, uid int)
 
 	configHome := xdgDir(getenv, "XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	stateHome := xdgDir(getenv, "XDG_STATE_HOME", filepath.Join(home, ".local", "state"))
-	runtimeDir := xdgDir(getenv, "XDG_RUNTIME_DIR", filepath.Join("/tmp", fmt.Sprintf("herd-wake-%d", uid)))
+	runtimeDir := xdgDir(getenv, "XDG_RUNTIME_DIR", runtimeDirFallback(uid, dirExists))
 
 	base := filepath.Join(configHome, "herd-wake")
 	return Paths{
@@ -66,6 +72,25 @@ func defaultPaths(goos string, getenv func(string) string, home string, uid int)
 		LogsDir:    filepath.Join(stateHome, "herd-wake", "logs"),
 		SocketPath: filepath.Join(runtimeDir, "herd-wake.sock"),
 	}
+}
+
+// runtimeDirFallback is the socket directory when XDG_RUNTIME_DIR is unset:
+// the systemd user manager's /run/user/<uid> when it exists (the daemon under
+// contrib/herd-wake.service listens there, and the CLI must find it even from
+// a shell that does not carry the variable), otherwise a private /tmp
+// directory.
+func runtimeDirFallback(uid int, dirExists func(string) bool) string {
+	if runDir := filepath.Join("/run", "user", strconv.Itoa(uid)); dirExists(runDir) {
+		return runDir
+	}
+	return filepath.Join("/tmp", fmt.Sprintf("herd-wake-%d", uid))
+}
+
+// dirExists reports whether path is an existing directory (following
+// symlinks).
+func dirExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
 }
 
 // xdgDir returns the value of the XDG base directory variable name when it
@@ -107,9 +132,9 @@ func LogsDir() (string, error) {
 
 // SocketPath returns the default control socket path:
 // ~/Library/Application Support/herd-wake/herd-wake.sock on macOS,
-// $XDG_RUNTIME_DIR/herd-wake.sock (fallback
-// /tmp/herd-wake-<uid>/herd-wake.sock) on Linux. The daemon listens on it
-// and the CLI connects to it.
+// $XDG_RUNTIME_DIR/herd-wake.sock (fallback /run/user/<uid>/herd-wake.sock
+// when that directory exists, else /tmp/herd-wake-<uid>/herd-wake.sock) on
+// Linux. The daemon listens on it and the CLI connects to it.
 func SocketPath() (string, error) {
 	p, err := DefaultPaths()
 	return p.SocketPath, err
@@ -122,9 +147,9 @@ func SocketPath() (string, error) {
 func DisplayDefaults() Paths {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return defaultPaths(runtime.GOOS, os.Getenv, "~", os.Getuid())
+		return defaultPaths(runtime.GOOS, os.Getenv, "~", os.Getuid(), dirExists)
 	}
-	p := defaultPaths(runtime.GOOS, os.Getenv, home, os.Getuid())
+	p := defaultPaths(runtime.GOOS, os.Getenv, home, os.Getuid(), dirExists)
 	return Paths{
 		BaseDir:    abbreviateHome(p.BaseDir, home),
 		ConfigFile: abbreviateHome(p.ConfigFile, home),

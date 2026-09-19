@@ -10,12 +10,16 @@
 # defaults: config ~/.config/herd-wake/config.yaml (+ projects.d/), logs
 # ~/.local/state/herd-wake/logs/, and the control socket
 # $XDG_RUNTIME_DIR/herd-wake.sock — the user manager sets XDG_RUNTIME_DIR, so
-# the socket lands in /run/user/<uid>/herd-wake.sock, where the CLI looks too.
+# the socket lands in /run/user/<uid>/herd-wake.sock, where the CLI looks too,
+# even from a shell without XDG_RUNTIME_DIR (cron, su, docker exec): the CLI
+# falls back to /run/user/<uid> when it exists before /tmp/herd-wake-<uid>.
 
 [Unit]
 Description=herd-wake on-demand dev-server supervisor
 Documentation=https://github.com/michael-hewitt/herd-wake#running-as-a-service
-After=network.target
+# No After=: a user unit cannot order against the system's network targets
+# (network.target does not exist in the user manager), and the daemon binds
+# loopback only, so it needs none.
 
 [Service]
 Type=simple
