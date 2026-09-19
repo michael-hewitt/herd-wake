@@ -71,7 +71,7 @@ Platforms — macOS and Linux carry equal weight; Windows is out of scope:
 
 | | macOS | Linux (Ubuntu) |
 |---|---|---|
-| Front proxy that owns 80/443, DNS and TLS | [Laravel Herd](https://herd.laravel.com); `herd-wake sync` registers the proxy entries for you | nginx or Caddy with a wildcard `server` block ([Behind another proxy](#behind-another-proxy)); you register it once |
+| Front proxy that owns 80/443, DNS and TLS | [Laravel Herd](https://herd.laravel.com); `herd-wake sync` registers the proxy entries for you | nginx or Caddy with a wildcard `server` block ("Behind another proxy" under [Sharing a port: routing by Host](#sharing-a-port-routing-by-host)); you register it once |
 | Runs the daemon at boot | launchd (see the `herd-wake-worktrees` skill in `.claude/skills/`) | systemd (unit file and XDG paths land with [#11](https://github.com/michael-hewitt/herd-wake/issues/11)) |
 | Config / socket / logs | `~/Library/Application Support/herd-wake`, `~/Library/Logs/herd-wake` | XDG paths after #11; until then pass `--config`, `--socket`, `--log-dir` |
 | CI | e2e suite on `macos-latest` | unit tests on `ubuntu-latest` (e2e on Linux lands with #11) |
