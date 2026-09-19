@@ -1,0 +1,55 @@
+# herd-wake — user-level systemd unit (Linux).
+#
+# Install:  cp contrib/herd-wake.service ~/.config/systemd/user/
+#           systemctl --user daemon-reload
+#           systemctl --user enable --now herd-wake
+#           loginctl enable-linger $USER     # keep it running with no login session open
+# Logs:     journalctl --user -u herd-wake -f
+#
+# The daemon runs as your own user, never root. With no flags it uses the XDG
+# defaults: config ~/.config/herd-wake/config.yaml (+ projects.d/), logs
+# ~/.local/state/herd-wake/logs/, and the control socket
+# $XDG_RUNTIME_DIR/herd-wake.sock — the user manager sets XDG_RUNTIME_DIR, so
+# the socket lands in /run/user/<uid>/herd-wake.sock, where the CLI looks too,
+# even from a shell without XDG_RUNTIME_DIR (cron, su, docker exec): the CLI
+# falls back to /run/user/<uid> when it exists before /tmp/herd-wake-<uid>.
+
+[Unit]
+Description=herd-wake on-demand dev-server supervisor
+Documentation=https://github.com/michael-hewitt/herd-wake#running-as-a-service
+# No After=: a user unit cannot order against the system's network targets
+# (network.target does not exist in the user manager), and the daemon binds
+# loopback only, so it needs none.
+
+[Service]
+Type=simple
+# The binary path is the only line most installs change
+# (/usr/local/bin/herd-wake is the other common location).
+ExecStart=%h/.local/bin/herd-wake start
+# Explicit paths instead of the XDG defaults:
+#ExecStart=%h/.local/bin/herd-wake start --config %h/.config/herd-wake/config.yaml --socket %t/herd-wake.sock --log-dir %h/.local/state/herd-wake/logs
+WorkingDirectory=%h
+
+# User units do not inherit a login shell's PATH, so a Node installed by
+# nvm/fnm/volta is not found unless you set PATH here or give each project
+# (or discovery entry) a `node_path` in config.yaml.
+#Environment=PATH=%h/.nvm/versions/node/v24.15.0/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+# SIGTERM makes herd-wake stop every dev-server process group it started,
+# then exit. KillMode=mixed sends SIGTERM to herd-wake alone and leaves the
+# dev servers to it; anything still alive at TimeoutStopSec gets SIGKILL.
+# 90s comfortably exceeds a project's shutdown_timeout_seconds (default 10).
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=90
+
+Restart=on-failure
+RestartSec=5
+
+# The daemon's own stdout/stderr go to the journal; per-project dev-server
+# output still goes to the logs directory (`herd-wake logs <name>`).
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

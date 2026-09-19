@@ -12,6 +12,7 @@
 //	§18.9  TestFailedStartupDiagnostic
 //	§18.10 TestDaemonRestartLeavesProjectsStopped
 //	#14    TestWildcardWorktreesServedByHost
+//	#11    TestPlainNodeServerCommand
 package e2e
 
 import (
@@ -378,6 +379,64 @@ http.createServer((req, res) => { res.end('hello from ' + require('path').basena
 	d.waitForState("alpha", "stopped", 15*time.Second)
 	if code, _ := getHost(t, ports[0], "beta.e2e.test", "/"); code != http.StatusOK {
 		t.Fatalf("beta after stopping alpha: status %d", code)
+	}
+}
+
+// Plain node command (issue #11): a project whose command is a bare `node
+// server.js` with the port supplied through `env: {PORT: …}` rather than an
+// npm script — the staging-server shape — cold-starts through its
+// supervisor port, stops gracefully on project:stop (the fixture exits 0 on
+// SIGTERM, well inside the shutdown timeout, so no SIGKILL is involved), and
+// cold-starts again on the next request.
+func TestPlainNodeServerCommand(t *testing.T) {
+	requireE2E(t)
+	const shutdownTimeoutSeconds = 30
+	ports := freePorts(t, 2)
+	d := startDaemon(t, nodeFixtureProject("node-plain", ports[0], ports[1], shutdownTimeoutSeconds))
+
+	if state := d.projectStatus("node-plain").State; state != "stopped" {
+		t.Fatalf("fresh project state = %q, want stopped", state)
+	}
+
+	wantBody := fmt.Sprintf("node-fixture ok port=%d", ports[1])
+	code, body := get(t, ports[0], "/")
+	if code != http.StatusOK || !strings.Contains(body, wantBody) {
+		t.Fatalf("cold GET: status %d body %q, want 200 containing %q", code, body, wantBody)
+	}
+	first := d.projectStatus("node-plain")
+	if first.State != "running" || first.PID == 0 {
+		t.Fatalf("after cold start: state=%q pid=%d, want running with a pid", first.State, first.PID)
+	}
+	if n := countNodeFixtureProcs(t); n != 1 {
+		t.Fatalf("node-fixture process count after cold start = %d, want 1", n)
+	}
+
+	// Graceful stop: the fixture must be gone long before the daemon would
+	// escalate to SIGKILL.
+	stopped := time.Now()
+	out, err := d.cli("project:stop", "node-plain")
+	if err != nil {
+		t.Fatalf("herd-wake project:stop node-plain: %v\n%s", err, out)
+	}
+	d.waitForState("node-plain", "stopped", 10*time.Second)
+	if took := time.Since(stopped); took >= shutdownTimeoutSeconds*time.Second {
+		t.Fatalf("project:stop took %s, at or past the %ds shutdown timeout: the server did not exit on SIGTERM", took, shutdownTimeoutSeconds)
+	}
+	if n := countNodeFixtureProcs(t); n != 0 {
+		t.Fatalf("node-fixture process count after project:stop = %d, want 0", n)
+	}
+
+	// The next request cold-starts a fresh process.
+	code, body = get(t, ports[0], "/")
+	if code != http.StatusOK || !strings.Contains(body, wantBody) {
+		t.Fatalf("revive GET: status %d body %q, want 200 containing %q", code, body, wantBody)
+	}
+	revived := d.projectStatus("node-plain")
+	if revived.State != "running" || revived.PID == 0 {
+		t.Fatalf("after revive: state=%q pid=%d, want running with a pid", revived.State, revived.PID)
+	}
+	if revived.PID == first.PID {
+		t.Fatalf("revived pid %d equals the stopped process's pid", first.PID)
 	}
 }
 

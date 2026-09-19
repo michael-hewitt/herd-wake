@@ -151,6 +151,32 @@ func New(cfg *config.Config, socketPath, logDir string, logger *log.Logger) *Dae
 //
 // If another daemon already answers on the control socket, Run refuses to
 // start. A stale socket file (nothing accepting) is removed and replaced.
+// verifySocketDir refuses a control socket directory that is not a real
+// directory owned by the current user. MkdirAll accepts a pre-existing
+// directory as-is, so without this a /tmp/herd-wake-<uid> planted by another
+// local user (or a symlink pointing anywhere) would be used silently.
+func verifySocketDir(dir string) error {
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return fmt.Errorf("inspect control socket directory %s: %w", dir, err)
+	}
+	const hint = "point the daemon and CLI elsewhere with XDG_RUNTIME_DIR or --socket"
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("control socket directory %s is a symlink; refusing to use it (%s)", dir, hint)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("control socket directory %s is not a directory (%s)", dir, hint)
+	}
+	// Sys() is a *syscall.Stat_t on the unix platforms herd-wake builds for;
+	// skip the owner check anywhere it is not.
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
+		if owner := int(st.Uid); owner != os.Getuid() {
+			return fmt.Errorf("control socket directory %s is owned by uid %d, not the current user (uid %d); refusing to use it (%s)", dir, owner, os.Getuid(), hint)
+		}
+	}
+	return nil
+}
+
 func (d *Daemon) Run(ctx context.Context) error {
 	// Deferred (not just called on the normal path) so supervised process
 	// groups are terminated even if the daemon panics.
@@ -159,8 +185,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if err := d.claimSocket(ctx); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(d.socketPath), 0o755); err != nil {
+	// 0700: the socket is the daemon's control interface and, on Linux, its
+	// fallback directory lives under the shared /tmp.
+	socketDir := filepath.Dir(d.socketPath)
+	if err := os.MkdirAll(socketDir, 0o700); err != nil {
 		return fmt.Errorf("create control socket directory: %w", err)
+	}
+	if err := verifySocketDir(socketDir); err != nil {
+		return err
 	}
 
 	controlListener, err := net.Listen("unix", d.socketPath)

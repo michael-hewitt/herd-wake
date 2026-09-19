@@ -24,7 +24,8 @@ import (
 func runURL(args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("url", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	configPath := flags.String("config", "", "path to the config file (default: ~/Library/Application Support/herd-wake/config.yaml)")
+	defaults := config.DisplayDefaults()
+	configPath := flags.String("config", "", "path to the config file (default: "+defaults.ConfigFile+")")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}

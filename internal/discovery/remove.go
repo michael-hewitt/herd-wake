@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/michael-hewitt/herd-wake/internal/config"
@@ -45,6 +46,12 @@ type RemoveOptions struct {
 	// Herd is the Herd CLI, or nil when unavailable (HerdNote says why).
 	Herd     *herd.CLI
 	HerdNote string
+	// HerdUnavailable and GOOS are as in Options: with no Herd CLI found,
+	// off darwin, a project whose discovery entry leaves `herd:` unset (or
+	// that has no entry) is removed with no Herd action at all; on darwin
+	// the manual `herd unproxy` command is reported as before.
+	HerdUnavailable bool
+	GOOS            string
 	// KeepHerd leaves the project's Herd proxy in place.
 	KeepHerd bool
 }
@@ -91,10 +98,28 @@ func Remove(ctx context.Context, cfg *config.Config, name string, opts RemoveOpt
 	}
 
 	if !opts.KeepHerd {
-		s := &syncer{ctx: ctx, opts: Options{Herd: opts.Herd, HerdNote: opts.HerdNote}}
-		res.Herd = append(res.Herd, s.unproxyAction(true, p))
+		goos := opts.GOOS
+		if goos == "" {
+			goos = runtime.GOOS
+		}
+		s := &syncer{ctx: ctx, opts: Options{Herd: opts.Herd, HerdNote: opts.HerdNote, HerdUnavailable: opts.HerdUnavailable, GOOS: goos}}
+		if !s.herdQuiet(herdSettingFor(cfg, p)) {
+			res.Herd = append(res.Herd, s.unproxyAction(true, p))
+		}
 	}
 	return res, nil
+}
+
+// herdSettingFor returns the `herd:` setting of the discovery entry whose
+// managed file defines p, or nil when p has no such entry (a hand-written
+// projects.d file) or the entry leaves it unset.
+func herdSettingFor(cfg *config.Config, p *config.Project) *bool {
+	for _, d := range cfg.Discovery {
+		if d.Source() == p.Source {
+			return d.Herd
+		}
+	}
+	return nil
 }
 
 // hasManagedMarker reports whether an existing file starts with the

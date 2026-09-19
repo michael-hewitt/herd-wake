@@ -1,10 +1,12 @@
 // Package config loads and validates the herd-wake project configuration.
 //
-// The config is a user-level YAML file (by default
-// ~/Library/Application Support/herd-wake/config.yaml) that maps project
-// names to per-project settings: the public Herd URL, the loopback ports the
+// The config is a user-level YAML file that maps project names to
+// per-project settings: the public Herd URL, the loopback ports the
 // supervisor and the application listen on, the command to run, readiness
-// detection, and lifecycle timeouts.
+// detection, and lifecycle timeouts. Its default location depends on the
+// platform (see DefaultPaths): ~/Library/Application Support/herd-wake/
+// config.yaml on macOS, $XDG_CONFIG_HOME/herd-wake/config.yaml (fallback
+// ~/.config/herd-wake/config.yaml) on Linux.
 //
 // Next to the main file, an optional projects.d directory holds additional
 // project files (see Load): tooling that registers projects automatically

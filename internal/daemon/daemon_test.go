@@ -262,3 +262,54 @@ func TestDaemonReportsSupervisorPortConflict(t *testing.T) {
 		t.Errorf("control socket file should be cleaned up after failed start (stat err: %v)", err)
 	}
 }
+
+// The control socket directory must be a real directory owned by the
+// current user: a directory the test owns is accepted, a symlink to one is
+// refused with an error naming the path and the way out.
+func TestRunVerifiesControlSocketDirectory(t *testing.T) {
+	t.Run("owned directory", func(t *testing.T) {
+		socket := testSocketPath(t)
+		if err := verifySocketDir(filepath.Dir(socket)); err != nil {
+			t.Fatalf("verifySocketDir(owned dir) = %v, want nil", err)
+		}
+		_, stop, done := startDaemon(t, testConfig(freePort(t), freePort(t)))
+		stop()
+		if err := <-done; err != nil {
+			t.Fatalf("Run() = %v, want nil", err)
+		}
+	})
+
+	t.Run("symlinked directory", func(t *testing.T) {
+		real := filepath.Dir(testSocketPath(t))
+		link := filepath.Join(filepath.Dir(testSocketPath(t)), "link")
+		if err := os.Symlink(real, link); err != nil {
+			t.Fatal(err)
+		}
+		socket := filepath.Join(link, "d.sock")
+
+		err := New(testConfig(freePort(t), freePort(t)), socket, t.TempDir(), log.New(io.Discard, "", 0)).Run(context.Background())
+
+		if err == nil {
+			t.Fatal("Run() with a symlinked socket directory succeeded, want an error")
+		}
+		for _, want := range []string{link, "symlink", "XDG_RUNTIME_DIR", "--socket"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("Run() error %q should mention %q", err, want)
+			}
+		}
+		if _, statErr := os.Lstat(socket); !os.IsNotExist(statErr) {
+			t.Errorf("no socket should be created under the refused directory (stat err: %v)", statErr)
+		}
+	})
+
+	t.Run("regular file", func(t *testing.T) {
+		file := filepath.Join(t.TempDir(), "notadir")
+		if err := os.WriteFile(file, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		err := verifySocketDir(file)
+		if err == nil || !strings.Contains(err.Error(), "not a directory") {
+			t.Errorf("verifySocketDir(file) = %v, want a not-a-directory error", err)
+		}
+	})
+}

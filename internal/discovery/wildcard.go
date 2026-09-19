@@ -15,7 +15,8 @@ import (
 
 // StateFileName is the file next to the config in which sync records the
 // wildcard Herd proxies it created, so that removing (or renaming the
-// domain of) a wildcard entry and syncing again removes the proxy too.
+// domain of) a wildcard entry and syncing again removes the proxy too,
+// and the bring-your-own-proxy notes it has already shown.
 const StateFileName = "sync-state.yaml"
 
 // StatePath returns the sync state file next to the config at configPath.
@@ -23,34 +24,47 @@ func StatePath(configPath string) string {
 	return filepath.Join(filepath.Dir(configPath), StateFileName)
 }
 
-// syncState is the YAML shape of the state file.
+// syncState is the YAML shape of the state file. Older files carry only
+// wildcards; every key is optional so they still load.
 type syncState struct {
 	// Wildcards maps a wildcard entry's name to the Herd proxy sync
 	// registered for it.
 	Wildcards map[string]wildcardState `yaml:"wildcards,omitempty"`
+	// ProxyNotes maps a wildcard entry's name to the listener the
+	// bring-your-own-proxy note was last shown for, so the note is printed
+	// once and again only when base_domain or supervisor_port changes.
+	ProxyNotes map[string]wildcardState `yaml:"proxy_notes,omitempty"`
 }
 
-// wildcardState is one registered wildcard proxy.
+// wildcardState is one registered wildcard proxy (or the listener a proxy
+// note was shown for).
 type wildcardState struct {
 	BaseDomain     string `yaml:"base_domain"`
 	SupervisorPort int    `yaml:"supervisor_port"`
 }
 
+// empty reports whether there is nothing worth keeping a file for.
+func (st *syncState) empty() bool {
+	return len(st.Wildcards) == 0 && len(st.ProxyNotes) == 0
+}
+
 // loadState reads the state file; a missing file is an empty state.
 func loadState(path string) (*syncState, error) {
-	st := &syncState{Wildcards: map[string]wildcardState{}}
+	st := &syncState{}
 	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return st, nil
-	}
-	if err != nil {
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("read sync state %s: %w", path, err)
 	}
-	if err := yaml.Unmarshal(data, st); err != nil {
-		return nil, fmt.Errorf("parse sync state %s: %w", path, err)
+	if err == nil {
+		if err := yaml.Unmarshal(data, st); err != nil {
+			return nil, fmt.Errorf("parse sync state %s: %w", path, err)
+		}
 	}
 	if st.Wildcards == nil {
 		st.Wildcards = map[string]wildcardState{}
+	}
+	if st.ProxyNotes == nil {
+		st.ProxyNotes = map[string]wildcardState{}
 	}
 	return st, nil
 }
@@ -58,14 +72,14 @@ func loadState(path string) (*syncState, error) {
 // saveState writes the state file (removing it when there is nothing to
 // record).
 func saveState(path string, st *syncState) error {
-	if len(st.Wildcards) == 0 {
+	if st.empty() {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 		return nil
 	}
 	var buf bytes.Buffer
-	buf.WriteString("# Written by herd-wake sync: the wildcard Herd proxies it registered, so a\n# removed wildcard entry is unproxied on the next sync. Do not edit.\n")
+	buf.WriteString("# Written by herd-wake sync: the wildcard Herd proxies it registered, so a\n# removed wildcard entry is unproxied on the next sync, and the proxy notes\n# it has shown for entries synced without a Herd CLI. Do not edit.\n")
 	enc := yaml.NewEncoder(&buf)
 	enc.SetIndent(2)
 	if err := enc.Encode(st); err != nil {
@@ -84,8 +98,12 @@ func saveState(path string, st *syncState) error {
 // writes no projects.d file — worktrees are resolved by the daemon on
 // demand. A managed file left over from proxy mode is reported, never
 // deleted.
-func (s *syncer) syncWildcard(d *config.Discovery) *EntryResult {
-	res := &EntryResult{
+//
+// Without a Herd CLI the entry is left to the user's own proxy instead,
+// and note (empty when nothing is to be said) tells them what to point it
+// at — once, until the listener changes.
+func (s *syncer) syncWildcard(d *config.Discovery) (res *EntryResult, note string) {
+	res = &EntryResult{
 		Name:           d.Name,
 		Mode:           config.ModeWildcard,
 		Directory:      d.Directory,
@@ -104,6 +122,11 @@ func (s *syncer) syncWildcard(d *config.Discovery) *EntryResult {
 		res.Notices = append(res.Notices, fmt.Sprintf(
 			"%s exists (left over from proxy mode) and its projects are still registered; delete it, run `herd unproxy <worktree>` for each of them, and reload once you no longer need them",
 			stale))
+	}
+
+	note = s.proxyNote(d)
+	if s.herdOff(d) {
+		return res, note
 	}
 
 	host := d.BaseDomain
@@ -147,7 +170,34 @@ func (s *syncer) syncWildcard(d *config.Discovery) *EntryResult {
 	if a.Status == HerdDone || a.Status == HerdSkipped || a.Status == HerdDryRun {
 		s.state.Wildcards[d.Name] = wildcardState{BaseDomain: d.BaseDomain, SupervisorPort: d.SupervisorPort()}
 	}
-	return res
+	return res, note
+}
+
+// proxyNote returns the bring-your-own-proxy note for a wildcard entry
+// synced without a Herd CLI (`herd:` unset or true), or "" when there is
+// nothing to say: Herd is in use, --no-herd asked for Herd commands
+// instead, `herd: false`, or the same note was already shown for this
+// listener. Showing it records it in the state (which a dry run never
+// writes), so the next sync is silent until base_domain or the port
+// changes. A sync that uses Herd (or was told to leave it alone) forgets
+// the record, so the note comes back should Herd go away again.
+func (s *syncer) proxyNote(d *config.Discovery) string {
+	if s.opts.Herd != nil || !s.opts.HerdUnavailable || !d.HerdEnabled() {
+		delete(s.state.ProxyNotes, d.Name)
+		return ""
+	}
+	listener := wildcardState{BaseDomain: d.BaseDomain, SupervisorPort: d.SupervisorPort()}
+	if s.state.ProxyNotes[d.Name] == listener {
+		return ""
+	}
+	s.state.ProxyNotes[d.Name] = listener
+	note := fmt.Sprintf("no Herd CLI found; point your proxy at herd-wake yourself for discovery %q: *.%s → http://127.0.0.1:%d (see README \"Bring your own proxy\" for the nginx and Caddy blocks)",
+		d.Name, d.BaseDomain, d.SupervisorPort())
+	if s.opts.GOOS == "darwin" {
+		site, _ := herd.SiteName(d.BaseDomain)
+		note += fmt.Sprintf("; or install Laravel Herd and run: %s", herd.ProxyCommand(site, d.SupervisorPort()))
+	}
+	return note
 }
 
 // retireWildcards unproxies the registrations recorded before this sync
@@ -160,6 +210,13 @@ func (s *syncer) retireWildcards(previous map[string]wildcardState) []*EntryResu
 	for _, d := range s.cfg.Discovery {
 		if d.Wildcard() {
 			live[d.Name] = d
+		}
+	}
+	// A removed wildcard entry takes its proxy note with it (a changed
+	// listener was re-noted by syncWildcard).
+	for name := range s.state.ProxyNotes {
+		if _, ok := live[name]; !ok {
+			delete(s.state.ProxyNotes, name)
 		}
 	}
 	names := make([]string, 0, len(previous))

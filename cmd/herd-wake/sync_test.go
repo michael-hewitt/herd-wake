@@ -418,3 +418,230 @@ func TestUsageMentionsSyncAndRemove(t *testing.T) {
 		}
 	}
 }
+
+// withoutHerd removes the fixture's fake herd from PATH (leaving the
+// system tools sync needs) so Detect finds no Herd CLI; HOME is already a
+// temp dir without the bundled binary.
+func (f *syncFixture) withoutHerd() {
+	f.t.Helper()
+	f.t.Setenv("PATH", "/usr/bin:/bin")
+}
+
+// onGOOS makes sync and project:remove behave as on the given platform
+// for the rest of the test.
+func (f *syncFixture) onGOOS(goos string) {
+	f.t.Helper()
+	previous := hostGOOS
+	hostGOOS = goos
+	f.t.Cleanup(func() { hostGOOS = previous })
+}
+
+// writeWildcardEntry writes the main config with one plain wildcard entry
+// (no worktree servers needed) plus extra entry lines.
+func (f *syncFixture) writeWildcardEntry(extra string) {
+	f.t.Helper()
+	body := fmt.Sprintf(`projects: {}
+discovery:
+  - name: webapp
+    mode: wildcard
+    supervisor_port: %d
+    directory: %s
+    repository: %s
+    command: ./start.sh
+    application_port_range: [42000, 42999]
+%s`, f.supervisorLow, f.workspace, f.repo, extra)
+	if err := os.WriteFile(f.configPath, []byte(body), 0o644); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+// TestRunSyncWithoutHerdCLIPrintsProxyNoteOnce: on a Linux machine
+// without Herd a wildcard entry syncs quietly — no Herd lines, no
+// commands to run by hand — and the bring-your-own-proxy note is printed
+// on the first sync only; --json carries it.
+func TestRunSyncWithoutHerdCLIPrintsProxyNoteOnce(t *testing.T) {
+	f := newSyncFixture(t)
+	f.withoutHerd()
+	f.onGOOS("linux")
+	f.writeWildcardEntry("")
+	note := fmt.Sprintf(`Proxy: no Herd CLI found; point your proxy at herd-wake yourself for discovery "webapp": *.webapp.test → http://127.0.0.1:%d (see README "Bring your own proxy" for the nginx and Caddy blocks)`, f.supervisorLow)
+
+	// Dry run first: the note shows but is not remembered.
+	code, stdout, stderr := f.run("sync", "--config", f.configPath, "--socket", f.socket, "--dry-run")
+	if code != 0 || !strings.Contains(stdout, note) {
+		t.Fatalf("dry-run sync: code=%d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+
+	code, stdout, stderr = f.run("sync", "--config", f.configPath, "--socket", f.socket)
+	if code != 0 {
+		t.Fatalf("sync exit code = %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+	for _, want := range []string{`Discovery "webapp"`, "wildcard: https://<label>.webapp.test", note, "Daemon: not running"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("sync output missing %q; got:\n%s", want, stdout)
+		}
+	}
+	if strings.Count(stdout, "Proxy:") != 1 {
+		t.Errorf("proxy note should appear once:\n%s", stdout)
+	}
+	assertQuietAboutHerd(t, stdout)
+	if _, err := os.Stat(filepath.Join(f.configDir, "sync-state.yaml")); err != nil {
+		t.Errorf("sync-state.yaml not written: %v", err)
+	}
+
+	// Second sync: silent about the proxy.
+	code, stdout, stderr = f.run("sync", "--config", f.configPath, "--socket", f.socket)
+	if code != 0 {
+		t.Fatalf("second sync exit code = %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+	if strings.Contains(stdout, "Proxy:") {
+		t.Errorf("second sync should not repeat the proxy note:\n%s", stdout)
+	}
+	assertQuietAboutHerd(t, stdout)
+
+	// A changed base_domain shows it again, and --json carries it.
+	f.writeWildcardEntry("    base_domain: preview.test\n")
+	code, stdout, stderr = f.run("sync", "--config", f.configPath, "--socket", f.socket, "--json")
+	if code != 0 {
+		t.Fatalf("json sync exit code = %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+	var out struct {
+		HerdAvailable bool     `json:"herd_available"`
+		HerdNote      string   `json:"herd_note"`
+		ProxyNotes    []string `json:"proxy_notes"`
+		Discovery     []struct {
+			Name string `json:"name"`
+			Herd []any  `json:"herd"`
+		} `json:"discovery"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &out); err != nil {
+		t.Fatalf("sync --json output is not JSON: %v\n%s", err, stdout)
+	}
+	if out.HerdAvailable || !strings.Contains(out.HerdNote, "herd CLI not found") {
+		t.Errorf("herd_available = %v, herd_note = %q", out.HerdAvailable, out.HerdNote)
+	}
+	if len(out.ProxyNotes) != 1 || !strings.Contains(out.ProxyNotes[0], fmt.Sprintf("*.preview.test → http://127.0.0.1:%d", f.supervisorLow)) {
+		t.Errorf("proxy_notes = %q", out.ProxyNotes)
+	}
+	if len(out.Discovery) != 1 || out.Discovery[0].Name != "webapp" || len(out.Discovery[0].Herd) != 0 {
+		t.Errorf("discovery = %+v, want the entry with no Herd actions", out.Discovery)
+	}
+
+	// An explicit herd: true still asks for Herd: the reason and the
+	// manual command are printed.
+	f.writeWildcardEntry("    herd: true\n")
+	code, stdout, stderr = f.run("sync", "--config", f.configPath, "--socket", f.socket)
+	if code != 0 {
+		t.Fatalf("herd: true sync exit code = %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+	for _, want := range []string{"Herd: herd CLI not found", "Run these Herd commands yourself:", fmt.Sprintf("  herd proxy webapp http://127.0.0.1:%d --secure", f.supervisorLow)} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("herd: true output missing %q; got:\n%s", want, stdout)
+		}
+	}
+}
+
+// TestRunSyncWithoutHerdCLIProxyModeIsQuiet: on Linux a proxy-mode entry
+// with `herd:` unset is written and reloaded with nothing said about
+// Herd; the URLs it registered are noted once for the user's own proxy,
+// and project:remove is quiet about Herd too.
+func TestRunSyncWithoutHerdCLIProxyModeIsQuiet(t *testing.T) {
+	f := newSyncFixture(t)
+	f.withoutHerd()
+	f.onGOOS("linux")
+	f.worktree("alpha")
+	f.writeConfig("")
+	note := fmt.Sprintf("Proxy: no Herd CLI found; point your proxy at herd-wake yourself for the new URLs of discovery \"webapp\" (see README \"Bring your own proxy\" for the nginx and Caddy blocks):\n  https://alpha.test → http://127.0.0.1:%d\n", f.supervisorLow)
+
+	code, stdout, stderr := f.run("sync", "--config", f.configPath, "--socket", f.socket)
+	if code != 0 {
+		t.Fatalf("sync exit code = %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+	for _, want := range []string{"added:     alpha", "file:      written", note, "Daemon: not running"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("sync output missing %q; got:\n%s", want, stdout)
+		}
+	}
+	assertQuietAboutHerd(t, stdout)
+	if _, err := os.Stat(f.managedFile()); err != nil {
+		t.Error("managed file should be written without Herd")
+	}
+
+	// Unchanged: nothing to note.
+	code, stdout, stderr = f.run("sync", "--config", f.configPath, "--socket", f.socket)
+	if code != 0 {
+		t.Fatalf("second sync exit code = %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "unchanged: alpha") || strings.Contains(stdout, "Proxy:") {
+		t.Errorf("second sync should list alpha unchanged with no proxy note:\n%s", stdout)
+	}
+
+	// project:remove: no herd line at all.
+	code, stdout, stderr = f.run("project:remove", "--config", f.configPath, "--socket", f.socket, "alpha")
+	if code != 0 {
+		t.Fatalf("project:remove exit code = %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, `Removed project "alpha" from `+f.managedFile()) {
+		t.Errorf("project:remove output missing the removal line:\n%s", stdout)
+	}
+	assertQuietAboutHerd(t, stdout)
+}
+
+// TestRunSyncWithoutHerdCLIOnDarwinReportsHerd: on macOS a missing Herd
+// CLI is still reported the old way with `herd:` unset — the reason, the
+// manual `herd proxy` per project, the commands to run by hand — and
+// project:remove prints the manual `herd unproxy`.
+func TestRunSyncWithoutHerdCLIOnDarwinReportsHerd(t *testing.T) {
+	f := newSyncFixture(t)
+	f.withoutHerd()
+	f.onGOOS("darwin")
+	f.worktree("alpha")
+	f.writeConfig("")
+	proxyCmd := fmt.Sprintf("herd proxy alpha http://127.0.0.1:%d --secure", f.supervisorLow)
+
+	code, stdout, stderr := f.run("sync", "--config", f.configPath, "--socket", f.socket)
+	if code != 0 {
+		t.Fatalf("sync exit code = %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+	for _, want := range []string{
+		"added:     alpha",
+		fmt.Sprintf("herd:      proxy alpha → http://127.0.0.1:%d (run by hand: %s; herd CLI not found", f.supervisorLow, proxyCmd),
+		"file:      written",
+		"Herd: herd CLI not found",
+		"Run these Herd commands yourself:\n  " + proxyCmd + "\n",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("darwin sync output missing %q; got:\n%s", want, stdout)
+		}
+	}
+	if strings.Contains(stdout, "Proxy:") {
+		t.Errorf("darwin gets Herd commands, not a proxy note:\n%s", stdout)
+	}
+
+	code, stdout, stderr = f.run("project:remove", "--config", f.configPath, "--socket", f.socket, "alpha")
+	if code != 0 {
+		t.Fatalf("project:remove exit code = %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "herd: unproxy alpha (run by hand: herd unproxy alpha; herd CLI not found") {
+		t.Errorf("darwin project:remove should print the manual unproxy; got:\n%s", stdout)
+	}
+}
+
+// assertQuietAboutHerd fails when a sync's human output carries any Herd
+// action, Herd note, or command to run by hand. The proxy note's own
+// lines are ignored (on macOS it offers the herd proxy command).
+func assertQuietAboutHerd(t *testing.T, stdout string) {
+	t.Helper()
+	var kept []string
+	for _, line := range strings.Split(stdout, "\n") {
+		if !strings.HasPrefix(line, "Proxy: ") {
+			kept = append(kept, line)
+		}
+	}
+	rest := strings.Join(kept, "\n")
+	for _, unwanted := range []string{"Run these Herd commands yourself", "herd proxy", "herd unproxy", "\nHerd: ", "  herd:"} {
+		if strings.Contains("\n"+rest, unwanted) {
+			t.Errorf("sync output should be quiet about Herd but contains %q:\n%s", unwanted, stdout)
+		}
+	}
+}

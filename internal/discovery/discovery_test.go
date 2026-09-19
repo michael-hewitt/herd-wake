@@ -835,3 +835,179 @@ func TestRemoveLeavesForeignSiteFileAlone(t *testing.T) {
 		t.Errorf("herd mutations = %v, want none", got)
 	}
 }
+
+// TestSyncWithoutHerdCLIDefaultsHerdOff: on Linux with no Herd CLI found
+// and `herd:` unset, a proxy-mode entry is written and its projects
+// registered with no Herd action at all — no commands to run by hand —
+// and the user is told, for the projects added or updated by that sync
+// only, which URLs to front with their own proxy; an explicit `herd:
+// true` still degrades to the manual command.
+func TestSyncWithoutHerdCLIDefaultsHerdOff(t *testing.T) {
+	f := newFixture(t)
+	f.worktree("issue-1")
+	f.writeConfig("", "")
+	noHerd := Options{HerdUnavailable: true, HerdNote: "herd CLI not found on PATH (Laravel Herd is macOS-only)", GOOS: "linux"}
+	const note = "no Herd CLI found; point your proxy at herd-wake yourself for the new URLs of discovery \"webapp\" (see README \"Bring your own proxy\" for the nginx and Caddy blocks):\n  https://issue-1.test → http://127.0.0.1:41000"
+
+	res, err := Sync(context.Background(), f.load(), noHerd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := res.Entries[0]
+	if names(e.Added) != "issue-1" || !e.Written || len(e.Errors) > 0 {
+		t.Fatalf("without a Herd CLI: added=%q written=%v errors=%v", names(e.Added), e.Written, e.Errors)
+	}
+	if len(e.Herd) != 0 || len(res.ManualCommands()) != 0 {
+		t.Errorf("herd: unset without a CLI should need nothing from Herd: herd=%+v manual=%v", e.Herd, res.ManualCommands())
+	}
+	if len(res.ProxyNotes) != 1 || res.ProxyNotes[0] != note {
+		t.Errorf("ProxyNotes = %q, want %q", res.ProxyNotes, note)
+	}
+	if res.HerdAvailable || res.HerdNote == "" {
+		t.Errorf("HerdAvailable = %v, HerdNote = %q", res.HerdAvailable, res.HerdNote)
+	}
+	if p := f.managed()["issue-1"]; p == nil || p.SupervisorPort != 41000 {
+		t.Errorf("managed file = %+v", f.managed())
+	}
+	if _, err := os.Stat(f.statePath()); !os.IsNotExist(err) {
+		t.Error("a proxy-mode note needs no state file")
+	}
+
+	// Unchanged projects are not noted again; a new worktree is noted
+	// alone.
+	res, err = Sync(context.Background(), f.load(), noHerd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e := res.Entries[0]; names(e.Unchanged) != "issue-1" || len(res.ProxyNotes) != 0 {
+		t.Errorf("second sync: unchanged %q, notes %q (want none)", names(e.Unchanged), res.ProxyNotes)
+	}
+	f.worktree("issue-2")
+	res, err = Sync(context.Background(), f.load(), noHerd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.ProxyNotes) != 1 || !strings.HasSuffix(res.ProxyNotes[0], ":\n  https://issue-2.test → http://127.0.0.1:41001") {
+		t.Errorf("after adding issue-2 ProxyNotes = %q", res.ProxyNotes)
+	}
+
+	// A removed worktree is dropped from the file with no unproxy either.
+	for _, name := range []string{"issue-1", "issue-2"} {
+		if err := os.RemoveAll(filepath.Join(f.workspace, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	res, err = Sync(context.Background(), f.load(), noHerd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e := res.Entries[0]; names(e.Removed) != "issue-1,issue-2" || len(e.Herd) != 0 || len(res.ProxyNotes) != 0 {
+		t.Errorf("removal without a Herd CLI = removed %q, herd %+v, notes %q", names(e.Removed), e.Herd, res.ProxyNotes)
+	}
+
+	// herd: true asks for Herd: manual as before.
+	f.worktree("issue-1")
+	f.writeConfig("", "    herd: true\n")
+	res, err = Sync(context.Background(), f.load(), noHerd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a := findHerd(t, res.Entries[0].Herd, "proxy", "issue-1"); a.Status != HerdManual || !strings.Contains(a.Detail, "herd CLI not found") {
+		t.Errorf("herd: true without a CLI = %+v, want manual", a)
+	}
+	if got := res.ManualCommands(); len(got) != 1 || got[0] != "herd proxy issue-1 http://127.0.0.1:41000 --secure" {
+		t.Errorf("ManualCommands = %v", got)
+	}
+	if len(res.ProxyNotes) != 0 {
+		t.Errorf("herd: true gets Herd commands, not a proxy note: %q", res.ProxyNotes)
+	}
+}
+
+// TestSyncWithoutHerdCLIOnDarwinStaysManual: on macOS a missing Herd CLI
+// is reported as before the quiet Linux default existed — every proxy is
+// a command to run by hand with the reason, a removed worktree's unproxy
+// too, and no bring-your-own-proxy note — even with `herd:` unset.
+func TestSyncWithoutHerdCLIOnDarwinStaysManual(t *testing.T) {
+	f := newFixture(t)
+	f.worktree("issue-1")
+	f.writeConfig("", "")
+	noHerd := Options{HerdUnavailable: true, HerdNote: "herd CLI not found on PATH or at ~/Library/Application Support/Herd/bin/herd", GOOS: "darwin"}
+
+	res, err := Sync(context.Background(), f.load(), noHerd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := res.Entries[0]
+	if names(e.Added) != "issue-1" || !e.Written {
+		t.Fatalf("added=%q written=%v", names(e.Added), e.Written)
+	}
+	if a := findHerd(t, e.Herd, "proxy", "issue-1"); a.Status != HerdManual || a.Detail != noHerd.HerdNote {
+		t.Errorf("proxy on darwin without the CLI = %+v, want manual with the reason", a)
+	}
+	if got := res.ManualCommands(); len(got) != 1 || got[0] != "herd proxy issue-1 http://127.0.0.1:41000 --secure" {
+		t.Errorf("ManualCommands = %v", got)
+	}
+	if len(res.ProxyNotes) != 0 {
+		t.Errorf("darwin gets Herd commands, not a proxy note: %q", res.ProxyNotes)
+	}
+
+	if err := os.RemoveAll(filepath.Join(f.workspace, "issue-1")); err != nil {
+		t.Fatal(err)
+	}
+	res, err = Sync(context.Background(), f.load(), noHerd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a := findHerd(t, res.Entries[0].Herd, "unproxy", "issue-1"); a.Status != HerdManual || a.Command != "herd unproxy issue-1" {
+		t.Errorf("unproxy on darwin without the CLI = %+v, want manual", a)
+	}
+}
+
+// TestRemoveWithoutHerdCLI: project:remove on Linux without a Herd CLI
+// records no Herd action for a project whose entry leaves `herd:` unset
+// (or that has no entry); an explicit `herd: true` and darwin keep the
+// manual `herd unproxy` command.
+func TestRemoveWithoutHerdCLI(t *testing.T) {
+	f := newFixture(t)
+	f.worktree("issue-1")
+	f.worktree("issue-2")
+	f.writeConfig("", "")
+	linux := Options{HerdUnavailable: true, HerdNote: "herd CLI not found on PATH (Laravel Herd is macOS-only)", GOOS: "linux"}
+	f.sync(linux)
+	if err := os.MkdirAll(filepath.Join(f.configDir, "projects.d"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hand := "# my file\nprojects:\n  hand:\n    public_url: https://hand.test\n    supervisor_port: 7102\n    application_port: 17102\n    working_directory: /tmp\n    command: npm run dev\n"
+	if err := os.WriteFile(filepath.Join(f.configDir, "projects.d", "hand.yaml"), []byte(hand), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	remove := func(name string, opts RemoveOptions) *RemoveResult {
+		t.Helper()
+		res, err := Remove(ctx, f.load(), name, opts)
+		if err != nil {
+			t.Fatalf("Remove(%s): %v", name, err)
+		}
+		return res
+	}
+
+	// Linux, `herd:` unset: nothing about Herd.
+	if res := remove("issue-1", RemoveOptions{HerdNote: linux.HerdNote, HerdUnavailable: true, GOOS: "linux"}); len(res.Herd) != 0 {
+		t.Errorf("Linux without a CLI: herd = %+v, want none", res.Herd)
+	}
+	// Linux, hand-written projects.d project (no entry): nothing either.
+	if res := remove("hand", RemoveOptions{HerdNote: linux.HerdNote, HerdUnavailable: true, GOOS: "linux"}); len(res.Herd) != 0 {
+		t.Errorf("Linux without a CLI, hand-written project: herd = %+v, want none", res.Herd)
+	}
+	// darwin: the manual command with the reason, as before.
+	if a := findHerd(t, remove("issue-2", RemoveOptions{HerdNote: "no herd", HerdUnavailable: true, GOOS: "darwin"}).Herd, "unproxy", "issue-2"); a.Status != HerdManual || a.Command != "herd unproxy issue-2" || a.Detail != "no herd" {
+		t.Errorf("darwin without a CLI: unproxy = %+v, want manual", a)
+	}
+	// Linux, explicit `herd: true`: still asks for Herd.
+	f.worktree("issue-3")
+	f.writeConfig("", "    herd: true\n")
+	f.sync(linux)
+	if a := findHerd(t, remove("issue-3", RemoveOptions{HerdNote: "no herd", HerdUnavailable: true, GOOS: "linux"}).Herd, "unproxy", "issue-3"); a.Status != HerdManual || a.Command != "herd unproxy issue-3" {
+		t.Errorf("Linux with herd: true: unproxy = %+v, want manual", a)
+	}
+}
