@@ -20,8 +20,9 @@ import (
 // wildcardFixture is a config directory holding one wildcard discovery
 // entry over a workspace of fake worktrees, plus the daemon started from
 // it. Each worktree carries a `port` file (read by both port_command and
-// the dev-server command) and appends a line to `port-runs` every time
-// port_command runs.
+// the dev-server command), a `mode` file selecting the testproc mode its
+// dev server runs in (http by default), and appends a line to `port-runs`
+// every time port_command runs.
 type wildcardFixture struct {
 	t          *testing.T
 	dir        string
@@ -33,6 +34,11 @@ type wildcardFixture struct {
 	base       string
 	socket     string
 	client     *control.Client
+	d          *Daemon
+	// maxRunning, when set, is written as the top-level max_running;
+	// holdMaxWait is the template's hold_max_wait_seconds.
+	maxRunning  int
+	holdMaxWait int
 }
 
 func newWildcardFixture(t *testing.T) *wildcardFixture {
@@ -42,13 +48,14 @@ func newWildcardFixture(t *testing.T) *wildcardFixture {
 		t.Fatal(err)
 	}
 	f := &wildcardFixture{
-		t:         t,
-		dir:       t.TempDir(),
-		workspace: t.TempDir(),
-		repo:      t.TempDir(),
-		command:   command,
-		port:      freePort(t),
-		base:      "webapp.test",
+		t:           t,
+		dir:         t.TempDir(),
+		workspace:   t.TempDir(),
+		repo:        t.TempDir(),
+		command:     command,
+		port:        freePort(t),
+		base:        "webapp.test",
+		holdMaxWait: 20,
 	}
 	f.configPath = filepath.Join(f.dir, "config.yaml")
 	if err := os.MkdirAll(filepath.Join(f.repo, ".git", "worktrees"), 0o755); err != nil {
@@ -74,6 +81,7 @@ func (f *wildcardFixture) worktree(name string, files ...string) (dir string, ap
 	}
 	appPort = freePort(f.t)
 	f.setPort(name, itoa(appPort))
+	f.setMode(name, testproc.ModeHTTP)
 	for _, file := range files {
 		if err := os.WriteFile(filepath.Join(dir, file), []byte("x"), 0o644); err != nil {
 			f.t.Fatal(err)
@@ -92,6 +100,15 @@ func (f *wildcardFixture) setPort(name, port string) {
 	}
 }
 
+// setMode rewrites a worktree's mode file (the testproc mode its dev
+// server runs in).
+func (f *wildcardFixture) setMode(name, mode string) {
+	f.t.Helper()
+	if err := os.WriteFile(filepath.Join(f.workspace, name, "mode"), []byte(mode+"\n"), 0o644); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
 // portRuns counts how often port_command ran in a worktree.
 func (f *wildcardFixture) portRuns(name string) int {
 	data, err := os.ReadFile(filepath.Join(f.workspace, name, "port-runs"))
@@ -105,7 +122,11 @@ func (f *wildcardFixture) portRuns(name string) int {
 // template lines) and the given projects body.
 func (f *wildcardFixture) writeConfig(extra string, projects string) {
 	f.t.Helper()
-	body := fmt.Sprintf(`projects:
+	top := ""
+	if f.maxRunning > 0 {
+		top = fmt.Sprintf("max_running: %d\n", f.maxRunning)
+	}
+	body := fmt.Sprintf(`%sprojects:
 %sdiscovery:
   - name: webapp
     mode: wildcard
@@ -116,15 +137,15 @@ func (f *wildcardFixture) writeConfig(extra string, projects string) {
     require_files: [port]
     exclude: [".*", "tmp-*"]
     port_command: "echo run >> port-runs; cat port"
-    command: "HW_TESTPROC_PORT=$(cat port) %s"
+    command: "HW_TESTPROC_PORT=$(cat port) HW_TESTPROC_MODE=$(cat mode) %s"
     readiness_strategy: tcp
     startup_timeout_seconds: 10
     idle_timeout_seconds: 60
     shutdown_timeout_seconds: 5
-    hold_max_wait_seconds: 20
+    hold_max_wait_seconds: %d
     env:
       %s: %s
-%s`, projects, f.base, f.port, f.workspace, f.repo, f.command, testproc.EnvMode, testproc.ModeHTTP, extra)
+%s`, top, projects, f.base, f.port, f.workspace, f.repo, f.command, f.holdMaxWait, testproc.EnvMode, testproc.ModeHTTP, extra)
 	if err := os.WriteFile(f.configPath, []byte(body), 0o600); err != nil {
 		f.t.Fatal(err)
 	}
@@ -144,7 +165,7 @@ func (f *wildcardFixture) start() {
 	if err != nil {
 		f.t.Fatalf("load fixture config: %v", err)
 	}
-	f.socket, _, _ = startDaemon(f.t, cfg)
+	f.d, f.socket, _, _ = startDaemonFor(f.t, cfg)
 	f.client = control.NewClient(f.socket)
 }
 

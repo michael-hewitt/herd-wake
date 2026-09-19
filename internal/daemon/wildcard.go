@@ -39,10 +39,14 @@ type entryState struct {
 	entry    *config.Discovery
 	bind     *binding
 	resolver *resolver
+	// maxRunning is the entry's max_running cap (0 = none), updated in
+	// place by reloads.
+	maxRunning atomic.Int64
 }
 
 func (d *Daemon) newEntryState(e *config.Discovery) *entryState {
 	es := &entryState{entry: e}
+	es.maxRunning.Store(int64(e.MaxRunning))
 	es.resolver = newResolver(d, es)
 	return es
 }
@@ -529,7 +533,7 @@ func (d *Daemon) restartDynamic(ctx context.Context, st *projectState) (control.
 		port = p
 	}
 	if port == st.project.ApplicationPort {
-		if err := st.proc.Restart(ctx); err != nil {
+		if err := d.restart(ctx, st); err != nil {
 			return control.ProjectStatus{}, err
 		}
 		return d.projectStatus(st), nil
@@ -559,25 +563,25 @@ func (d *Daemon) restartDynamic(ctx context.Context, st *projectState) (control.
 		return control.ProjectStatus{}, err // unreachable: an inherited route never fails
 	}
 	d.logger.Printf("project %q: application port changed %d -> %d on restart", label, st.project.ApplicationPort, port)
-	select {
-	case err := <-next.proc.EnsureStarted():
-		if err != nil {
-			return control.ProjectStatus{}, err
-		}
-		return d.projectStatus(next), nil
-	case <-ctx.Done():
-		return control.ProjectStatus{}, ctx.Err()
+	if err := d.startManual(ctx, next); err != nil {
+		return control.ProjectStatus{}, err
 	}
+	return d.projectStatus(next), nil
 }
 
 // wildcardStatus renders one entry's control-API status.
 func (d *Daemon) wildcardStatusLocked(es *entryState) control.WildcardStatus {
+	states := d.dynamicStatesLocked(es)
+	running, _ := countRunning(states, nil)
 	return control.WildcardStatus{
 		Name:           es.entry.Name,
 		BaseDomain:     es.entry.BaseDomain,
 		URLPattern:     es.entry.URLPattern(),
 		Directory:      es.entry.Directory,
 		SupervisorPort: es.entry.SupervisorPort(),
-		Projects:       len(d.dynamicStatesLocked(es)),
+		Projects:       len(states),
+		Running:        running,
+		MaxRunning:     int(es.maxRunning.Load()),
+		NextEviction:   nextEviction(states),
 	}
 }

@@ -338,20 +338,32 @@ func backoffDelay(failures int) time.Duration {
 // ctx; ctx only bounds how long the caller waits. Stopping an already
 // stopped or failed project is a no-op.
 func (s *Supervisor) Stop(ctx context.Context) error {
+	select {
+	case <-s.StopAsync():
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// StopAsync is Stop without the wait: it begins the graceful stop — the
+// project is StateStopping when it returns, so it no longer holds a
+// running-server slot — and returns a channel closed once the stop has
+// fully finished (the whole process group gone, state StateStopped). For a
+// stopped or failed project the channel is already closed; a stop already
+// in progress is joined.
+func (s *Supervisor) StopAsync() <-chan struct{} {
 	s.mu.Lock()
 	switch s.state {
 	case StateStopped, StateFailed:
 		s.mu.Unlock()
-		return nil
+		done := make(chan struct{})
+		close(done)
+		return done
 	case StateStopping:
 		stopDone := s.stopDone
 		s.mu.Unlock()
-		select {
-		case <-stopDone:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+		return stopDone
 	}
 	// Starting or running: this caller owns the shutdown.
 	if s.state == StateStarting {
@@ -372,16 +384,10 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 	grace := time.NewTimer(timeout)
 	s.signalGroup(pgid, sig)
 
-	// Drain and escalate independently of the caller's ctx so the group is
-	// never left running because a caller gave up waiting.
+	// Drain and escalate independently of the caller so the group is never
+	// left running because a caller gave up waiting.
 	go s.finishStop(pgid, procDone, stopDone, grace, timeout, sigName)
-
-	select {
-	case <-stopDone:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return stopDone
 }
 
 // finishStop waits for the whole process group to disappear within the

@@ -75,6 +75,7 @@ discovery:
     shutdown_timeout_seconds: 15
     idle_timeout_minutes: 30
     herd: true
+    max_running: 2       # optional: at most 2 worktree servers alive; the least recently used is evicted for a new one
 ```
 
 A second repo is another list entry with its own `name`/`base_domain`, `directory`

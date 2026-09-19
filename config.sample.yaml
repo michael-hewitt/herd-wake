@@ -30,6 +30,18 @@
 # must every supervisor_port — except that projects which all set `host`
 # may share one (example 3).
 
+# Optional. The running-server budget: at most this many projects — static
+# or worktree, always_on included — are starting or running at once on this
+# machine. When a wake-up would exceed it, the least-recently-active running
+# project is stopped gracefully first (never one that is always_on, has a
+# request in flight, an open WebSocket, or a lease; if only such projects
+# hold the slots the request is held, then answered 503 naming them). An
+# evicted project simply cold-starts on its next request. Unset means
+# unlimited; `herd-wake reload` applies a change live, and lowering it
+# below the current count stops nothing until the next wake-up. A wildcard
+# discovery entry may add its own max_running on top (see below).
+max_running: 3
+
 projects:
   # ---------------------------------------------------------------------
   # Example 1: a Node-only application (Next.js, Vite SPA, Express, ...).
@@ -300,6 +312,12 @@ discovery:
     # served. Default: [".*"] (dot-directories). Setting it replaces the
     # default, so include ".*" yourself if you still want it.
     exclude: [".*", "node_modules"]
+
+    # Optional (wildcard mode). At most this many of this entry's worktrees
+    # run at once; the least recently active is evicted for a new one. The
+    # top-level max_running still applies across entries. Applied live by
+    # a reload without touching the entry's running worktrees.
+    max_running: 2
 
     # Any other per-project field is accepted here and copied verbatim to
     # every worktree project: env, node_path, rewrite_host,

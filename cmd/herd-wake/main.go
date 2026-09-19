@@ -93,6 +93,9 @@ func runProjects(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "No projects configured in %s (or %s)\n", path, config.ProjectsDir(path))
 		return 0
 	}
+	if cfg.MaxRunning > 0 {
+		fmt.Fprintf(stdout, "max_running: %d  (at most this many dev servers run at once; the least recently active is evicted for a new one)\n\n", cfg.MaxRunning)
+	}
 
 	for i, name := range cfg.ProjectNames() {
 		if i > 0 {
@@ -124,6 +127,9 @@ func printWildcard(w io.Writer, d *config.Discovery) {
 		fmt.Fprintf(w, "  Port command:      %s\n", d.PortCommand)
 	} else {
 		fmt.Fprintf(w, "  Application ports: %v\n", d.ApplicationPortRange)
+	}
+	if d.MaxRunning > 0 {
+		fmt.Fprintf(w, "  Max running:       %d  (worktrees of this entry at once)\n", d.MaxRunning)
 	}
 }
 
@@ -210,9 +216,12 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 		}
 		fmt.Fprintf(stdout, "config: %s (%s)\n", status.ConfigPath, reloaded)
 	}
+	if b := status.Budget; b != nil {
+		fmt.Fprintf(stdout, "running servers: %s\n", describeBudget(b.Running, b.MaxRunning, b.NextEviction))
+	}
 	for _, wc := range status.Wildcards {
-		fmt.Fprintf(stdout, "wildcard %s: %s -> %s/<label> (supervisor port %d, %d project(s) materialised)\n",
-			wc.Name, wc.URLPattern, wc.Directory, wc.SupervisorPort, wc.Projects)
+		fmt.Fprintf(stdout, "wildcard %s: %s -> %s/<label> (supervisor port %d, %d project(s) materialised, running %s)\n",
+			wc.Name, wc.URLPattern, wc.Directory, wc.SupervisorPort, wc.Projects, describeBudget(wc.Running, wc.MaxRunning, wc.NextEviction))
 	}
 	if len(status.Projects) == 0 {
 		if len(status.Wildcards) == 0 {
@@ -260,6 +269,22 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 	return 0
+}
+
+// describeBudget renders a running-server count against its max_running
+// cap ("2/2 (max_running); next eviction: issue-7", or "3 (no max_running)")
+// and, under a cap, which project would be evicted first.
+func describeBudget(running, maxRunning int, nextEviction string) string {
+	if maxRunning <= 0 {
+		return fmt.Sprintf("%d (no max_running)", running)
+	}
+	s := fmt.Sprintf("%d/%d (max_running)", running, maxRunning)
+	if nextEviction != "" {
+		s += "; next eviction: " + nextEviction
+	} else if running >= maxRunning {
+		s += "; nothing evictable"
+	}
+	return s
 }
 
 // describeLastActivity renders the status column for when a project's most

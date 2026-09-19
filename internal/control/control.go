@@ -47,6 +47,23 @@ type StatusResponse struct {
 	// Wildcards lists the wildcard discovery entries (shared listeners
 	// resolving worktrees on demand); omitted when there are none.
 	Wildcards []WildcardStatus `json:"wildcards,omitempty"`
+	// Budget is the running-server budget: how many projects hold a slot
+	// (starting or running), the top-level max_running cap, and which
+	// project would be evicted first.
+	Budget *BudgetStatus `json:"budget,omitempty"`
+}
+
+// BudgetStatus is the running-server budget in a StatusResponse.
+type BudgetStatus struct {
+	// MaxRunning is the max_running cap; 0 means unlimited.
+	MaxRunning int `json:"max_running"`
+	// Running counts the projects holding a slot: starting or running,
+	// static or dynamic, always_on included.
+	Running int `json:"running"`
+	// NextEviction names the project a start needing a slot would evict
+	// first (the least recently active evictable one); empty when no
+	// running project can be evicted.
+	NextEviction string `json:"next_eviction,omitempty"`
 }
 
 // WildcardStatus is one wildcard discovery entry in a StatusResponse.
@@ -63,6 +80,12 @@ type WildcardStatus struct {
 	// Projects is how many dynamic projects the entry has materialised
 	// (they appear in Projects with Dynamic set).
 	Projects int `json:"projects"`
+	// Running counts the entry's projects holding a running-server slot;
+	// MaxRunning is the entry's max_running cap (0 = none) and
+	// NextEviction the entry project that would be evicted first under it.
+	Running      int    `json:"running"`
+	MaxRunning   int    `json:"max_running,omitempty"`
+	NextEviction string `json:"next_eviction,omitempty"`
 }
 
 // Uptime returns the daemon uptime as a duration.

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -367,5 +368,51 @@ func TestFieldErrorScope(t *testing.T) {
 	}
 	if got := (&FieldError{Scope: ScopeDiscovery, Project: "x", Field: "f", Message: "m"}).Error(); got != `discovery "x": f: m` {
 		t.Errorf("discovery scope = %q", got)
+	}
+}
+
+// TestDiscoveryMaxRunning: a wildcard entry's max_running loads, rejects
+// negatives, is refused in proxy mode, and never makes two otherwise equal
+// entries non-equivalent (a reload applies it in place).
+func TestDiscoveryMaxRunning(t *testing.T) {
+	workspace := t.TempDir()
+	entry := func(name, mode string, maxRunning int) string {
+		s := fmt.Sprintf(`  - name: %s
+    mode: %s
+    directory: %s
+    command: npm run dev
+    port_command: echo 42000
+    max_running: %d
+`, name, mode, workspace, maxRunning)
+		if mode == ModeWildcard {
+			return s + "    supervisor_port: 41000\n"
+		}
+		return s + "    supervisor_port_range: [41000, 41999]\n"
+	}
+
+	cfg, err := Load(writeDiscoveryConfig(t, entry("webapp", ModeWildcard, 3)))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Discovery[0].MaxRunning != 3 {
+		t.Errorf("MaxRunning = %d, want 3", cfg.Discovery[0].MaxRunning)
+	}
+	other := *cfg.Discovery[0]
+	other.MaxRunning = 1
+	if !cfg.Discovery[0].Equivalent(&other) {
+		t.Error("entries differing only in max_running should be equivalent")
+	}
+	other.Template.Command = "other"
+	if cfg.Discovery[0].Equivalent(&other) {
+		t.Error("entries differing in command should not be equivalent")
+	}
+
+	_, err = Load(writeDiscoveryConfig(t, entry("webapp", ModeWildcard, -2)))
+	if err == nil || !strings.Contains(err.Error(), `discovery "webapp": max_running: must not be negative`) {
+		t.Errorf("negative max_running: err = %v", err)
+	}
+	_, err = Load(writeDiscoveryConfig(t, entry("legacy", ModeProxy, 2)))
+	if err == nil || !strings.Contains(err.Error(), `discovery "legacy": max_running: only used in wildcard mode`) {
+		t.Errorf("max_running in proxy mode: err = %v", err)
 	}
 }
