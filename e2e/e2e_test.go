@@ -599,6 +599,11 @@ func TestPreviewEnvFileAndSafeDiagnostics(t *testing.T) {
 	if err := os.WriteFile(sharedEnv, []byte("DB_LOGIN="+dbLogin+"\nENVIRONMENT=preview\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// WriteFile's mode is masked by the umask, and the warning under test
+	// only fires on a file other users can read: force it.
+	if err := os.Chmod(sharedEnv, 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	alpha := writeWorktree(t, workspace, "alpha", `const http = require('http');
 const port = Number(require('fs').readFileSync('port', 'utf8'));

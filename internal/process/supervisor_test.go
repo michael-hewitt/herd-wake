@@ -802,6 +802,12 @@ func writeEnvFile(t *testing.T, path, content string, mode os.FileMode) {
 	if err := os.WriteFile(path, []byte(content), mode); err != nil {
 		t.Fatal(err)
 	}
+	// WriteFile's mode is masked by the umask; force the mode we asked for,
+	// so a 0600 file really is 0600 and a deliberately loose one really is
+	// readable by other users under any umask the suite runs with.
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // envReportingCommand wraps the project's helper command in a shell line

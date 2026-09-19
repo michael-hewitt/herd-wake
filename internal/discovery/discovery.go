@@ -455,6 +455,14 @@ func (s *syncer) build(d *config.Discovery, c candidate, prev *config.Project) (
 	} else {
 		p.Env = nil
 	}
+	// Like Env, the template's env_file list must not be shared with the
+	// generated project: the managed file is written from these projects,
+	// and a slice one of them appends to would be seen by all of them.
+	if len(p.EnvFile) > 0 {
+		p.EnvFile = append(config.EnvFiles(nil), p.EnvFile...)
+	} else {
+		p.EnvFile = nil
+	}
 
 	// Never claim a Herd site that already belongs to something else.
 	if prev == nil && s.opts.Herd != nil {

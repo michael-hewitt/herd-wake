@@ -108,7 +108,11 @@ func TestRunProjectsShowsEnvironmentSafely(t *testing.T) {
 		t.Errorf("run(projects) printed the DB_LOGIN password; got:\n%s", out)
 	}
 	// A project with no environment gets no environment lines at all.
-	accounts, _, _ := strings.Cut(out[strings.Index(out, "accounts-vite"):], "\n\n")
+	start := strings.Index(out, "accounts-vite")
+	if start < 0 {
+		t.Fatalf("run(projects) stdout has no accounts-vite block; got:\n%s", out)
+	}
+	accounts, _, _ := strings.Cut(out[start:], "\n\n")
 	if strings.Contains(accounts, "Env") || strings.Contains(accounts, "Diagnostics:") {
 		t.Errorf("accounts-vite has no env_file, env, or diagnostic_logs, but its block says otherwise:\n%s", accounts)
 	}

@@ -257,10 +257,13 @@ func (rs *resolver) resolve(ctx context.Context, label string) (http.Handler, *p
 		return rs.await(ctx, c)
 	}
 	if f := rs.failures[label]; f != nil && time.Now().Before(f.retryAt) {
+		// Every field of the remembered failure is copied under the lock: a
+		// concurrent materialise rewrites the same record when its own
+		// resolution finishes, so reading it after the unlock would race.
+		diag, retryAt, detail := f.diag, f.retryAt, f.detail
 		rs.mu.Unlock()
-		diag := f.diag
-		diag.Hint = fmt.Sprintf("Automatic retry in %s (the next request after that resolves the worktree again).", time.Until(f.retryAt).Round(100*time.Millisecond))
-		return nil, &diag, f.detail
+		diag.Hint = fmt.Sprintf("Automatic retry in %s (the next request after that resolves the worktree again).", time.Until(retryAt).Round(100*time.Millisecond))
+		return nil, &diag, detail
 	}
 	c := &resolveCall{done: make(chan struct{})}
 	rs.calls[label] = c
@@ -329,7 +332,8 @@ func (rs *resolver) materialise(label string) (http.Handler, *proxy.Diagnostic, 
 	runCtx := d.runCtx
 	d.mu.RUnlock()
 	if existing != nil {
-		return nil, rs.nameTaken(label, existing), ""
+		diag, detail := rs.nameTaken(label, existing)
+		return nil, diag, detail
 	}
 
 	port, err := rs.discoverPort(runCtx, label, dir)
@@ -361,7 +365,13 @@ func (rs *resolver) materialise(label string) (http.Handler, *proxy.Diagnostic, 
 		go d.dropDynamicByName(label, rs.es, "its worktree directory vanished")
 	}, missing: func(w http.ResponseWriter, r *http.Request) {
 		_, reason := discovery.Check(e, label)
-		diag, _ := rs.noWorktree(label, dir, reason)
+		diag, detail := rs.noWorktree(label, dir, reason)
+		if detail != "" {
+			// A terse 404 keeps nothing of why on the page, so the daemon
+			// log is the only place the operator can learn that the
+			// worktree behind a live project has gone.
+			d.logger.Printf("discovery %q: 404 for %s %s: %s", e.Name, r.Method, r.URL.Path, detail)
+		}
 		proxy.WriteDiagnostic(w, r, *diag)
 	}}
 
@@ -369,7 +379,8 @@ func (rs *resolver) materialise(label string) (http.Handler, *proxy.Diagnostic, 
 	if d.states[label] != nil {
 		other := d.states[label]
 		d.mu.Unlock()
-		return nil, rs.nameTaken(label, other), ""
+		diag, detail := rs.nameTaken(label, other)
+		return nil, diag, detail
 	}
 	d.states[label] = st
 	st.bind = rs.es.bind
@@ -390,6 +401,8 @@ const (
 	noWorktreeHint   = "Check the daemon log on the host for the rule that rejected it."
 	noPortReason     = "herd-wake could not determine a usable dev server port for this worktree."
 	noPortHint       = "See the daemon log on the host."
+	nameTakenReason  = "A project of this name is already registered, so the worktree cannot be served through the wildcard listener."
+	nameTakenHint    = "See the daemon log on the host."
 )
 
 // public returns the diagnostic to send to the client and the reason to
@@ -424,21 +437,24 @@ func (rs *resolver) noWorktree(label, dir, reason string) (*proxy.Diagnostic, st
 }
 
 // nameTaken is the 503 for a label whose name is already a registered
-// project: a static one, or a dynamic one being taken out of service.
-func (rs *resolver) nameTaken(label string, other *projectState) *proxy.Diagnostic {
+// project: a static one, or a dynamic one being taken out of service, with
+// the reason to log alongside it (see public). The static case names the
+// conflicting project's source file, which is a path on the box, so it goes
+// through public like every other page the wildcard listener serves.
+func (rs *resolver) nameTaken(label string, other *projectState) (*proxy.Diagnostic, string) {
 	if other.dynamic && other.entry == rs.es {
-		return &proxy.Diagnostic{
+		return rs.public(&proxy.Diagnostic{
 			Status: http.StatusServiceUnavailable, Project: label,
 			Reason: fmt.Sprintf("Worktree %q is being taken out of service (its directory vanished or it was reconfigured) and its process is still stopping.", label),
 			Hint:   "Retry in a moment.",
-		}
+		}, "", fmt.Sprintf("Worktree %q is being taken out of service; retry in a moment.", label), " ")
 	}
-	return &proxy.Diagnostic{
+	return rs.public(&proxy.Diagnostic{
 		Status: http.StatusServiceUnavailable, Project: label,
 		Title:  fmt.Sprintf("worktree %q cannot be served", label),
 		Reason: fmt.Sprintf("A project named %q is already registered (from %s), so the worktree of that name cannot be served through the wildcard listener.", label, other.project.Source),
 		Hint:   "Rename the worktree, or remove the conflicting project.",
-	}
+	}, fmt.Sprintf("worktree %q cannot be served", label), nameTakenReason, nameTakenHint)
 }
 
 // discoverPort finds the application port for a label being materialised:

@@ -275,6 +275,46 @@ func TestSyncWritesManagedFileWithStablePorts(t *testing.T) {
 	}
 }
 
+// TestSyncCopiesTemplateEnvFilesPerProject: a proxy-mode template carrying
+// env_file and diagnostic_logs gives every generated project both fields —
+// each with its own env_file slice, never the template's — and the managed
+// file it writes still loads as part of the whole configuration, which is
+// what a reload does with it.
+func TestSyncCopiesTemplateEnvFilesPerProject(t *testing.T) {
+	f := newFixture(t)
+	for _, name := range []string{"issue-1", "issue-2"} {
+		f.worktree(name)
+	}
+	shared := filepath.Join(t.TempDir(), "shared.env")
+	if err := os.WriteFile(shared, []byte("DB_LOGIN=postgres://app:hunter2@db/app\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.writeConfig("", fmt.Sprintf("    env_file: [%s, .env.preview]\n    diagnostic_logs: false\n", shared))
+
+	res := f.sync(Options{Herd: f.herd(testproc.FakeHerd{})})
+	if len(res.Errors) > 0 {
+		t.Fatalf("errors: %v", res.Errors)
+	}
+
+	projects := f.managed()
+	for _, name := range []string{"issue-1", "issue-2"} {
+		p := projects[name]
+		if p == nil {
+			t.Fatalf("managed file has no project %q", name)
+		}
+		want := config.EnvFiles{shared, ".env.preview"}
+		if len(p.EnvFile) != len(want) || p.EnvFile[0] != want[0] || p.EnvFile[1] != want[1] {
+			t.Errorf("%s env_file = %q, want %q", name, p.EnvFile, want)
+		}
+		if p.DiagnosticLogs == nil || *p.DiagnosticLogs {
+			t.Errorf("%s diagnostic_logs = %v, want false", name, p.DiagnosticLogs)
+		}
+	}
+	if _, err := config.Load(f.configPath); err != nil {
+		t.Errorf("generated config does not load: %v", err)
+	}
+}
+
 func TestSyncRemovesDeletedWorktreeAndUnproxies(t *testing.T) {
 	f := newFixture(t)
 	f.worktree("keep")

@@ -675,6 +675,35 @@ func TestWildcardTerseDiagnostics(t *testing.T) {
 		}
 	})
 
+	t.Run("terse name conflict", func(t *testing.T) {
+		f := newWildcardFixture(t)
+		f.captureLogs()
+		f.worktree("a")
+		staticPorts := [2]int{freePort(t), freePort(t)}
+		f.writeConfig("    diagnostic_logs: false\n", fmt.Sprintf(`  a:
+    public_url: https://a.test
+    supervisor_port: %d
+    application_port: %d
+    working_directory: %s
+    command: sleep 300
+    readiness_strategy: tcp
+`, staticPorts[0], staticPorts[1], f.dir))
+		f.start()
+
+		code, body, _ := f.get(f.host("a"), "/", nil)
+		if code != http.StatusServiceUnavailable || !strings.Contains(body, `worktree "a" cannot be served`) {
+			t.Fatalf("label a with a static a = %d; body:\n%s", code, body)
+		}
+		if !strings.Contains(body, "A project of this name is already registered") {
+			t.Errorf("503 for a conflicting name is not the terse wording; body:\n%s", body)
+		}
+		assertTerse(t, "503 for the name conflict", body, "config.yaml")
+
+		if logs := f.logs.String(); !strings.Contains(logs, `already registered (from config.yaml)`) {
+			t.Errorf("daemon log does not name the conflicting project's source; got:\n%s", logs)
+		}
+	})
+
 	t.Run("default", func(t *testing.T) {
 		f := newWildcardFixture(t)
 		f.writeConfig("", "")

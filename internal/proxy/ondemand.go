@@ -142,9 +142,8 @@ func NewOnDemand(p *config.Project, upstream Upstream, activity Activity, logger
 		wsKeepAlive: p.WebSocketsKeepAlive == nil || *p.WebSocketsKeepAlive,
 
 		diagnosticLogs: p.DiagnosticLogsEnabled(),
-
-		maxWait: maxWait,
-		maxHeld: maxHeld,
+		maxWait:        maxWait,
+		maxHeld:        maxHeld,
 	}
 }
 
@@ -286,32 +285,70 @@ func isUpgrade(r *http.Request) bool {
 }
 
 // deny answers 503 with a diagnostic: the reason, the project's lifecycle
-// state, its exit summary and last error, and — unless the project sets
-// diagnostic_logs: false — recent process output.
+// state, its exit summary and — unless the project sets diagnostic_logs:
+// false — its last error and recent process output. The hold-limit reasons
+// it is called with are generated here and name no path, so they are safe
+// on a public URL as they stand.
 func (h *onDemand) deny(w http.ResponseWriter, r *http.Request, reason string) {
-	h.denyWith(w, r, Diagnostic{Reason: reason})
+	h.denyWith(w, r, Diagnostic{Reason: reason}, "")
 }
 
 // denyErr is deny for a startup error; an Explained error supplies the
-// diagnostic's title and hint.
+// diagnostic's title and hint. An error that explains itself names project
+// labels only, so it is public either way; any other startup error is the
+// dev server's or the configuration's own text — an env_file parse failure
+// quotes an absolute path, for one — and under diagnostic_logs: false it is
+// replaced by terseStartupReason and survives only in the daemon log.
 func (h *onDemand) denyErr(w http.ResponseWriter, r *http.Request, err error) {
 	d := Diagnostic{Reason: err.Error()}
+	detail := ""
 	var explained Explained
-	if errors.As(err, &explained) {
+	switch {
+	case errors.As(err, &explained):
 		d.Title, d.Hint = explained.DiagnosticTitle(), explained.DiagnosticHint()
+	case !h.diagnosticLogs:
+		detail, d.Reason = d.Reason, h.terseStartupReason(err)
 	}
-	h.denyWith(w, r, d)
+	h.denyWith(w, r, d, detail)
 }
 
-func (h *onDemand) denyWith(w http.ResponseWriter, r *http.Request, d Diagnostic) {
+// terseStartupReason is all a public 503 says about a startup failure when
+// the project sets diagnostic_logs: false: that the project failed to
+// start, and — while automatic retries are suppressed — when the next one
+// runs. The wait is computed exactly as process.BackoffError.Error computes
+// it, so the sentence the operator reads in the log and the one the visitor
+// reads on the page agree.
+func (h *onDemand) terseStartupReason(err error) string {
+	reason := fmt.Sprintf("Project %q failed to start.", h.project.Name)
+	var backoff *process.BackoffError
+	if errors.As(err, &backoff) {
+		wait := time.Until(backoff.RetryAt).Round(100 * time.Millisecond)
+		if wait < 0 {
+			wait = 0
+		}
+		reason += fmt.Sprintf(" Automatic retry in %s, or run `herd-wake project:start %s` to retry now.", wait, h.project.Name)
+	}
+	return reason
+}
+
+// denyWith writes the 503. detail, when non-empty, is the untersed reason
+// the daemon log gets in place of the diagnostic's own — the operator on
+// the host loses nothing to a terse page.
+func (h *onDemand) denyWith(w http.ResponseWriter, r *http.Request, d Diagnostic, detail string) {
 	snap := h.upstream.Snapshot()
-	h.logger.Printf("project %q: 503 for %s %s: %s", h.project.Name, r.Method, r.URL.Path, d.Reason)
+	if detail == "" {
+		detail = d.Reason
+	}
+	h.logger.Printf("project %q: 503 for %s %s: %s", h.project.Name, r.Method, r.URL.Path, detail)
 	d.Status = http.StatusServiceUnavailable
 	d.Project = h.project.Name
-	d.State, d.Exit, d.Err = snap.State, snap.LastExit, snap.LastError
-	// State, exit status, and last error stay either way; only the process
-	// output is withheld, and the page says so and where to find it.
+	d.State, d.Exit = snap.State, snap.LastExit
+	// State and exit status stay either way — neither can carry a path. The
+	// last error can (it is the failed start's own message), so under
+	// diagnostic_logs: false it goes the way of the process output, and the
+	// page says where on the host to read both.
 	if h.diagnosticLogs {
+		d.Err = snap.LastError
 		d.Logs = h.upstream.Logs(diagnosticLogLines)
 	} else {
 		d.LogsOmitted = true

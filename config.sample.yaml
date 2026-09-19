@@ -153,9 +153,9 @@ projects:
     # project's recent process output and filesystem paths. Default: true,
     # which is what you want at a local .test URL. Set it to false for a
     # server whose URL is reachable by other people: the page then shows
-    # the state, the exit status, the last error, and a pointer to
-    # `herd-wake logs <name>` on the host only, while the full detail still
-    # goes to the daemon log, so you lose nothing.
+    # the state, the exit status, and a pointer to `herd-wake logs <name>`
+    # on the host only — no process output, no last error, no paths — while
+    # the full detail still goes to the daemon log, so you lose nothing.
     # diagnostic_logs: true
 
     # Optional. Absolute path to the node executable to put first on PATH,

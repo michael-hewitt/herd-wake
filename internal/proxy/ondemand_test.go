@@ -546,12 +546,32 @@ func noDiagnosticLogsProject() *config.Project {
 	return p
 }
 
+// The startup failure a preview box realistically hits, and the part of it
+// that must never reach a public page: a malformed shared env file names
+// the file by absolute path, and the same text becomes the supervisor's
+// last error.
+const (
+	envFileStartFailure = `project "dashboard": env_file /etc/herd-wake/preview.env: line 4: no '=' in line`
+	envFilePath         = "/etc/herd-wake"
+)
+
+// tersePreviewFake is failingFake whose startup error and last error both
+// carry an absolute path, so a terse 503 is tested against the worst text
+// it could repeat rather than a harmless one.
+func tersePreviewFake() *fakeUpstream {
+	fake := failingFake(errors.New(envFileStartFailure))
+	fake.mu.Lock()
+	fake.snap.LastError = envFileStartFailure
+	fake.mu.Unlock()
+	return fake
+}
+
 // TestOnDemandFailureDiagnosticOmitsLogsPlainText: with diagnostic_logs
-// false the plain-text 503 still says what went wrong — state, exit status,
-// last error — but quotes no process output and points at the host's logs
-// instead.
+// false the plain-text 503 says the project's state and exit status, that
+// it failed to start, and where on the host to read the rest — and neither
+// the failure's own message nor the path in it reaches the page.
 func TestOnDemandFailureDiagnosticOmitsLogsPlainText(t *testing.T) {
-	fake := failingFake(errors.New(`project "dashboard": process exited during startup (exit status 3)`))
+	fake := tersePreviewFake()
 	h := onDemandHandler(t, noDiagnosticLogsProject(), fake)
 
 	rec := httptest.NewRecorder()
@@ -563,13 +583,50 @@ func TestOnDemandFailureDiagnosticOmitsLogsPlainText(t *testing.T) {
 		t.Fatalf("status = %d, want 503", rec.Code)
 	}
 	body := rec.Body.String()
-	for _, want := range []string{`"dashboard"`, "failed", "exit status 3", "diagnostic_logs: false", "herd-wake logs dashboard"} {
+	for _, want := range []string{`Project "dashboard" failed to start.`, "exit status 3", "diagnostic_logs: false", "herd-wake logs dashboard"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("terse plain diagnostic missing %q; got:\n%s", want, body)
 		}
 	}
-	if strings.Contains(body, "boom line one") {
-		t.Errorf("terse plain diagnostic leaked process output; got:\n%s", body)
+	for _, unwanted := range []string{"boom line one", envFilePath, "no '=' in line", "Last error"} {
+		if strings.Contains(body, unwanted) {
+			t.Errorf("terse plain diagnostic leaked %q; got:\n%s", unwanted, body)
+		}
+	}
+}
+
+// TestOnDemandFailureDiagnosticOmitsLogsBackoff: a 503 served during retry
+// backoff is just as terse, but still tells the visitor when the next
+// attempt runs — the one thing a *process.BackoffError says that names no
+// path.
+func TestOnDemandFailureDiagnosticOmitsLogsBackoff(t *testing.T) {
+	fake := tersePreviewFake()
+	retryAt := time.Now().Add(4 * time.Second)
+	fake.ensure = func() <-chan error {
+		ch := make(chan error, 1)
+		ch <- &process.BackoffError{Project: "dashboard", RetryAt: retryAt, Reason: envFileStartFailure}
+		return ch
+	}
+	h := onDemandHandler(t, noDiagnosticLogsProject(), fake)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://dashboard.test/", nil)
+	req.Header.Set("Accept", "*/*")
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{`Project "dashboard" failed to start.`, "Automatic retry in", "herd-wake project:start dashboard"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("terse backoff diagnostic missing %q; got:\n%s", want, body)
+		}
+	}
+	for _, unwanted := range []string{envFilePath, "no '=' in line", "failed to start recently"} {
+		if strings.Contains(body, unwanted) {
+			t.Errorf("terse backoff diagnostic leaked %q; got:\n%s", unwanted, body)
+		}
 	}
 }
 
@@ -577,7 +634,7 @@ func TestOnDemandFailureDiagnosticOmitsLogsPlainText(t *testing.T) {
 // same 503: no process output at all, so nothing from the logs — escaped or
 // not — reaches the page.
 func TestOnDemandFailureDiagnosticOmitsLogsHTML(t *testing.T) {
-	fake := failingFake(errors.New(`project "dashboard": process exited during startup (exit status 3)`))
+	fake := tersePreviewFake()
 	h := onDemandHandler(t, noDiagnosticLogsProject(), fake)
 
 	rec := httptest.NewRecorder()
@@ -592,12 +649,12 @@ func TestOnDemandFailureDiagnosticOmitsLogsHTML(t *testing.T) {
 		t.Errorf("Content-Type = %q, want text/html", ct)
 	}
 	body := rec.Body.String()
-	for _, want := range []string{"<!DOCTYPE html", "dashboard", "exit status 3", "diagnostic_logs: false", "<code>herd-wake logs dashboard</code>"} {
+	for _, want := range []string{"<!DOCTYPE html", "dashboard", "failed to start", "exit status 3", "diagnostic_logs: false", "<code>herd-wake logs dashboard</code>"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("terse HTML diagnostic missing %q; got:\n%s", want, body)
 		}
 	}
-	for _, unwanted := range []string{"boom line one", "&lt;script&gt;", "<script>alert"} {
+	for _, unwanted := range []string{"boom line one", "&lt;script&gt;", "<script>alert", envFilePath, "no &#39;=&#39; in line", "Last error"} {
 		if strings.Contains(body, unwanted) {
 			t.Errorf("terse HTML diagnostic leaked process output (%q); got:\n%s", unwanted, body)
 		}
