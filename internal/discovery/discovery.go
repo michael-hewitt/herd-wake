@@ -24,6 +24,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -44,6 +45,17 @@ type Options struct {
 	// user).
 	Herd     *herd.CLI
 	HerdNote string
+	// HerdUnavailable marks a nil Herd as "no Herd CLI could be found" (as
+	// opposed to disabled with --no-herd). Then an entry whose `herd:` is
+	// unset is synced as `herd: false` — no Herd actions, no commands to
+	// run by hand — and a wildcard entry is told once (see
+	// Result.ProxyNotes) how to front its listener with another proxy.
+	// An explicit `herd: true` still degrades to manual commands.
+	HerdUnavailable bool
+	// GOOS is the operating system the advice in ProxyNotes assumes
+	// (default runtime.GOOS): on darwin the note also offers the `herd
+	// proxy` command.
+	GOOS string
 	// DryRun computes everything but writes no file and runs no Herd
 	// command that changes anything (`herd paths`/`herd links` still run).
 	DryRun bool
@@ -138,11 +150,16 @@ type EntryResult struct {
 
 // Result is the outcome of one Sync.
 type Result struct {
-	ConfigPath    string         `json:"config_path"`
-	DryRun        bool           `json:"dry_run"`
-	HerdAvailable bool           `json:"herd_available"`
-	HerdNote      string         `json:"herd_note,omitempty"`
-	Entries       []*EntryResult `json:"discovery"`
+	ConfigPath    string `json:"config_path"`
+	DryRun        bool   `json:"dry_run"`
+	HerdAvailable bool   `json:"herd_available"`
+	HerdNote      string `json:"herd_note,omitempty"`
+	// ProxyNotes tells the user, once per wildcard entry, how to front the
+	// entry's listener with their own proxy because no Herd CLI was found.
+	// A note is recorded in the state file when shown and repeated only
+	// when the entry's base_domain or supervisor_port changes.
+	ProxyNotes []string       `json:"proxy_notes,omitempty"`
+	Entries    []*EntryResult `json:"discovery"`
 }
 
 // HasErrors reports whether any entry hit an error.
@@ -214,6 +231,9 @@ func Sync(ctx context.Context, cfg *config.Config, opts Options) (*Result, error
 	if opts.PortCommandTimeout <= 0 {
 		opts.PortCommandTimeout = DefaultPortCommandTimeout
 	}
+	if opts.GOOS == "" {
+		opts.GOOS = runtime.GOOS
+	}
 	statePath := StatePath(cfg.Path)
 	state, err := loadState(statePath)
 	if err != nil {
@@ -245,7 +265,11 @@ func Sync(ctx context.Context, cfg *config.Config, opts Options) (*Result, error
 	previous := maps.Clone(state.Wildcards)
 	for _, d := range cfg.Discovery {
 		if d.Wildcard() {
-			res.Entries = append(res.Entries, s.syncWildcard(d))
+			entry, note := s.syncWildcard(d)
+			res.Entries = append(res.Entries, entry)
+			if note != "" {
+				res.ProxyNotes = append(res.ProxyNotes, note)
+			}
 		} else {
 			res.Entries = append(res.Entries, s.syncEntry(d))
 		}
@@ -494,9 +518,20 @@ func (s *syncer) allocate(rng []int, name string) (int, bool) {
 	return 0, false
 }
 
+// herdOff reports whether the entry is synced without any Herd action at
+// all: no Herd CLI could be found and the entry does not ask for Herd
+// explicitly, so it is treated as `herd: false` — the user fronts the
+// listener with their own proxy (Herd is macOS-only).
+func (s *syncer) herdOff(d *config.Discovery) bool {
+	return s.opts.Herd == nil && s.opts.HerdUnavailable && d.Herd == nil
+}
+
 // herdActions creates the missing proxies for the entry's projects and
 // removes the proxies of removed projects, recording each action.
 func (s *syncer) herdActions(d *config.Discovery, res *EntryResult, final, existing map[string]*config.Project) {
+	if s.herdOff(d) {
+		return
+	}
 	record := func(a HerdAction) { res.Herd = append(res.Herd, a) }
 
 	for _, name := range sortedNames(final) {

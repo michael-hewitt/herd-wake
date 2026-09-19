@@ -321,3 +321,169 @@ func TestCheck(t *testing.T) {
 		}
 	}
 }
+
+// TestSyncWildcardWithoutHerdCLIShowsProxyNoteOnce: with no Herd CLI and
+// `herd:` unset, a wildcard entry is synced without any Herd action and
+// the user is told once how to front the listener with their own proxy;
+// the note comes back only when base_domain or the port changes, a dry
+// run never records it, and a removed entry takes its record along.
+func TestSyncWildcardWithoutHerdCLIShowsProxyNoteOnce(t *testing.T) {
+	f := newFixture(t)
+	f.writeWildcardConfig("", "")
+	noHerd := Options{HerdUnavailable: true, HerdNote: "herd CLI not found on PATH (Laravel Herd is macOS-only)", GOOS: "linux"}
+	const note = `no Herd CLI found; point your proxy at herd-wake yourself for discovery "webapp": *.webapp.test → http://127.0.0.1:41000 (see README "Bring your own proxy" for the nginx and Caddy blocks)`
+
+	// Dry run: the note is shown but not remembered.
+	dry := noHerd
+	dry.DryRun = true
+	all := f.syncAll(dry)
+	if len(all.ProxyNotes) != 1 || all.ProxyNotes[0] != note {
+		t.Errorf("dry-run ProxyNotes = %q, want %q", all.ProxyNotes, note)
+	}
+	if _, err := os.Stat(f.statePath()); !os.IsNotExist(err) {
+		t.Error("dry run wrote the state file")
+	}
+
+	// First real sync: note shown, no Herd action, no manual command,
+	// record kept in the state file.
+	all = f.syncAll(noHerd)
+	e := all.Entries[0]
+	if len(e.Errors) > 0 || len(e.Herd) != 0 || len(all.ManualCommands()) != 0 {
+		t.Errorf("without Herd and herd: unset the entry should need nothing from Herd: %+v (manual %v)", e, all.ManualCommands())
+	}
+	if len(all.ProxyNotes) != 1 || all.ProxyNotes[0] != note {
+		t.Errorf("ProxyNotes = %q, want %q", all.ProxyNotes, note)
+	}
+	if all.HerdAvailable || all.HerdNote == "" {
+		t.Errorf("HerdAvailable = %v, HerdNote = %q", all.HerdAvailable, all.HerdNote)
+	}
+	data, err := os.ReadFile(f.statePath())
+	if err != nil {
+		t.Fatalf("state file not written: %v", err)
+	}
+	for _, want := range []string{"# Written by herd-wake sync", "proxy_notes:", "  webapp:", "    base_domain: webapp.test", "    supervisor_port: 41000"} {
+		if !strings.Contains(string(data), want) {
+			t.Errorf("state file missing %q:\n%s", want, data)
+		}
+	}
+	if strings.Contains(string(data), "wildcards:") {
+		t.Errorf("no Herd proxy was registered, so none should be recorded:\n%s", data)
+	}
+
+	// Same listener again: silence.
+	if all = f.syncAll(noHerd); len(all.ProxyNotes) != 0 {
+		t.Errorf("second sync repeated the note: %q", all.ProxyNotes)
+	}
+
+	// A changed base_domain: shown again, for the new pattern.
+	f.writeWildcardConfig("", "    base_domain: preview.test\n")
+	all = f.syncAll(noHerd)
+	if len(all.ProxyNotes) != 1 || !strings.Contains(all.ProxyNotes[0], "*.preview.test → http://127.0.0.1:41000") {
+		t.Errorf("after base_domain change ProxyNotes = %q", all.ProxyNotes)
+	}
+	if len(all.Entries) != 1 {
+		t.Errorf("nothing was proxied, so nothing should be retired: %+v", all.Entries)
+	}
+	if all = f.syncAll(noHerd); len(all.ProxyNotes) != 0 {
+		t.Errorf("sync after the base_domain change repeated the note: %q", all.ProxyNotes)
+	}
+
+	// A changed port: shown again.
+	f.writeWildcardConfig("", "    base_domain: preview.test\n")
+	body, _ := os.ReadFile(f.configPath)
+	if err := os.WriteFile(f.configPath, []byte(strings.Replace(string(body), "supervisor_port: 41000", "supervisor_port: 41001", 1)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	all = f.syncAll(noHerd)
+	if len(all.ProxyNotes) != 1 || !strings.Contains(all.ProxyNotes[0], "*.preview.test → http://127.0.0.1:41001") {
+		t.Errorf("after port change ProxyNotes = %q", all.ProxyNotes)
+	}
+
+	// On darwin the note also offers the herd proxy command.
+	f.writeWildcardConfig("", "")
+	mac := noHerd
+	mac.GOOS = "darwin"
+	all = f.syncAll(mac)
+	if len(all.ProxyNotes) != 1 || !strings.HasSuffix(all.ProxyNotes[0], "; or install Laravel Herd and run: herd proxy webapp http://127.0.0.1:41000 --secure") {
+		t.Errorf("darwin ProxyNotes = %q", all.ProxyNotes)
+	}
+
+	// Entry removed: its record goes and the state file with it.
+	if err := os.WriteFile(f.configPath, []byte("projects: {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	all = f.syncAll(noHerd)
+	if len(all.Entries) != 0 || len(all.ProxyNotes) != 0 {
+		t.Errorf("after removal = %+v, notes %q", all.Entries, all.ProxyNotes)
+	}
+	if _, err := os.Stat(f.statePath()); !os.IsNotExist(err) {
+		t.Error("state file should be removed once nothing is recorded")
+	}
+}
+
+// TestSyncWildcardWithoutHerdCLIExplicitHerdStillManual: `herd: true`
+// asks for Herd, so without the CLI the entry degrades to the manual
+// command (and the proxy note is still shown once); --no-herd (Herd nil
+// but not unavailable) keeps printing the manual command and no note;
+// `herd: false` gets neither Herd action nor note treatment change.
+func TestSyncWildcardWithoutHerdCLIExplicitHerdStillManual(t *testing.T) {
+	f := newFixture(t)
+	f.writeWildcardConfig("", "    herd: true\n")
+	noHerd := Options{HerdUnavailable: true, HerdNote: "herd CLI not found", GOOS: "linux"}
+	all := f.syncAll(noHerd)
+	if a := all.Entries[0].Herd; len(a) != 1 || a[0].Status != HerdManual || a[0].Detail != "herd CLI not found" {
+		t.Errorf("herd: true without the CLI = %+v, want manual", a)
+	}
+	if got := all.ManualCommands(); len(got) != 1 || got[0] != "herd proxy webapp http://127.0.0.1:41000 --secure" {
+		t.Errorf("ManualCommands = %v", got)
+	}
+	if len(all.ProxyNotes) != 1 {
+		t.Errorf("ProxyNotes = %q, want the note once", all.ProxyNotes)
+	}
+	if all = f.syncAll(noHerd); len(all.ProxyNotes) != 0 || len(all.ManualCommands()) != 1 {
+		t.Errorf("second sync: notes %q, manual %v", all.ProxyNotes, all.ManualCommands())
+	}
+
+	// --no-herd: Herd commands by hand, no proxy note.
+	f.writeWildcardConfig("", "")
+	all = f.syncAll(Options{HerdNote: "--no-herd: Herd left untouched", GOOS: "linux"})
+	if got := all.ManualCommands(); len(got) != 1 || len(all.ProxyNotes) != 0 {
+		t.Errorf("--no-herd: manual %v, notes %q", got, all.ProxyNotes)
+	}
+
+	// herd: false without the CLI: as before, and no note.
+	f.writeWildcardConfig("", "    herd: false\n")
+	all = f.syncAll(noHerd)
+	if a := all.Entries[0].Herd; len(a) != 1 || a[0].Status != HerdManual || !strings.Contains(a[0].Detail, "herd: false") || len(all.ProxyNotes) != 0 {
+		t.Errorf("herd: false without the CLI = %+v, notes %q", a, all.ProxyNotes)
+	}
+}
+
+// TestLoadStateOldFormat: a state file written before proxy notes existed
+// still loads, and a proxy-less sync keeps its wildcard records.
+func TestLoadStateOldFormat(t *testing.T) {
+	f := newFixture(t)
+	f.writeWildcardConfig("", "")
+	old := "# Written by herd-wake sync: the wildcard Herd proxies it registered, so a\n# removed wildcard entry is unproxied on the next sync. Do not edit.\nwildcards:\n  webapp:\n    base_domain: webapp.test\n    supervisor_port: 41000\n"
+	if err := os.WriteFile(f.statePath(), []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st, err := loadState(f.statePath())
+	if err != nil {
+		t.Fatalf("loadState(old format): %v", err)
+	}
+	if st.Wildcards["webapp"] != (wildcardState{BaseDomain: "webapp.test", SupervisorPort: 41000}) || st.ProxyNotes == nil || len(st.ProxyNotes) != 0 {
+		t.Errorf("loaded state = %+v", st)
+	}
+
+	all := f.syncAll(Options{HerdUnavailable: true, HerdNote: "herd CLI not found", GOOS: "linux"})
+	if len(all.ProxyNotes) != 1 {
+		t.Errorf("ProxyNotes = %q", all.ProxyNotes)
+	}
+	data, _ := os.ReadFile(f.statePath())
+	for _, want := range []string{"wildcards:", "proxy_notes:"} {
+		if !strings.Contains(string(data), want) {
+			t.Errorf("state file missing %q:\n%s", want, data)
+		}
+	}
+}

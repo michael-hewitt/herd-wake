@@ -35,9 +35,10 @@ func TestDetectPrefersExplicitThenPathThenBundled(t *testing.T) {
 	bundled := filepath.Join(home, "Library", "Application Support", "Herd", "bin", "herd")
 	notFound := func(string) (string, error) { return "", errors.New("not found") }
 
-	// Nothing anywhere.
-	if _, err := Detect(Options{Home: home, LookPath: notFound}); !errors.Is(err, ErrNotFound) {
-		t.Errorf("Detect with nothing installed: err = %v, want ErrNotFound", err)
+	// Nothing anywhere: the macOS error names the bundled location.
+	_, err := Detect(Options{Home: home, LookPath: notFound, GOOS: "darwin"})
+	if !errors.Is(err, ErrNotFound) || !strings.Contains(err.Error(), filepath.Join(home, "Library", "Application Support", "Herd", "bin")) {
+		t.Errorf("Detect with nothing installed: err = %v, want ErrNotFound naming the bundled path", err)
 	}
 
 	// Bundled binary only.
@@ -47,7 +48,7 @@ func TestDetectPrefersExplicitThenPathThenBundled(t *testing.T) {
 	if err := os.WriteFile(bundled, []byte("#!/bin/sh\n"), 0o755); err != nil { //nolint:gosec // executable fixture
 		t.Fatal(err)
 	}
-	cli, err := Detect(Options{Home: home, LookPath: notFound})
+	cli, err := Detect(Options{Home: home, LookPath: notFound, GOOS: "darwin"})
 	if err != nil || cli.Binary() != bundled {
 		t.Errorf("Detect bundled = %v, %v; want %s", cli, err, bundled)
 	}
@@ -57,7 +58,7 @@ func TestDetectPrefersExplicitThenPathThenBundled(t *testing.T) {
 
 	// PATH wins over bundled.
 	onPath := func(string) (string, error) { return "/usr/local/bin/herd", nil }
-	cli, err = Detect(Options{Home: home, LookPath: onPath})
+	cli, err = Detect(Options{Home: home, LookPath: onPath, GOOS: "darwin"})
 	if err != nil || cli.Binary() != "/usr/local/bin/herd" {
 		t.Errorf("Detect PATH = %v, %v", cli, err)
 	}
@@ -69,6 +70,41 @@ func TestDetectPrefersExplicitThenPathThenBundled(t *testing.T) {
 	}})
 	if err != nil || cli.Binary() != "/explicit/herd" {
 		t.Errorf("Detect explicit = %v, %v", cli, err)
+	}
+}
+
+// TestDetectSkipsBundledBinaryOffDarwin: Herd is macOS-only, so on any
+// other OS only PATH (and an explicit binary) count, and the not-found
+// error says so instead of naming a macOS path.
+func TestDetectSkipsBundledBinaryOffDarwin(t *testing.T) {
+	home := t.TempDir()
+	bundled := filepath.Join(home, "Library", "Application Support", "Herd", "bin", "herd")
+	if err := os.MkdirAll(filepath.Dir(bundled), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bundled, []byte("#!/bin/sh\n"), 0o755); err != nil { //nolint:gosec // executable fixture
+		t.Fatal(err)
+	}
+	notFound := func(string) (string, error) { return "", errors.New("not found") }
+
+	_, err := Detect(Options{Home: home, LookPath: notFound, GOOS: "linux"})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Detect on linux with only a bundled binary: err = %v, want ErrNotFound", err)
+	}
+	if want := "herd CLI not found on PATH (Laravel Herd is macOS-only)"; err.Error() != want {
+		t.Errorf("error = %q, want %q", err.Error(), want)
+	}
+	if strings.Contains(err.Error(), "Library") {
+		t.Errorf("the linux error must not mention the macOS bundled path: %q", err)
+	}
+
+	// PATH and an explicit binary still work everywhere.
+	onPath := func(string) (string, error) { return "/usr/local/bin/herd", nil }
+	if cli, err := Detect(Options{Home: home, LookPath: onPath, GOOS: "linux"}); err != nil || cli.Binary() != "/usr/local/bin/herd" {
+		t.Errorf("Detect PATH on linux = %v, %v", cli, err)
+	}
+	if cli, err := Detect(Options{Binary: "/explicit/herd", LookPath: notFound, GOOS: "linux"}); err != nil || cli.Binary() != "/explicit/herd" {
+		t.Errorf("Detect explicit on linux = %v, %v", cli, err)
 	}
 }
 

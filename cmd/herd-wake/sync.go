@@ -83,7 +83,7 @@ func runSync(args []string, stdout, stderr io.Writer) int {
 
 	ctx := context.Background()
 	opts := discovery.Options{DryRun: *dryRun}
-	opts.Herd, opts.HerdNote = detectHerd(*noHerd)
+	opts.Herd, opts.HerdNote, opts.HerdUnavailable = detectHerd(*noHerd)
 	result, err := discovery.Sync(ctx, cfg, opts)
 	if err != nil {
 		fmt.Fprintf(stderr, "herd-wake: %v\n", err)
@@ -140,7 +140,7 @@ func runProjectRemove(args []string, stdout, stderr io.Writer) int {
 	ctx := context.Background()
 	opts := discovery.RemoveOptions{KeepHerd: *keepHerd}
 	if !*keepHerd {
-		opts.Herd, opts.HerdNote = detectHerd(false)
+		opts.Herd, opts.HerdNote, _ = detectHerd(false)
 	}
 	res, err := discovery.Remove(ctx, cfg, name, opts)
 	var mainErr *discovery.MainConfigError
@@ -173,16 +173,17 @@ func runProjectRemove(args []string, stdout, stderr io.Writer) int {
 }
 
 // detectHerd resolves the Herd CLI for sync/remove, or explains why it is
-// not used. disabled reflects --no-herd.
-func detectHerd(disabled bool) (*herd.CLI, string) {
+// not used. disabled reflects --no-herd; unavailable reports that no Herd
+// CLI could be found (as opposed to being told not to use it).
+func detectHerd(disabled bool) (cli *herd.CLI, note string, unavailable bool) {
 	if disabled {
-		return nil, "--no-herd: Herd left untouched"
+		return nil, "--no-herd: Herd left untouched", false
 	}
 	cli, err := herd.Detect(herd.Options{})
 	if err != nil {
-		return nil, err.Error()
+		return nil, err.Error(), true
 	}
-	return cli, ""
+	return cli, "", false
 }
 
 // triggerReload asks a running daemon to reload; a daemon that is not
@@ -247,7 +248,13 @@ func printSync(w io.Writer, out syncOutput) {
 			fmt.Fprintf(w, "  file:      up to date\n")
 		}
 	}
-	if out.HerdNote != "" {
+	for _, note := range out.ProxyNotes {
+		fmt.Fprintf(w, "Proxy: %s\n", note)
+	}
+	// Why Herd was not used matters only when something needed it; a run
+	// with no Herd action at all (no Herd CLI, `herd:` unset everywhere)
+	// stays quiet about Herd.
+	if out.HerdNote != "" && wantedHerd(out.Entries) {
 		fmt.Fprintf(w, "Herd: %s\n", out.HerdNote)
 	}
 	if manual := out.ManualCommands(); len(manual) > 0 {
@@ -259,6 +266,16 @@ func printSync(w io.Writer, out syncOutput) {
 	if !out.DryRun {
 		printReload(w, out.Reload)
 	}
+}
+
+// wantedHerd reports whether any entry recorded a Herd action.
+func wantedHerd(entries []*discovery.EntryResult) bool {
+	for _, e := range entries {
+		if len(e.Herd) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // printSummaries prints one group of a sync result.

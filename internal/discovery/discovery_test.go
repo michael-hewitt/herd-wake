@@ -835,3 +835,58 @@ func TestRemoveLeavesForeignSiteFileAlone(t *testing.T) {
 		t.Errorf("herd mutations = %v, want none", got)
 	}
 }
+
+// TestSyncWithoutHerdCLIDefaultsHerdOff: with no Herd CLI found and
+// `herd:` unset, a proxy-mode entry is written and its projects
+// registered with no Herd action at all — no commands to run by hand;
+// an explicit `herd: true` still degrades to the manual command.
+func TestSyncWithoutHerdCLIDefaultsHerdOff(t *testing.T) {
+	f := newFixture(t)
+	f.worktree("issue-1")
+	f.writeConfig("", "")
+	noHerd := Options{HerdUnavailable: true, HerdNote: "herd CLI not found on PATH (Laravel Herd is macOS-only)"}
+
+	res, err := Sync(context.Background(), f.load(), noHerd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := res.Entries[0]
+	if names(e.Added) != "issue-1" || !e.Written || len(e.Errors) > 0 {
+		t.Fatalf("without a Herd CLI: added=%q written=%v errors=%v", names(e.Added), e.Written, e.Errors)
+	}
+	if len(e.Herd) != 0 || len(res.ManualCommands()) != 0 || len(res.ProxyNotes) != 0 {
+		t.Errorf("herd: unset without a CLI should need nothing from Herd: herd=%+v manual=%v notes=%q", e.Herd, res.ManualCommands(), res.ProxyNotes)
+	}
+	if res.HerdAvailable || res.HerdNote == "" {
+		t.Errorf("HerdAvailable = %v, HerdNote = %q", res.HerdAvailable, res.HerdNote)
+	}
+	if p := f.managed()["issue-1"]; p == nil || p.SupervisorPort != 41000 {
+		t.Errorf("managed file = %+v", f.managed())
+	}
+
+	// A removed worktree is dropped from the file with no unproxy either.
+	if err := os.RemoveAll(filepath.Join(f.workspace, "issue-1")); err != nil {
+		t.Fatal(err)
+	}
+	res, err = Sync(context.Background(), f.load(), noHerd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e := res.Entries[0]; names(e.Removed) != "issue-1" || len(e.Herd) != 0 {
+		t.Errorf("removal without a Herd CLI = removed %q, herd %+v", names(e.Removed), e.Herd)
+	}
+
+	// herd: true asks for Herd: manual as before.
+	f.worktree("issue-1")
+	f.writeConfig("", "    herd: true\n")
+	res, err = Sync(context.Background(), f.load(), noHerd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a := findHerd(t, res.Entries[0].Herd, "proxy", "issue-1"); a.Status != HerdManual || !strings.Contains(a.Detail, "herd CLI not found") {
+		t.Errorf("herd: true without a CLI = %+v, want manual", a)
+	}
+	if got := res.ManualCommands(); len(got) != 1 || got[0] != "herd proxy issue-1 http://127.0.0.1:41000 --secure" {
+		t.Errorf("ManualCommands = %v", got)
+	}
+}

@@ -21,6 +21,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -43,6 +44,10 @@ type Options struct {
 	Home string
 	// LookPath resolves a command name on PATH. Default: exec.LookPath.
 	LookPath func(file string) (string, error)
+	// GOOS is the operating system Detect assumes. Default: runtime.GOOS.
+	// Herd only exists on macOS, so the bundled-binary fallback is tried
+	// on "darwin" alone; tests inject it to cover both branches anywhere.
+	GOOS string
 	// CommandTimeout bounds each CLI invocation. Default: 2 minutes (a
 	// `herd proxy` restarts nginx and may issue a certificate).
 	CommandTimeout time.Duration
@@ -68,8 +73,9 @@ type listing struct {
 }
 
 // Detect locates the Herd CLI: opts.Binary if set, else `herd` on PATH,
-// else the bundled binary at ~/Library/Application Support/Herd/bin/herd.
-// It returns ErrNotFound (wrapped) when none exists.
+// else — on macOS only — the bundled binary at ~/Library/Application
+// Support/Herd/bin/herd. It returns ErrNotFound (wrapped) when none
+// exists; on other platforms the error says Herd is macOS-only.
 func Detect(opts Options) (*CLI, error) {
 	home := opts.Home
 	if home == "" {
@@ -77,6 +83,11 @@ func Detect(opts Options) (*CLI, error) {
 			home = h
 		}
 	}
+	goos := opts.GOOS
+	if goos == "" {
+		goos = runtime.GOOS
+	}
+	darwin := goos == "darwin"
 	configDir := opts.ConfigDir
 	if configDir == "" {
 		configDir = filepath.Join(home, "Library", "Application Support", "Herd", "config", "valet")
@@ -94,7 +105,7 @@ func Detect(opts Options) (*CLI, error) {
 		}
 		if found, err := lookPath("herd"); err == nil {
 			binary = found
-		} else {
+		} else if darwin {
 			bundled := filepath.Join(home, "Library", "Application Support", "Herd", "bin", "herd")
 			if info, err := os.Stat(bundled); err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
 				binary = bundled
@@ -102,6 +113,9 @@ func Detect(opts Options) (*CLI, error) {
 		}
 	}
 	if binary == "" {
+		if !darwin {
+			return nil, fmt.Errorf("%w on PATH (Laravel Herd is macOS-only)", ErrNotFound)
+		}
 		return nil, fmt.Errorf("%w: not on PATH and no bundled binary under %s", ErrNotFound,
 			filepath.Join(home, "Library", "Application Support", "Herd", "bin"))
 	}
