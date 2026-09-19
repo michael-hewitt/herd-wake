@@ -535,3 +535,95 @@ func BenchmarkOnDemandHotPath(b *testing.B) {
 		}
 	})
 }
+
+// noDiagnosticLogsProject is a project whose 503s must reveal nothing the
+// dev server printed — the shape of a preview entry on a publicly reachable
+// staging box.
+func noDiagnosticLogsProject() *config.Project {
+	p := testProject(0)
+	off := false
+	p.DiagnosticLogs = &off
+	return p
+}
+
+// TestOnDemandFailureDiagnosticOmitsLogsPlainText: with diagnostic_logs
+// false the plain-text 503 still says what went wrong — state, exit status,
+// last error — but quotes no process output and points at the host's logs
+// instead.
+func TestOnDemandFailureDiagnosticOmitsLogsPlainText(t *testing.T) {
+	fake := failingFake(errors.New(`project "dashboard": process exited during startup (exit status 3)`))
+	h := onDemandHandler(t, noDiagnosticLogsProject(), fake)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://dashboard.test/", nil)
+	req.Header.Set("Accept", "*/*") // curl's default: not a browser
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{`"dashboard"`, "failed", "exit status 3", "diagnostic_logs: false", "herd-wake logs dashboard"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("terse plain diagnostic missing %q; got:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "boom line one") {
+		t.Errorf("terse plain diagnostic leaked process output; got:\n%s", body)
+	}
+}
+
+// TestOnDemandFailureDiagnosticOmitsLogsHTML is the browser rendering of the
+// same 503: no process output at all, so nothing from the logs — escaped or
+// not — reaches the page.
+func TestOnDemandFailureDiagnosticOmitsLogsHTML(t *testing.T) {
+	fake := failingFake(errors.New(`project "dashboard": process exited during startup (exit status 3)`))
+	h := onDemandHandler(t, noDiagnosticLogsProject(), fake)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://dashboard.test/", nil)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8")
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Errorf("Content-Type = %q, want text/html", ct)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"<!DOCTYPE html", "dashboard", "exit status 3", "diagnostic_logs: false", "<code>herd-wake logs dashboard</code>"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("terse HTML diagnostic missing %q; got:\n%s", want, body)
+		}
+	}
+	for _, unwanted := range []string{"boom line one", "&lt;script&gt;", "<script>alert"} {
+		if strings.Contains(body, unwanted) {
+			t.Errorf("terse HTML diagnostic leaked process output (%q); got:\n%s", unwanted, body)
+		}
+	}
+}
+
+// TestWriteDiagnosticLogsOmittedWithoutProject: the pointer line names a
+// project, so a diagnostic with no project (a hostname nobody claims) omits
+// the output silently rather than printing a command with a hole in it.
+func TestWriteDiagnosticLogsOmittedWithoutProject(t *testing.T) {
+	for _, accept := range []string{"*/*", "text/html"} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "http://nobody.test/", nil)
+		req.Header.Set("Accept", accept)
+		WriteDiagnostic(rec, req, Diagnostic{
+			Status:      http.StatusNotFound,
+			Reason:      "No project answers to this hostname.",
+			LogsOmitted: true,
+		})
+
+		body := rec.Body.String()
+		if strings.Contains(body, "diagnostic_logs") || strings.Contains(body, "herd-wake logs") {
+			t.Errorf("Accept %q: diagnostic without a project should print no logs pointer; got:\n%s", accept, body)
+		}
+		if !strings.Contains(body, "No project answers to this hostname.") {
+			t.Errorf("Accept %q: diagnostic lost its reason; got:\n%s", accept, body)
+		}
+	}
+}

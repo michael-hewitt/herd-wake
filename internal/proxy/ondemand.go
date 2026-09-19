@@ -82,6 +82,13 @@ type onDemand struct {
 	// activity and the tunnel never blocks an idle stop.
 	wsKeepAlive bool
 
+	// diagnosticLogs is the project's diagnostic_logs setting, read once at
+	// construction (like wsKeepAlive) rather than per request: true means a
+	// 503 quotes recent process output, false means it only points at
+	// `herd-wake logs`, which is what keeps a publicly reachable preview URL
+	// from showing paths or secrets printed by a failing dev server.
+	diagnosticLogs bool
+
 	// maxWait bounds how long one request may be held while the project
 	// starts.
 	maxWait time.Duration
@@ -133,8 +140,11 @@ func NewOnDemand(p *config.Project, upstream Upstream, activity Activity, logger
 		forward:     New(p, logger),
 		logger:      logger,
 		wsKeepAlive: p.WebSocketsKeepAlive == nil || *p.WebSocketsKeepAlive,
-		maxWait:     maxWait,
-		maxHeld:     maxHeld,
+
+		diagnosticLogs: p.DiagnosticLogsEnabled(),
+
+		maxWait: maxWait,
+		maxHeld: maxHeld,
 	}
 }
 
@@ -276,7 +286,8 @@ func isUpgrade(r *http.Request) bool {
 }
 
 // deny answers 503 with a diagnostic: the reason, the project's lifecycle
-// state, its exit summary and last error, and recent process output.
+// state, its exit summary and last error, and — unless the project sets
+// diagnostic_logs: false — recent process output.
 func (h *onDemand) deny(w http.ResponseWriter, r *http.Request, reason string) {
 	h.denyWith(w, r, Diagnostic{Reason: reason})
 }
@@ -298,7 +309,13 @@ func (h *onDemand) denyWith(w http.ResponseWriter, r *http.Request, d Diagnostic
 	d.Status = http.StatusServiceUnavailable
 	d.Project = h.project.Name
 	d.State, d.Exit, d.Err = snap.State, snap.LastExit, snap.LastError
-	d.Logs = h.upstream.Logs(diagnosticLogLines)
+	// State, exit status, and last error stay either way; only the process
+	// output is withheld, and the page says so and where to find it.
+	if h.diagnosticLogs {
+		d.Logs = h.upstream.Logs(diagnosticLogLines)
+	} else {
+		d.LogsOmitted = true
+	}
 	WriteDiagnostic(w, r, d)
 }
 
@@ -325,6 +342,13 @@ type Diagnostic struct {
 	Err   string
 	// Logs are recent process-output lines to quote (omitted when empty).
 	Logs []string
+	// LogsOmitted says process output exists but is deliberately not shown
+	// (the project's diagnostic_logs: false). The rendering then prints one
+	// line pointing at `herd-wake logs <Project>` on the host instead of the
+	// output, so a publicly reachable URL reveals nothing the dev server
+	// printed. Callers guarantee Logs is empty whenever this is set; it has
+	// no effect without a Project to name in the pointer.
+	LogsOmitted bool
 	// Hint is the closing advice. Default (with a project): reload to retry
 	// or run project:start.
 	Hint string
@@ -351,11 +375,15 @@ func WriteDiagnostic(w http.ResponseWriter, r *http.Request, d Diagnostic) {
 	if prefersHTML(r) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(d.Status)
-		_ = diagnosticPage.Execute(w, diagnosticData{
+		data := diagnosticData{
 			Diagnostic: d,
 			LogText:    strings.Join(d.Logs, "\n"),
 			HintHTML:   hintHTML(d.Hint),
-		}) // headers are written; nothing useful is left to do on a render error
+		}
+		if d.LogsOmitted && d.Project != "" {
+			data.OmittedHTML = hintHTML(logsOmittedNote(d.Project))
+		}
+		_ = diagnosticPage.Execute(w, data) // headers are written; nothing useful is left to do on a render error
 		return
 	}
 
@@ -371,15 +399,26 @@ func WriteDiagnostic(w http.ResponseWriter, r *http.Request, d Diagnostic) {
 	if d.Err != "" {
 		fmt.Fprintf(w, "Last error: %s\n", d.Err)
 	}
-	if len(d.Logs) > 0 {
+	switch {
+	case len(d.Logs) > 0:
 		fmt.Fprintf(w, "\nRecent output (herd-wake logs %s):\n", d.Project)
 		for _, line := range d.Logs {
 			fmt.Fprintf(w, "  %s\n", line)
 		}
+	case d.LogsOmitted && d.Project != "":
+		fmt.Fprintf(w, "\n%s\n", logsOmittedNote(d.Project))
 	}
 	if d.Hint != "" {
 		fmt.Fprintf(w, "\n%s\n", d.Hint)
 	}
+}
+
+// logsOmittedNote is the single line both renderings print in place of the
+// process output when diagnostic_logs is false: it says the output exists
+// but is not shown here, and where on the host to read it. The command is
+// backtick-quoted like a hint, so hintHTML renders it as <code>.
+func logsOmittedNote(project string) string {
+	return fmt.Sprintf("Process output is not shown here (diagnostic_logs: false); run `herd-wake logs %s` on the host.", project)
 }
 
 // prefersHTML reports whether the request's Accept header asks for HTML
@@ -410,6 +449,9 @@ type diagnosticData struct {
 	Diagnostic
 	LogText  string
 	HintHTML template.HTML
+	// OmittedHTML is the logs-omitted note, empty unless the diagnostic
+	// withholds process output.
+	OmittedHTML template.HTML
 }
 
 var diagnosticPage = template.Must(template.New("diagnostic").Parse(`<!DOCTYPE html>
@@ -437,6 +479,7 @@ var diagnosticPage = template.Must(template.New("diagnostic").Parse(`<!DOCTYPE h
 </dl>{{end}}
 {{if .LogText}}<p>Recent output (<code>herd-wake logs {{.Project}}</code>):</p>
 <pre>{{.LogText}}</pre>{{end}}
+{{if .OmittedHTML}}<p>{{.OmittedHTML}}</p>{{end}}
 {{if .HintHTML}}<p>{{.HintHTML}}</p>{{end}}
 </body>
 </html>
