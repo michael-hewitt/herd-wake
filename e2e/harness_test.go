@@ -28,9 +28,10 @@ const envGuard = "HW_E2E"
 
 // Shared, set up once in TestMain when the guard is on.
 var (
-	binPath    string // the compiled herd-wake binary
-	repoRoot   string // module root (parent of this package)
-	fixtureDir string // testdata/vite-fixture
+	binPath        string // the compiled herd-wake binary
+	repoRoot       string // module root (parent of this package)
+	fixtureDir     string // testdata/vite-fixture
+	nodeFixtureDir string // testdata/node-fixture (plain `node server.js`, no deps)
 )
 
 // e2eEnabled reports whether the guard is on.
@@ -59,6 +60,7 @@ func TestMain(m *testing.M) {
 			return 1
 		}
 		fixtureDir = filepath.Join(repoRoot, "testdata", "vite-fixture")
+		nodeFixtureDir = filepath.Join(repoRoot, "testdata", "node-fixture")
 
 		binDir, err := os.MkdirTemp("", "herd-wake-e2e")
 		if err != nil {
@@ -375,6 +377,53 @@ func viteProject(name string, supervisorPort, appPort, idleSeconds int) string {
     startup_timeout_seconds: 120
     idle_timeout_seconds: %d
 `, name, name, supervisorPort, appPort, fixtureDir, appPort, idleSeconds)
+}
+
+// countNodeFixtureProcs counts running testdata/node-fixture servers: node
+// processes whose command line names the script's absolute path. The
+// supervisor runs commands via `sh -c`; bash (macOS /bin/sh) execs the lone
+// command, but dash (Ubuntu) stays alive as `sh -c node …/server.js`, whose
+// line also contains the path — so only lines whose program (first token,
+// by basename, as node_path may make it absolute) is node count. The port
+// is not on the command line (it arrives via PORT), so a test using this
+// owns the only such project in the suite.
+func countNodeFixtureProcs(t *testing.T) int {
+	t.Helper()
+	out, err := exec.Command("ps", "ax", "-o", "args=").Output()
+	if err != nil {
+		t.Fatalf("ps: %v", err)
+	}
+	count := 0
+	script := filepath.Join(nodeFixtureDir, "server.js")
+	for line := range strings.SplitSeq(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || filepath.Base(fields[0]) != "node" {
+			continue
+		}
+		if strings.Contains(line, script) {
+			count++
+		}
+	}
+	return count
+}
+
+// nodeFixtureProject renders the config entry for testdata/node-fixture: a
+// plain `node <path>/server.js` command (no npm script) that learns its port
+// from the PORT variable in the project's env, the shape a TypeScript server
+// started as `node --import tsx src/server.ts` takes on a staging box.
+// shutdownTimeoutSeconds bounds the wait for a graceful exit before SIGKILL.
+func nodeFixtureProject(name string, supervisorPort, appPort, shutdownTimeoutSeconds int) string {
+	return fmt.Sprintf(`  %s:
+    public_url: https://%s.test
+    supervisor_port: %d
+    application_port: %d
+    working_directory: %s
+    command: node %s
+    env:
+      PORT: "%d"
+    startup_timeout_seconds: 60
+    shutdown_timeout_seconds: %d
+`, name, name, supervisorPort, appPort, nodeFixtureDir, filepath.Join(nodeFixtureDir, "server.js"), appPort, shutdownTimeoutSeconds)
 }
 
 // nodeProject renders the config entry for a trivial Node HTTP server (a
