@@ -54,8 +54,9 @@ type syncOutput struct {
 func runSync(args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("sync", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	configPath := flags.String("config", "", "path to the config file (default: ~/Library/Application Support/herd-wake/config.yaml)")
-	socketPath := flags.String("socket", "", "path to the control socket (default: ~/Library/Application Support/herd-wake/herd-wake.sock)")
+	defaults := config.DisplayDefaults()
+	configPath := flags.String("config", "", "path to the config file (default: "+defaults.ConfigFile+")")
+	socketPath := flags.String("socket", "", "path to the control socket (default: "+defaults.SocketPath+")")
 	dryRun := flags.Bool("dry-run", false, "compute and print the changes without writing files or touching Herd")
 	noHerd := flags.Bool("no-herd", false, "do not run the herd CLI at all; print the Herd commands to run by hand")
 	asJSON := flags.Bool("json", false, "print the result as JSON")
@@ -114,8 +115,9 @@ func runSync(args []string, stdout, stderr io.Writer) int {
 func runProjectRemove(args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("project:remove", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	configPath := flags.String("config", "", "path to the config file (default: ~/Library/Application Support/herd-wake/config.yaml)")
-	socketPath := flags.String("socket", "", "path to the control socket (default: ~/Library/Application Support/herd-wake/herd-wake.sock)")
+	defaults := config.DisplayDefaults()
+	configPath := flags.String("config", "", "path to the config file (default: "+defaults.ConfigFile+")")
+	socketPath := flags.String("socket", "", "path to the control socket (default: "+defaults.SocketPath+")")
 	keepHerd := flags.Bool("keep-herd", false, "leave the project's Herd proxy in place")
 	if err := flags.Parse(args); err != nil {
 		return 2

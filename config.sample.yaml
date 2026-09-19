@@ -2,7 +2,9 @@
 #
 # Copy this file to:
 #
-#   ~/Library/Application Support/herd-wake/config.yaml
+#   macOS:  ~/Library/Application Support/herd-wake/config.yaml
+#   Linux:  $XDG_CONFIG_HOME/herd-wake/config.yaml
+#           (~/.config/herd-wake/config.yaml when XDG_CONFIG_HOME is unset)
 #
 # and adjust it for your projects. herd-wake reads this user-level file only;
 # nothing is stored inside your project repositories.
@@ -15,8 +17,9 @@
 #   herd proxy vite.accounts http://127.0.0.1:7102 --secure
 #
 # Additional projects may live in one file each under a projects.d directory
-# next to this file (~/Library/Application Support/herd-wake/projects.d/
-# *.yaml, same layout: a `projects:` map per file, one project or many). They
+# next to this file (macOS: ~/Library/Application Support/herd-wake/projects.d/
+# *.yaml; Linux: ~/.config/herd-wake/projects.d/*.yaml; same layout: a
+# `projects:` map per file, one project or many). They
 # are merged into this file's projects; a name defined twice anywhere is an
 # error. Tooling that registers projects automatically writes there, so this
 # hand-written file is never rewritten.
@@ -67,7 +70,9 @@ projects:
     # Required. The dev-server command, run via `/bin/sh -c` from
     # working_directory (so quoting, $VARS, and && chains behave like your
     # terminal) in its own process group. Its combined stdout/stderr is
-    # captured to ~/Library/Application Support/herd-wake/logs/<name>.log.
+    # captured to <name>.log under the logs directory (macOS:
+    # ~/Library/Application Support/herd-wake/logs; Linux:
+    # $XDG_STATE_HOME/herd-wake/logs, default ~/.local/state/herd-wake/logs).
     # Pin it to application_port and make the port strict so a port conflict
     # fails fast instead of drifting to another port. Make the server bind
     # 127.0.0.1 explicitly: herd-wake proxies (and probes readiness) at

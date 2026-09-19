@@ -159,7 +159,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if err := d.claimSocket(ctx); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(d.socketPath), 0o755); err != nil {
+	// 0700: the socket is the daemon's control interface and, on Linux, its
+	// fallback directory lives under the shared /tmp.
+	if err := os.MkdirAll(filepath.Dir(d.socketPath), 0o700); err != nil {
 		return fmt.Errorf("create control socket directory: %w", err)
 	}
 

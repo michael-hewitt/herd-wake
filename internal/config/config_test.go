@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -328,12 +329,18 @@ func TestDefaultPath(t *testing.T) {
 	if err != nil {
 		t.Skipf("no home directory: %v", err)
 	}
+	t.Setenv("XDG_CONFIG_HOME", "")
 
 	got, err := DefaultPath()
 	if err != nil {
 		t.Fatalf("DefaultPath() error: %v", err)
 	}
-	want := filepath.Join(home, "Library", "Application Support", "herd-wake", "config.yaml")
+	var want string
+	if runtime.GOOS == "darwin" {
+		want = filepath.Join(home, "Library", "Application Support", "herd-wake", "config.yaml")
+	} else {
+		want = filepath.Join(home, ".config", "herd-wake", "config.yaml")
+	}
 	if got != want {
 		t.Errorf("DefaultPath() = %q, want %q", got, want)
 	}

@@ -73,7 +73,7 @@ Platforms — macOS and Linux carry equal weight; Windows is out of scope:
 |---|---|---|
 | Front proxy that owns 80/443, DNS and TLS | [Laravel Herd](https://herd.laravel.com); `herd-wake sync` registers the proxy entries for you | nginx or Caddy with a wildcard `server` block ("Behind another proxy" under [Sharing a port: routing by Host](#sharing-a-port-routing-by-host)); you register it once |
 | Runs the daemon at boot | launchd (see the `herd-wake-worktrees` skill in `.claude/skills/`) | systemd (unit file and XDG paths land with [#11](https://github.com/michael-hewitt/herd-wake/issues/11)) |
-| Config / socket / logs | `~/Library/Application Support/herd-wake`, `~/Library/Logs/herd-wake` | XDG paths after #11; until then pass `--config`, `--socket`, `--log-dir` |
+| Config / socket / logs | All under `~/Library/Application Support/herd-wake`: `config.yaml` (+ `projects.d/`), `herd-wake.sock`, `logs/` | XDG: config `~/.config/herd-wake/config.yaml` (+ `projects.d/`), socket `$XDG_RUNTIME_DIR/herd-wake.sock` (fallback `/tmp/herd-wake-<uid>/`), logs `~/.local/state/herd-wake/logs/`; `$XDG_CONFIG_HOME`/`$XDG_STATE_HOME` honoured |
 | CI | e2e suite on `macos-latest` | unit tests on `ubuntu-latest` (e2e on Linux lands with #11) |
 
 Requirements:

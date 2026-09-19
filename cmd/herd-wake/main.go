@@ -73,7 +73,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 func runProjects(args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("projects", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	configPath := flags.String("config", "", "path to the config file (default: ~/Library/Application Support/herd-wake/config.yaml)")
+	defaults := config.DisplayDefaults()
+	configPath := flags.String("config", "", "path to the config file (default: "+defaults.ConfigFile+")")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -138,9 +139,10 @@ func printWildcard(w io.Writer, d *config.Discovery) {
 func runStart(args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("start", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	configPath := flags.String("config", "", "path to the config file (default: ~/Library/Application Support/herd-wake/config.yaml)")
-	socketPath := flags.String("socket", "", "path to the control socket (default: ~/Library/Application Support/herd-wake/herd-wake.sock)")
-	logDirFlag := flags.String("log-dir", "", "directory for per-project process logs (default: ~/Library/Application Support/herd-wake/logs)")
+	defaults := config.DisplayDefaults()
+	configPath := flags.String("config", "", "path to the config file (default: "+defaults.ConfigFile+")")
+	socketPath := flags.String("socket", "", "path to the control socket (default: "+defaults.SocketPath+")")
+	logDirFlag := flags.String("log-dir", "", "directory for per-project process logs (default: "+defaults.LogsDir+")")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -178,7 +180,8 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 func runStatus(args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("status", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	socketPath := flags.String("socket", "", "path to the control socket (default: ~/Library/Application Support/herd-wake/herd-wake.sock)")
+	defaults := config.DisplayDefaults()
+	socketPath := flags.String("socket", "", "path to the control socket (default: "+defaults.SocketPath+")")
 	asJSON := flags.Bool("json", false, "print the daemon's status response as JSON (for scripts)")
 	if err := flags.Parse(args); err != nil {
 		return 2
@@ -329,7 +332,8 @@ func describeIdleStop(p control.ProjectStatus) string {
 func runReload(args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("reload", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	socketPath := flags.String("socket", "", "path to the control socket (default: ~/Library/Application Support/herd-wake/herd-wake.sock)")
+	defaults := config.DisplayDefaults()
+	socketPath := flags.String("socket", "", "path to the control socket (default: "+defaults.SocketPath+")")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -393,7 +397,8 @@ func runReload(args []string, stdout, stderr io.Writer) int {
 func runProjectLease(args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("project:lease", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	socketPath := flags.String("socket", "", "path to the control socket (default: ~/Library/Application Support/herd-wake/herd-wake.sock)")
+	defaults := config.DisplayDefaults()
+	socketPath := flags.String("socket", "", "path to the control socket (default: "+defaults.SocketPath+")")
 	ttl := flags.Duration("ttl", 30*time.Minute, "how long the lease lasts, e.g. 30m or 2h")
 	if err := flags.Parse(args); err != nil {
 		return 2
@@ -432,7 +437,8 @@ func runProjectLease(args []string, stdout, stderr io.Writer) int {
 func runProjectCommand(command string, args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	socketPath := flags.String("socket", "", "path to the control socket (default: ~/Library/Application Support/herd-wake/herd-wake.sock)")
+	defaults := config.DisplayDefaults()
+	socketPath := flags.String("socket", "", "path to the control socket (default: "+defaults.SocketPath+")")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -490,7 +496,8 @@ func runProjectCommand(command string, args []string, stdout, stderr io.Writer) 
 func runLogs(args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("logs", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	socketPath := flags.String("socket", "", "path to the control socket (default: ~/Library/Application Support/herd-wake/herd-wake.sock)")
+	defaults := config.DisplayDefaults()
+	socketPath := flags.String("socket", "", "path to the control socket (default: "+defaults.SocketPath+")")
 	lines := flags.Int("lines", 0, "maximum lines to print (0 = everything buffered, up to 200)")
 	if err := flags.Parse(args); err != nil {
 		return 2
@@ -606,7 +613,8 @@ https://github.com/michael-hewitt/herd-wake/blob/main/config.sample.yaml
 }
 
 func usage(w io.Writer) {
-	fmt.Fprint(w, `Usage: herd-wake <command>
+	defaults := config.DisplayDefaults()
+	fmt.Fprintf(w, `Usage: herd-wake <command>
 
 Commands:
   start                    Run the supervisor daemon in the foreground (Ctrl-C to stop, SIGHUP to reload)
@@ -626,16 +634,16 @@ Commands:
 
 Options:
   --config <path>   Config file to load (start, projects, sync, url, project:remove); projects.d/ next to it is merged in
-                    (default: ~/Library/Application Support/herd-wake/config.yaml)
+                    (default: %s)
   --socket <path>   Control socket to use (start, status, reload, sync, project:*, logs)
-                    (default: ~/Library/Application Support/herd-wake/herd-wake.sock)
+                    (default: %s)
   --log-dir <path>  Directory for per-project process logs (start)
-                    (default: ~/Library/Application Support/herd-wake/logs)
+                    (default: %s)
   --ttl <duration>  How long a lease lasts, e.g. 45m or 2h (project:lease; default 30m)
   --lines <n>       Maximum lines to print (logs; 0 = everything buffered)
   --dry-run         Compute and print what sync would change without writing or touching Herd (sync)
   --no-herd         Never run the herd CLI; print the Herd commands to run by hand (sync)
   --json            Print the result as JSON (sync, status)
   --keep-herd       Leave the project's Herd proxy in place (project:remove)
-`)
+`, defaults.ConfigFile, defaults.SocketPath, defaults.LogsDir)
 }

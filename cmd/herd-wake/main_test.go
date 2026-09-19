@@ -7,12 +7,14 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/michael-hewitt/herd-wake/internal/config"
 	"github.com/michael-hewitt/herd-wake/internal/control"
 )
 
@@ -132,6 +134,37 @@ func TestUsageMentionsProjects(t *testing.T) {
 
 	if !strings.Contains(stderr.String(), "projects") {
 		t.Errorf("usage should mention the projects command; got:\n%s", stderr.String())
+	}
+}
+
+// The usage text and the per-command flag help show the running platform's
+// default paths (macOS: Application Support; Linux: XDG), abbreviated with ~.
+func TestUsageShowsPlatformDefaultPaths(t *testing.T) {
+	defaults := config.DisplayDefaults()
+	if !strings.HasPrefix(defaults.ConfigFile, "~/") {
+		t.Fatalf("DisplayDefaults().ConfigFile = %q, want a ~-abbreviated path", defaults.ConfigFile)
+	}
+	if runtime.GOOS == "darwin" && defaults.ConfigFile != "~/Library/Application Support/herd-wake/config.yaml" {
+		t.Errorf("DisplayDefaults().ConfigFile = %q on darwin", defaults.ConfigFile)
+	}
+
+	var stdout, stderr bytes.Buffer
+	run(nil, &stdout, &stderr)
+	for _, want := range []string{defaults.ConfigFile, defaults.SocketPath, defaults.LogsDir} {
+		if !strings.Contains(stderr.String(), "(default: "+want+")") {
+			t.Errorf("usage should show default %q; got:\n%s", want, stderr.String())
+		}
+	}
+	if strings.Contains(stderr.String(), "Application Support") && runtime.GOOS != "darwin" {
+		t.Errorf("usage shows the macOS path on %s:\n%s", runtime.GOOS, stderr.String())
+	}
+
+	stderr.Reset()
+	run([]string{"start", "--help"}, &stdout, &stderr)
+	for _, want := range []string{defaults.ConfigFile, defaults.SocketPath, defaults.LogsDir} {
+		if !strings.Contains(stderr.String(), "(default: "+want+")") {
+			t.Errorf("start --help should show default %q; got:\n%s", want, stderr.String())
+		}
 	}
 }
 
