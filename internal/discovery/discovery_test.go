@@ -491,6 +491,54 @@ func TestSyncPortCommandTimeout(t *testing.T) {
 	}
 }
 
+// TestRunPortCommandSeesEnvFile: the probe runs with the same environment
+// the dev server will get, so a port kept in a per-worktree env file is
+// what the port_command can print. The file is relative and therefore
+// resolved against the worktree, which is what a prep script drops in.
+func TestRunPortCommandSeesEnvFile(t *testing.T) {
+	dir := t.TempDir()
+	shared := filepath.Join(t.TempDir(), "preview.env")
+	if err := os.WriteFile(shared, []byte("PREVIEW_PORT=4700\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".env.preview"), []byte("PREVIEW_PORT=4711\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	template := &config.Project{EnvFile: config.EnvFiles{shared, ".env.preview"}}
+
+	port, err := RunPortCommand(context.Background(), dir, `printf '%s' "$PREVIEW_PORT"`, template, time.Second)
+
+	if err != nil {
+		t.Fatalf("RunPortCommand: %v", err)
+	}
+	if port != 4711 {
+		t.Errorf("port = %d, want 4711 (the per-worktree file overriding the shared one)", port)
+	}
+}
+
+// TestRunPortCommandMalformedEnvFileFails: a broken secrets file fails the
+// probe with the file and line, and never the line's content.
+func TestRunPortCommandMalformedEnvFileFails(t *testing.T) {
+	dir := t.TempDir()
+	bad := filepath.Join(dir, ".env.preview")
+	if err := os.WriteFile(bad, []byte("PREVIEW_PORT=4711\nFOO hunter2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	template := &config.Project{EnvFile: config.EnvFiles{".env.preview"}}
+
+	_, err := RunPortCommand(context.Background(), dir, "echo 4711", template, time.Second)
+
+	if err == nil {
+		t.Fatal("RunPortCommand should fail on a malformed env file")
+	}
+	if !strings.Contains(err.Error(), bad) || !strings.Contains(err.Error(), "line 2") {
+		t.Errorf("error = %q, want it to name the file and line 2", err)
+	}
+	if strings.Contains(err.Error(), "hunter2") {
+		t.Errorf("error = %q; it must not quote the line's content", err)
+	}
+}
+
 func TestParsePort(t *testing.T) {
 	for output, want := range map[string]int{
 		"45001\n":                        45001,

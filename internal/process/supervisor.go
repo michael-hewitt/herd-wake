@@ -22,7 +22,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -30,6 +29,7 @@ import (
 	"time"
 
 	"github.com/michael-hewitt/herd-wake/internal/config"
+	"github.com/michael-hewitt/herd-wake/internal/envfile"
 )
 
 // Project lifecycle states (PRD §8).
@@ -483,6 +483,22 @@ func (s *Supervisor) Restart(ctx context.Context) error {
 // it spawns share one new process group, which is what stop/kill signals
 // target.
 func (s *Supervisor) spawnLocked() error {
+	// The environment comes first, before any file or pipe is opened,
+	// because building it can fail — a shared env file that has vanished,
+	// a malformed line — and a failed start must leave nothing behind. The
+	// failure travels as the spawn error, so it reaches the EnsureStarted
+	// waiters (and the proxy's 503 diagnostic) exactly like a command that
+	// would not start. The permission warnings are logged at every spawn,
+	// not just the first: an operator who chmods a secrets file wrongly
+	// should keep hearing about it.
+	env, warnings, err := envfile.ChildEnv(s.project, s.project.WorkingDirectory)
+	for _, warning := range warnings {
+		s.logger.Printf("project %q: %s", s.project.Name, warning)
+	}
+	if err != nil {
+		return fmt.Errorf("project %q: %w", s.project.Name, err)
+	}
+
 	logFile, err := openLogFile(s.logPath, s.project.LogRetentionDays)
 	if err != nil {
 		return fmt.Errorf("project %q: %w", s.project.Name, err)
@@ -495,7 +511,7 @@ func (s *Supervisor) spawnLocked() error {
 
 	cmd := exec.Command("/bin/sh", "-c", s.project.Command)
 	cmd.Dir = s.project.WorkingDirectory
-	cmd.Env = s.commandEnv()
+	cmd.Env = env
 	cmd.Stdout = w
 	cmd.Stderr = w
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -735,33 +751,6 @@ func (s *Supervisor) shutdownSignal() (syscall.Signal, string) {
 		return sig, s.project.ShutdownSignal
 	}
 	return syscall.SIGTERM, "SIGTERM" // config validation makes this unreachable
-}
-
-// commandEnv builds the child environment: the daemon's environment, plus a
-// PATH override for node_path, plus the project's env entries. os/exec keeps
-// the last occurrence of a duplicated variable, so later entries override
-// earlier ones (project env wins over node_path wins over the inherited
-// environment).
-func (s *Supervisor) commandEnv() []string {
-	env := os.Environ()
-	if s.project.NodePath != "" {
-		// node_path is documented as the node executable's path; prepend its
-		// directory to PATH (or the path itself if it already is a directory).
-		dir := s.project.NodePath
-		if info, err := os.Stat(dir); err != nil || !info.IsDir() {
-			dir = filepath.Dir(dir)
-		}
-		env = append(env, "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	}
-	keys := make([]string, 0, len(s.project.Env))
-	for k := range s.project.Env {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		env = append(env, k+"="+s.project.Env[k])
-	}
-	return env
 }
 
 // describeExit renders how a process ended ("exit status 1",
