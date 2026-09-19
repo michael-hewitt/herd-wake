@@ -6,6 +6,11 @@
 #           loginctl enable-linger $USER     # keep it running with no login session open
 # Logs:     journalctl --user -u herd-wake -f
 #
+# Serving per-branch preview servers from this unit (wildcard entry, nginx
+# with TLS and auth, env files for the secrets, terse public diagnostics) is
+# walked through in the README, "Preview servers on a staging box":
+# https://github.com/michael-hewitt/herd-wake#preview-servers-on-a-staging-box
+#
 # The daemon runs as your own user, never root. With no flags it uses the XDG
 # defaults: config ~/.config/herd-wake/config.yaml (+ projects.d/), logs
 # ~/.local/state/herd-wake/logs/, and the control socket

@@ -21,6 +21,7 @@ The full specification lives in [issue #1](https://github.com/michael-hewitt/her
   - [The projects.d directory](#the-projectsd-directory)
 - [Reloading the configuration](#reloading-the-configuration)
 - [Running as a service](#running-as-a-service)
+- [Preview servers on a staging box](#preview-servers-on-a-staging-box)
 - [Worktrees: automatic URLs](#worktrees-automatic-urls)
   - [Wildcard mode (recommended)](#wildcard-mode-recommended)
   - [How a worktree is resolved](#how-a-worktree-is-resolved)
@@ -63,7 +64,7 @@ A request arriving at a supervisor port goes through this lifecycle:
 2. **Stopped?** Transition to `starting`: run the configured `command` (via `/bin/sh -c`, in its own process group, from `working_directory`), and poll readiness (`http` polls `readiness_url`, `tcp` dials `application_port`).
 3. **Hold the request** while the server starts (bounded by `hold_max_wait_seconds` / `hold_max_requests`); every concurrent request shares the *same single startup* — 20 simultaneous cold requests produce exactly one process. Request bodies are streamed, never buffered.
 4. **Ready?** Forward the held request(s). The client just sees a slower first response.
-5. **Failed or timed out?** Answer `503` with a diagnostic (state, exit status, recent process output). Automatic request-triggered retries back off exponentially (1s doubling to a 30s cap); `project:start`/`project:restart` retries immediately and resets the backoff.
+5. **Failed or timed out?** Answer `503` with a diagnostic (state, exit status, recent process output — or, with [`diagnostic_logs: false`](#optional-fields) for a project whose URL other people can reach, a pointer to `herd-wake logs` instead of the output). Automatic request-triggered retries back off exponentially (1s doubling to a 30s cap); `project:start`/`project:restart` retries immediately and resets the backoff.
 
 Idle shutdown, WebSocket keep-alive, and manual controls are covered [below](#idle-shutdown-leases-and-websockets); [reloading the configuration](#reloading-the-configuration) applies config edits to the running daemon without touching unchanged projects. Process safety: herd-wake tracks the exact process group it spawned and signals only that group — never anything matched by name — and stops every group it owns before the daemon itself exits.
 
@@ -271,7 +272,7 @@ Drop `tls internal` for a public domain with a DNS provider module (below), or w
 
 **TLS is the proxy's job.** herd-wake only ever speaks plain HTTP on loopback. A wildcard certificate needs the ACME DNS-01 challenge — HTTP-01 cannot issue wildcards — so use certbot with a DNS plugin for your DNS host (`certbot certonly --dns-<provider> -d '*.webapp.example.com'`) and the commented `ssl_*` lines above, or Caddy's DNS provider modules (`tls { dns <provider> … }` in the site block) which renew on their own. A local `.test` domain cannot be issued a public certificate at all: use plain HTTP, a self-signed wildcard cert you trust on the client, or Caddy's `tls internal`. `.test` DNS is yours to provide too (`/etc/hosts` entries, or a `dnsmasq` rule `address=/.webapp.test/127.0.0.1`).
 
-**How herd-wake treats the forwarded headers** (`internal/proxy/proxy.go`): `X-Forwarded-For` is *appended to* — the chain your proxy started gains herd-wake's view of the client (the proxy's loopback address) rather than being replaced; an inbound `X-Forwarded-Proto` and `X-Forwarded-Host` are preserved verbatim and only filled in when absent (`X-Forwarded-Proto` from the project's `public_url` scheme, `X-Forwarded-Host` from the inbound `Host`); `Host` is forwarded to the dev server unchanged unless the project sets [`rewrite_host: true`](#optional-fields), in which case the dev server sees `Host: 127.0.0.1:<application_port>` and the public host rides in `X-Forwarded-Host`. Your proxy therefore has the last word on what the application believes its public origin is — send the headers above and nothing downstream needs to know the proxy exists.
+**How herd-wake treats the forwarded headers** (`internal/proxy/proxy.go`): `X-Forwarded-For` is *appended to* — the chain your proxy started gains herd-wake's view of the client (the proxy's loopback address) rather than being replaced; an inbound `X-Forwarded-Proto` and `X-Forwarded-Host` are preserved verbatim and only filled in when absent (`X-Forwarded-Proto` from the project's `public_url` scheme, `X-Forwarded-Host` from the inbound `Host`); `Host` is forwarded to the dev server unchanged unless the project sets [`rewrite_host: true`](#optional-fields), in which case the dev server sees `Host: 127.0.0.1:<application_port>` and the public host rides in `X-Forwarded-Host`. Your proxy therefore has the last word on what the application believes its public origin is — send the headers above and nothing downstream needs to know the proxy exists. One thing does change when the proxy faces more than your own machine: set [`diagnostic_logs: false`](#optional-fields) on those projects (or on the wildcard entry) so herd-wake's own `404`/`503` pages stop quoting process output and paths at strangers — see [Preview servers on a staging box](#preview-servers-on-a-staging-box).
 
 ## Configuration reference
 
@@ -313,6 +314,8 @@ The file is a `projects:` map of project names to settings, plus an optional `di
 | `shutdown_timeout_seconds` | int | `10` | How long to wait for the process group to exit after `shutdown_signal` before it is force-killed (SIGKILL). |
 | `always_on` | bool | `false` | Start this project as soon as the daemon starts and never idle-stop it. A failed always-on start never keeps the daemon from running. Manual `project:stop`/`project:restart` still work. |
 | `env` | map | — | Extra environment variables for the dev server (merged over the daemon's environment; project entries win). |
+| `env_file` | string or list | — | Files of `NAME=value` lines read into the dev server's environment at every start — and before every `port_command` run — so secrets stay out of this file and out of every herd-wake output. One path or a list of them; a leading `~/` is expanded. An **absolute** path is a shared file and must exist: a missing one is a validation error, and one that vanishes later fails the start. A **relative** path is resolved against `working_directory` (for a discovered worktree, the worktree itself) and is **optional** — a missing one is skipped, which is how a per-worktree file such as `.env.preview` is expressed. Files are read in list order: a later file beats an earlier one, the inline `env` map beats every file, and all of them beat the daemon's environment. Nothing is cached, so editing a file needs no reload and is not a "change" a [reload](#reloading-the-configuration) acts on. The format, the file permissions, and what herd-wake will never print are under [Preview servers on a staging box](#preview-servers-on-a-staging-box). |
+| `diagnostic_logs` | bool | `true` | Whether this project's `404`/`503` diagnostic pages may quote its recent process output and filesystem paths — what you want at a local `.test` URL. `false` makes them terse for a URL other people can reach: state, exit status, last error, and a pointer to `herd-wake logs <name>` on the host, with no output and no paths. The full detail still goes to the daemon's log either way. |
 | `node_path` | string | — | Absolute path to the Node executable (or its directory) to put first on `PATH`, for projects pinned to a specific Node version. |
 | `log_retention_days` | int | `7` | Log rotation/retention: on each project start, a log over 10 MiB is rotated to `<name>.log.old` (at most one rotation kept), and logs untouched for this many days are deleted. |
 | `listen_host` | string | `127.0.0.1` | Address the supervisor listener binds for this project. Non-loopback values are rejected unless `allow_non_loopback: true`. |
@@ -394,13 +397,13 @@ Each entry of the top-level `discovery:` list is a template for one family of gi
 | `require_files` | list | — | Relative paths that must all exist inside a subdirectory for it to become a project. |
 | `url_template` | string | `https://{name}.test` | Proxy mode only: each project's `public_url`; `{name}` (required) is the subdirectory name. (Rejected in wildcard mode, where the URL is always `https://<label>.<base_domain>`.) |
 | `command` | string | required | The template's `command`, run in each worktree. It must make the server listen on `127.0.0.1:<application_port>` — since that port differs per worktree, derive it the way `port_command` does rather than hard-coding it. |
-| `port_command` | string | — | Run in the worktree (`/bin/sh -c`, with the template's `env` and `node_path` on `PATH`, 15 s timeout); its output — a bare port on the last line, or a URL (explicit port, else 80/443 by scheme) — becomes `application_port`. Wildcard mode runs it when a worktree is first served (and again on `project:restart`, moving the project if the port changed); a failure is a `503` diagnostic with the output, retried with backoff. Proxy mode runs it on every sync; a changed port updates the project, and on failure the worktree is skipped this time (an already-registered project keeps its previous settings). |
+| `port_command` | string | — | Run in the worktree (`/bin/sh -c`, with the template's `env`, its `env_file` files, and `node_path` on `PATH`, 15 s timeout — a probe that could not see the variables the dev server gets would report a port for a different server); its output — a bare port on the last line, or a URL (explicit port, else 80/443 by scheme) — becomes `application_port`. Wildcard mode runs it when a worktree is first served (and again on `project:restart`, moving the project if the port changed); a failure is a `503` diagnostic with the output, retried with backoff. Proxy mode runs it on every sync; a changed port updates the project, and on failure the worktree is skipped this time (an already-registered project keeps its previous settings). |
 | `application_port_range` | `[low, high]` | required without `port_command` | Where projects get their `application_port` when there is no `port_command`: the lowest port not used anywhere in the configuration (proxy mode) or by any live project (wildcard mode). |
 | `supervisor_port_range` | `[low, high]` | required in proxy mode | Proxy mode only: where new projects get their `supervisor_port`: the lowest port not used anywhere in the configuration (main file and every `projects.d` file). Allocated ports are written to the managed file and never change afterwards, so URLs and Herd proxies stay stable across syncs. (Rejected in wildcard mode.) |
 | `herd` | bool | `true` (macOS); on Linux `true` when a `herd` CLI is found, else `false` | Create/remove Herd proxy entries for this entry (one per worktree in proxy mode; one wildcard proxy for `base_domain` in wildcard mode). With `false`, or with an explicit `true` when the `herd` CLI is not found, sync prints the commands for you to run instead. Left unset on Linux, where Laravel Herd does not exist, sync leaves Herd out entirely and tells you what to point your own proxy at (once per wildcard listener; per newly registered URL in proxy mode). On macOS a missing `herd` CLI is always reported, with the commands to run. |
 | `exclude` | list | `[".*"]` | `path.Match` glob patterns on the subdirectory name; matches are never candidates. Setting it replaces the default. |
 | `max_running` | int | — | Wildcard mode only: how many of this entry's worktrees may run at once — see [Running-server budget](#running-server-budget-max_running). The top-level `max_running` still applies across entries. Changing it is applied live by a reload, not treated as a change to the entry. |
-| *any per-project field* | | | `env`, `node_path`, `rewrite_host`, `readiness_strategy`, `startup_timeout_seconds`, `idle_timeout_minutes`, `websockets_keep_alive`, `shutdown_signal`, `shutdown_timeout_seconds`, `log_retention_days`, `always_on`, `hold_*`, `listen_host`, … are accepted in the template and copied verbatim to every generated project. `public_url`, `host`, `application_port`, and `working_directory` are generated and therefore rejected in a template (`supervisor_port` too, in proxy mode). |
+| *any per-project field* | | | `env`, `env_file`, `diagnostic_logs`, `node_path`, `rewrite_host`, `readiness_strategy`, `startup_timeout_seconds`, `idle_timeout_minutes`, `websockets_keep_alive`, `shutdown_signal`, `shutdown_timeout_seconds`, `log_retention_days`, `always_on`, `hold_*`, `listen_host`, … are accepted in the template and copied verbatim to every generated project. `public_url`, `host`, `application_port`, and `working_directory` are generated and therefore rejected in a template (`supervisor_port` too, in proxy mode). |
 
 ### The projects.d directory
 
@@ -469,6 +472,217 @@ journalctl --user -u herd-wake -f     # the daemon's own log; dev-server output 
 
 The unit stops with SIGTERM under `KillMode=mixed`, so systemd signals only herd-wake and lets it stop every dev-server process group itself (`shutdown_signal`, then SIGKILL after `shutdown_timeout_seconds`); stragglers are killed at `TimeoutStopSec=90`. `Restart=on-failure` restarts a crashed daemon after 5 s — a clean `systemctl --user stop` stays stopped. After editing the unit: `systemctl --user daemon-reload && systemctl --user restart herd-wake`; after editing `config.yaml`: `herd-wake reload`, which never restarts anything. Nginx or Caddy in front of the listener is the [Bring your own proxy](#bring-your-own-proxy) setup.
 
+## Preview servers on a staging box
+
+A small Linux box can host a preview server per in-flight branch without running them all at once. The branches are prepped on disk by **your** tooling — checkout, `npm install`, client build, a database copied from staging — and herd-wake does exactly one thing with the result: it starts a branch's server when someone opens its URL and stops it again when they stop looking. Nothing is registered per branch, nothing is reloaded when a branch appears or goes, and herd-wake never preps, builds, or deletes anything.
+
+```
+browser ──▶ nginx on the staging box (443, wildcard cert, auth)
+              ├─ staging.singyourpart.app ──▶ herd-wake ──▶ staging server   (always_on)
+              └─ <slug>.preview.singyourpart.app ──▶ herd-wake ──▶ branch server for <slug>  (on demand)
+```
+
+**Authentication is required — this walkthrough is not complete without it.** Every branch server sits on a copy of the staging database, so no preview URL may be reachable from the internet unauthenticated. The steps below use nginx `auth_basic`: it needs no external service and it lives in the `server` block you are writing anyway. Cloudflare Access in front of the box, or binding the box to a Tailscale address only, are equivalent substitutes — pick one, but pick one. herd-wake itself stays auth-agnostic: it speaks plain HTTP on loopback behind the proxy and has no opinion about who is on the other side.
+
+**1. Install the binary and the service.** Build and install `herd-wake` as in [Install](#install), then run it under systemd exactly as in [Running as a service](#running-as-a-service) — the user unit from `contrib/herd-wake.service`, plus `loginctl enable-linger $USER` so the daemon survives with no login session open, which a headless box always is. Give the unit a `PATH` (or each project a `node_path`) that finds the Node the branches need; a user unit does not inherit a login shell's.
+
+**2. Lay out the prep directory.** Your prep script owns `/srv/previews`: one directory per branch, named by a slug that is a DNS label (`issue-3265`, not `Feature_X`), holding the checkout, its installed dependencies, its built client, and its own database. It also drops `<slug>/.env.preview` with the branch's own values (its database name, say) and `<slug>/.herd-wake-port` holding the port that branch's server should listen on. herd-wake reads that directory and never writes to it: a slug is servable the moment its directory passes the entry's rules, and a `404` the moment it is gone.
+
+**3. Write the config** (`~/.config/herd-wake/config.yaml`): one always-on project for staging, one wildcard entry for every branch.
+
+```yaml
+# ~350 MB per SYP server on a 4 GB box with no swap: six servers is about
+# 2.1 GB, which leaves room for nginx, Postgres, and the prep script. The
+# always-on staging server holds one of the six permanently, so five
+# branches can be open at once; the sixth visitor evicts the least recently
+# used branch, whose next visit cold-starts it again.
+max_running: 6
+
+projects:
+  staging:
+    host: staging.singyourpart.app        # public_url defaults to https://<host>
+    supervisor_port: 41001
+    application_port: 41101
+    working_directory: /srv/staging
+    command: SYP_SERVER_PORT=41101 node --import tsx src/server.ts
+    always_on: true
+    env_file: /etc/herd-wake/staging.env
+    diagnostic_logs: false
+    startup_timeout_seconds: 120
+
+discovery:
+  - name: preview
+    mode: wildcard
+    base_domain: preview.singyourpart.app # <slug>.preview.singyourpart.app
+    supervisor_port: 41000                # ONE listener for every branch
+    directory: /srv/previews              # <directory>/<slug> is the prepped branch
+    require_files: [package.json, .herd-wake-port]
+
+    # herd-wake sets no port variable of its own: port_command tells it
+    # where to proxy, and the command must make the server listen there.
+    # Reading both from the same file the prep script wrote is the honest
+    # way to keep them equal.
+    port_command: cat .herd-wake-port
+    command: SYP_SERVER_PORT=$(cat .herd-wake-port) node --import tsx src/server.ts
+
+    # Non-secret values, the same for every branch: they may sit in the
+    # config, which is why they are here rather than in a file.
+    env:
+      ENVIRONMENT: preview
+      SUPPRESS_DB_TESTS: "1"
+
+    # Secrets are not. The absolute path is the shared file every branch
+    # gets and must exist; the relative one is read from each branch's own
+    # directory and is optional, so a branch whose prep dropped no
+    # .env.preview still starts.
+    env_file: [/etc/herd-wake/preview.env, .env.preview]
+
+    # The URLs are reachable by other people, so the 404/503 pages say
+    # nothing about the box (step 6).
+    diagnostic_logs: false
+
+    readiness_strategy: tcp
+    startup_timeout_seconds: 120
+    idle_timeout_minutes: 30
+```
+
+`application_port_range: [42000, 42999]` replaces `port_command` if you would rather herd-wake pick each branch's port — but then the `command` has to learn the port some other way, so a port file the prep script writes is usually simpler. The full field reference is under [Discovery entries](#discovery-entries); `max_running` is explained under [Running-server budget](#running-server-budget-max_running).
+
+**4. Put the secrets in the env files, and lock them down.** An env file is a small dotenv subset, read fresh at every process start (and at every `port_command` run) — rotating a password is a file edit, never a reload:
+
+```sh
+sudo install -d -m 700 /etc/herd-wake
+sudo tee /etc/herd-wake/preview.env >/dev/null <<'EOF'
+# One NAME=value per line. `export ` in front is allowed and ignored.
+DB_LOGIN=postgres://syp:s3cr3t@localhost/staging_template
+SESSION_SECRET="line one\nline two"
+EOF
+sudo chmod 600 /etc/herd-wake/preview.env
+chmod 700 ~/.config/herd-wake            # and 600 on anything secret inside it
+```
+
+The rules, exactly:
+
+- One `NAME=value` per line, with an optional `export ` prefix. `NAME` must be a shell identifier (`[A-Za-z_][A-Za-z0-9_]*`). A name repeated later in the same file keeps its last value.
+- Blank lines, and lines whose first non-space character is `#`, are ignored. **There are no inline comments**: a `#` in a value is an ordinary character, so `DB_LOGIN=pa#ss` needs no quoting and `FOO=bar # note` has the value `bar # note`.
+- A value in matching single quotes is taken literally between them. A value in matching double quotes honours `\n`, `\"`, and `\\`, and keeps every other backslash sequence verbatim (a Windows path or a regex survives). An unquoted value is trimmed of surrounding whitespace and is otherwise verbatim. Text after a closing quote is an error.
+- CRLF endings and a leading UTF-8 BOM are tolerated.
+- Files are read in the order they are listed: a later file beats an earlier one, the inline `env` map beats every file, and all of them beat the daemon's own environment (and the `node_path` `PATH` entry).
+- A malformed line fails the start with `env_file /etc/herd-wake/preview.env: line 4: no '=' in line`. The message names the file and the line number and never quotes the line, because the line is where the password is.
+- A file readable by group or other is a warning at every start (`/etc/herd-wake/preview.env is readable by other users (mode 0644); run chmod 600 on it`) in the daemon's log — `journalctl --user -u herd-wake`. It is a warning, never a refusal.
+
+What herd-wake will and will not show you afterwards: **an env file's contents are never rendered anywhere** — not in `projects`, not in `status`, not in a diagnostic page, not in the daemon's log, not in a parse error. `herd-wake projects` names the configured paths (it never opens them) and prints the inline `env` map with any value whose name matches `PASSWORD|SECRET|TOKEN|KEY|LOGIN|DSN|URL` (case-insensitive, anywhere in the name) replaced by `[redacted]`; the rule over-matches on purpose, so `PUBLIC_URL` is masked too. `herd-wake status` and `status --json` carry no environment at all, so a pasted status cannot leak by construction.
+
+**5. Front it with nginx, with TLS and authentication.** One wildcard `server` block for the branches and one for staging, both forwarding to their herd-wake listener. Get a certificate first — a wildcard needs the ACME DNS-01 challenge, and one certificate can cover the staging host too:
+
+```sh
+sudo certbot certonly --dns-<provider> \
+  -d 'preview.singyourpart.app' -d '*.preview.singyourpart.app' -d 'staging.singyourpart.app'
+sudo apt install apache2-utils
+sudo htpasswd -c /etc/nginx/preview.htpasswd reviewer   # drop -c to add more people
+sudo chmod 640 /etc/nginx/preview.htpasswd && sudo chown root:www-data /etc/nginx/preview.htpasswd
+```
+
+```nginx
+# /etc/nginx/conf.d/preview.conf
+server {
+    listen 443 ssl;
+    server_name *.preview.singyourpart.app;
+
+    ssl_certificate     /etc/letsencrypt/live/preview.singyourpart.app/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/preview.singyourpart.app/privkey.pem;
+
+    # Nothing behind this block is safe to expose: every branch server runs
+    # on a copy of the staging database.
+    auth_basic           "Preview";
+    auth_basic_user_file /etc/nginx/preview.htpasswd;
+
+    location / {
+        proxy_pass http://127.0.0.1:41000;   # the wildcard entry's one listener
+        proxy_http_version 1.1;
+
+        proxy_set_header Host              $host;   # herd-wake picks the branch from this
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host  $host;
+
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        # Must outlive a held cold start: hold_max_wait_seconds defaults to
+        # startup_timeout_seconds + 5, so 125s for the config above.
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+
+        proxy_buffering off;                 # streamed responses (SSE, HMR)
+    }
+}
+
+server {
+    listen 443 ssl;
+    server_name staging.singyourpart.app;
+
+    ssl_certificate     /etc/letsencrypt/live/preview.singyourpart.app/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/preview.singyourpart.app/privkey.pem;
+
+    auth_basic           "Preview";
+    auth_basic_user_file /etc/nginx/preview.htpasswd;
+
+    location / {
+        proxy_pass http://127.0.0.1:41001;   # the staging project's own port
+        proxy_http_version 1.1;
+        # …the same proxy_set_header, timeout, and proxy_buffering lines.
+    }
+}
+```
+
+```sh
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+The headers are the ones explained under [Bring your own proxy](#bring-your-own-proxy), and the branch server sees exactly what they promise: the public host in `Host`, the real client appended to `X-Forwarded-For`, and `https` in `X-Forwarded-Proto`, so its generated URLs and logs are right (`TestPreviewForwardedHeadersBehindNginx` sends this block's headers end to end). Branches come and go without nginx being edited or reloaded.
+
+**Caddy** does the same in a few lines, renewing the wildcard itself:
+
+```caddyfile
+*.preview.singyourpart.app {
+    basic_auth { reviewer <bcrypt hash from `caddy hash-password`> }
+    tls { dns <provider> <credentials> }
+    reverse_proxy 127.0.0.1:41000
+}
+staging.singyourpart.app {
+    basic_auth { reviewer <bcrypt hash from `caddy hash-password`> }
+    tls { dns <provider> <credentials> }
+    reverse_proxy 127.0.0.1:41001
+}
+```
+
+**6. Verify, and know what a reviewer sees.** `herd-wake projects` shows the staging project and the wildcard entry, each with its `Env files:` paths, its `Env:` map with the secrets masked, and `Diagnostics: process output hidden on the public 503/404 pages (diagnostic_logs: false)`. `herd-wake status` shows `running servers: 1/6 (max_running)` with staging up. Then open a branch:
+
+```sh
+curl -u reviewer:<password> -sS -o /dev/null -w '%{http_code} in %{time_total}s\n' \
+  https://issue-3265.preview.singyourpart.app/
+```
+
+The first request is the cold start: herd-wake runs `port_command`, starts the branch's server, holds the request until the port answers, and forwards it — about 8 s for an SYP server, and instant afterwards until the branch idles out at `idle_timeout_minutes`.
+
+When a branch fails to start, the reviewer gets a `503` naming the branch, its state, and its exit status, followed by one line: "Process output is not shown here (diagnostic_logs: false); run `herd-wake logs issue-3265` on the host." Whatever the dying server printed, including a connection string, stays on the box. A slug with no prepped directory gets a `404` saying `There is no servable worktree for this hostname.` and `Check the daemon log on the host for the rule that rejected it.`, with no paths and no `port_command` output. Nothing is lost for you: the full reason is in the daemon's log, and the server's own output is complete on the host.
+
+```sh
+herd-wake logs issue-3265            # the branch server's stdout/stderr, unredacted
+journalctl --user -u herd-wake       # the daemon: the real 404/503 reason, env-file warnings
+```
+
+**What the prep script must guarantee.** herd-wake serves whatever it finds, so the contract is the prep script's to keep:
+
+- `/srv/previews/<slug>` exists, complete and ready to run, before anyone opens its URL — and `<slug>` is a DNS label (lowercase letters, digits, hyphens), not starting with a dot (the default `exclude` is `[".*"]`).
+- The directory is a git checkout or worktree: a candidate must have a `.git` file or directory (add `repository: /srv/syp.git` to the entry to insist on linked worktrees of one repository, and see [How a worktree is resolved](#how-a-worktree-is-resolved) for the rest of the rules).
+- Every `require_files` entry is there, including the port file, and the port in it is free and unique across branches (two branches on one port make the second a `503`).
+- `<slug>/.env.preview`, when the branch needs its own values, is mode `600` and holds only `NAME=value` lines.
+- Removing a branch is `rm -rf` of its directory: the next request is a `404`, a running server is stopped gracefully, and the project is dropped.
+
+TLS, DNS, and authentication are the proxy's job from beginning to end; herd-wake terminates nothing and authenticates no one.
+
 ## Worktrees: automatic URLs
 
 If you work in git worktrees — one directory per branch or issue under a workspace folder — herd-wake can make `https://<worktree-name>.<repo>.test` live the moment the worktree exists, with nothing to register per branch and nothing to clean up when it goes. That is **wildcard mode**: one Herd proxy per repository, one listener, worktrees resolved from the URL on demand. The older **per-worktree mode** — one project, port, and Herd proxy per worktree, kept in sync by a folder watcher — remains available for setups that need a flat `https://<worktree>.test` URL or a separate port per worktree.
@@ -514,7 +728,7 @@ Herd's proxy site file and certificate for `webapp.test` both cover `*.webapp.te
 
 A request reaching the entry's listener with `Host: <label>.<base_domain>` — exactly one label, directly under the base domain; the base domain itself, `www.…`, and deeper names get a `404` — is resolved to `<directory>/<label>`. The directory must pass the entry's candidate rules: it exists, is not `exclude`d (dot-directories by default), is a git worktree or repository (has a `.git` file or directory), is a *linked* worktree of `repository` when that is set (its `.git` file points into `<repository>/.git/worktrees/`), and contains every `require_files` entry. Otherwise the request gets a `404` diagnostic saying which rule failed (`no worktree named "nope" under …: missing required file(s): start.sh`). Rules are re-checked on every unresolved request, so a worktree that appears (or is fixed) is served without any restart.
 
-The first sight of a label **materialises a project in memory**: name `<label>`, `working_directory` the worktree, `host`/`public_url` `https://<label>.<base_domain>`, the template's fields, and an `application_port` from `port_command` (run in the worktree with the template's `env` and `node_path`, 15 s timeout) or the lowest free port of `application_port_range`. Resolution runs at most once per label at a time — concurrent first requests share it, so `port_command` runs once and one process starts — and requests arriving meanwhile are held under the template's `hold_max_wait_seconds`/`hold_max_requests`. A `port_command` failure, or a port some other live project already uses, is a `503` diagnostic with the reason, retried with the same backoff as a failed start.
+The first sight of a label **materialises a project in memory**: name `<label>`, `working_directory` the worktree, `host`/`public_url` `https://<label>.<base_domain>`, the template's fields, and an `application_port` from `port_command` (run in the worktree with the template's `env`, `env_file`, and `node_path`, 15 s timeout) or the lowest free port of `application_port_range`. Resolution runs at most once per label at a time — concurrent first requests share it, so `port_command` runs once and one process starts — and requests arriving meanwhile are held under the template's `hold_max_wait_seconds`/`hold_max_requests`. A `port_command` failure, or a port some other live project already uses, is a `503` diagnostic with the reason, retried with the same backoff as a failed start.
 
 From then on the project is ordinary: single-flight cold start, request holding, idle stop (it stays registered, keeping its port, across idle stops), WebSocket keep-alive, leases, and every `project:*` command and `logs` work with `<label>` as the name. `herd-wake status` lists it with source `discovery:webapp (dynamic)` and shows each wildcard entry's URL pattern and how many worktrees it has materialised. `project:restart <label>` re-runs `port_command` first and moves the project to the new port if it changed. Names must be unique across the daemon: a static project called `issue-1` takes precedence over a worktree of that name, which gets a `503` naming the conflict.
 
@@ -608,7 +822,7 @@ herd-wake <command> [flags] [args]
 | `herd-wake reload` | Re-read the config file and `projects.d` and apply the difference to the running daemon (see [Reloading the configuration](#reloading-the-configuration)). Prints added / removed / changed / unchanged projects; exits 1 if the config is invalid (nothing changes) or a project could not be applied. |
 | `herd-wake sync` | Reconcile every `discovery:` entry with Herd: one wildcard proxy per wildcard entry; for proxy-mode entries, discover worktrees, rewrite the managed `projects.d/<name>.yaml` files, and create/remove per-worktree proxies. Then reload the daemon if it is running (see [Worktrees: automatic URLs](#worktrees-automatic-urls)). `--dry-run` prints without writing or touching Herd; `--no-herd` skips the Herd CLI and prints the commands; `--json` for scripting. Exits 1 when an entry failed or the reload was rejected. |
 | `herd-wake url [directory]` | Print the public URL a directory (default: the current one) is served at: a registered project's `public_url` for its `working_directory`, or `https://<label>.<base_domain>` for a servable worktree under a wildcard entry. Exits 1 with the reason otherwise (not a candidate, or a per-worktree-mode worktree that has not been synced). Works without the daemon running. |
-| `herd-wake projects` | List every registered project from the config file and `projects.d` (with each project's source file) and every wildcard entry (works without the daemon running). |
+| `herd-wake projects` | List every registered project from the config file and `projects.d` (with each project's source file) and every wildcard entry (works without the daemon running). Each one's environment is shown too: the `env_file` paths as configured (the files are never opened), the inline `env` map with values whose names look sensitive replaced by `[redacted]`, and a note when `diagnostic_logs: false` keeps the public pages terse. |
 | `herd-wake project:start <name>` | Start a project's dev server and wait until it is ready. Bypasses and resets the failure backoff. Under a full [`max_running`](#running-server-budget-max_running) it evicts the least-recently-active project first, or fails naming the projects that cannot be evicted. Worktrees of a wildcard entry are addressed by their label once they have been served. |
 | `herd-wake project:stop <name>` | Gracefully stop a project's dev server (signal, then force-kill after its shutdown timeout). A wildcard worktree whose directory is gone is dropped once stopped. |
 | `herd-wake project:restart <name>` | Stop (if needed) and start a project's dev server. For a wildcard worktree, re-runs `port_command` first and moves the project to the new port if it changed. |
@@ -690,6 +904,10 @@ WebSocket upgrades are proxied like any other traffic, including through a cold 
 
 **A worktree answers `503 … cannot be served`.** Its `port_command` failed (the output is quoted) or printed a port another running project already uses. Fix the worktree and retry after the backoff, or `herd-wake project:restart <label>` once it exists.
 
+**A preview URL shows a `503` (or `404`) with nothing in it.** That is [`diagnostic_logs: false`](#optional-fields) doing its job: the page a reviewer can reach names the project, its state and exit status, and says "Process output is not shown here (diagnostic_logs: false); run `herd-wake logs <name>` on the host" — a terse `404` likewise says only that there is no servable worktree for the hostname. Nothing was withheld from *you*: `herd-wake logs <name>` has the server's full output on the host, and the daemon's log (`journalctl --user -u herd-wake`) has the real reason for the `404`/`503`, including the `port_command` output and the path that failed the candidate rules. Unset the field (or set it to `true`) on a project whose URL only you can reach.
+
+**Start fails with `env_file … does not exist` or `env_file … line N`.** An [`env_file`](#optional-fields) could not be used, so the start was abandoned before anything was spawned. An absolute path is a shared file that must exist — check it is still there and readable by the user the daemon runs as (a missing one is also rejected at load time, by `herd-wake projects` and by `reload`); a relative path is resolved against the working directory and a missing one is skipped, so that error means the file is there but unreadable or malformed. `line N` is a syntax error on that line: one `NAME=value` per line with a shell-identifier name, `#` only as a whole-line comment, and no text after a closing quote — the [format rules](#preview-servers-on-a-staging-box) in full. The error deliberately never quotes the line, so open line N yourself. A world-readable env file is only a warning in the daemon's log, not a failure.
+
 **`herd-wake url` exits 1 in a worktree that used to work.** The reason is printed: the directory fails a candidate rule, or (per-worktree mode) it has not been synced. In wildcard mode the URL is `https://<directory name>.<base_domain>` by construction.
 
 **`sync` refused a worktree (or a wildcard base name): "a directory named … exists in Herd parked path …".** A parked or linked Herd site already answers on that name, and a proxy would shadow it — see [the safeguard](#the-herd-collision-safeguard). Rename the worktree (or the site, or the entry's `base_domain`). Nothing was written for it.
@@ -708,7 +926,7 @@ WebSocket upgrades are proxied like any other traffic, including through a cold 
 
 ## Development
 
-Layout: `cmd/herd-wake` (CLI), `internal/config` (config load/validate, `projects.d` merge, `discovery:` schema, port-sharing rules), `internal/discovery` (worktree candidate rules, port allocation, managed-file writer, `sync`/`project:remove`, wildcard proxy state), `internal/herd` (Herd CLI wrapper: `paths`, `links`, site files, `proxy`/`unproxy`), `internal/daemon` (wiring, Host router and shared listeners, wildcard resolver, states, control-API provider, live reload), `internal/proxy` (reverse proxy, on-demand holding, WebSocket tunneling, diagnostic pages), `internal/process` (process-group supervisor, logs, backoff), `internal/idle` (activity tracking, idle monitor), `internal/control` (unix-socket HTTP API + client), `internal/testproc` (test-only child-process helpers, WebSocket test client, and the fake `herd` script the discovery tests run against — no test ever invokes a real Herd).
+Layout: `cmd/herd-wake` (CLI), `internal/config` (config load/validate, `projects.d` merge, `discovery:` schema, port-sharing rules), `internal/discovery` (worktree candidate rules, port allocation, managed-file writer, `sync`/`project:remove`, wildcard proxy state), `internal/herd` (Herd CLI wrapper: `paths`, `links`, site files, `proxy`/`unproxy`), `internal/daemon` (wiring, Host router and shared listeners, wildcard resolver, states, control-API provider, live reload), `internal/proxy` (reverse proxy, on-demand holding, WebSocket tunneling, diagnostic pages), `internal/process` (process-group supervisor, logs, backoff), `internal/envfile` (env-file parsing, the child environment every spawn is built from, and the redaction rule), `internal/idle` (activity tracking, idle monitor), `internal/control` (unix-socket HTTP API + client), `internal/testproc` (test-only child-process helpers, WebSocket test client, and the fake `herd` script the discovery tests run against — no test ever invokes a real Herd).
 
 ```sh
 go test -race ./...                          # fast inner loop (e2e tests skip themselves)
@@ -718,4 +936,4 @@ golangci-lint run
 
 Changes land through pull requests against `main`. A ruleset requires every CI check (`build-and-test (ubuntu-latest)`, `build-and-test (macos-latest)`, `lint`, `e2e (ubuntu-latest)`, `e2e (macos-latest)`) to pass and blocks force-pushes and deletion, so nothing can be pushed to `main` directly; open a PR from a branch, enable auto-merge, and it squash-merges itself once CI is green (the PR title becomes the commit title, the commit messages its body) and the branch is deleted. Merging to `main` deploys nothing: engineers build and install the binary from their own checkout (see [Install](#install)).
 
-The E2E suite (`e2e/`) builds the real binary, runs the daemon as a subprocess against two fixtures — the Vite fixture in `testdata/vite-fixture` (an npm script) and the dependency-free `testdata/node-fixture` (a plain `node server.js` that takes its port from `PORT` via the project's `env`, the shape of a staging server) — and exercises the spec's acceptance criteria — cold start, single-flight under 20 concurrent requests, warm-request overhead, HMR-WebSocket keep-alive, idle stop and revival, two-project isolation, failure diagnostics, no-auto-start after a daemon restart, wildcard worktrees routed by `Host`, and a plain `node` command stopped gracefully and revived — purely through public surfaces (supervisor ports, CLI, control API). It is guarded by `HW_E2E=1` (and skips under `-short`), needs `node`/`npm` on `PATH`, and installs the fixture's pinned dependencies automatically (`npm ci`) on first run. CI runs the unit and e2e suites on both `ubuntu-latest` and `macos-latest`, so a Linux-only process or PID difference fails the build before it reaches a Linux staging box.
+The E2E suite (`e2e/`) builds the real binary, runs the daemon as a subprocess against two fixtures — the Vite fixture in `testdata/vite-fixture` (an npm script) and the dependency-free `testdata/node-fixture` (a plain `node server.js` that takes its port from `PORT` via the project's `env`, the shape of a staging server) — and exercises the spec's acceptance criteria — cold start, single-flight under 20 concurrent requests, warm-request overhead, HMR-WebSocket keep-alive, idle stop and revival, two-project isolation, failure diagnostics, no-auto-start after a daemon restart, wildcard worktrees routed by `Host`, a plain `node` command stopped gracefully and revived, the forwarded headers the preview box's nginx block sends (`TestPreviewForwardedHeadersBehindNginx`: the public host, the client appended to `X-Forwarded-For`, `X-Forwarded-Proto: https`), and the whole [preview-box](#preview-servers-on-a-staging-box) scenario (`TestPreviewEnvFileAndSafeDiagnostics`: a shared env file plus a per-worktree one delivered to the branch server, the world-readable-file warning, and a database password that reaches no `503`, no `status --json`, no `projects` output, and no daemon log line while `herd-wake logs` stays complete) — purely through public surfaces (supervisor ports, CLI, control API). It is guarded by `HW_E2E=1` (and skips under `-short`), needs `node`/`npm` on `PATH`, and installs the fixture's pinned dependencies automatically (`npm ci`) on first run. CI runs the unit and e2e suites on both `ubuntu-latest` and `macos-latest`, so a Linux-only process or PID difference fails the build before it reaches a Linux staging box.
